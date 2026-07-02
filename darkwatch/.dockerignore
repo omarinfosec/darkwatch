@@ -1,0 +1,26 @@
+# Keep the build context minimal — anything not needed at build time
+# stays out so docker doesn't ship it as a layer.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+data/
+loot/
+*.db
+*.db-shm
+*.db-wal
+*.session
+.DS_Store
+.vscode/
+.idea/
+*.log
+*.tar
+*.tar.gz
+# Don't ship the static/ build artifacts from a previous local build —
+# they get rebuilt in the build stage anyway.
+static/bundle.js
+static/bundle.js.map
+static/styles.css
+static/react.production.min.js
+static/react-dom.production.min.js

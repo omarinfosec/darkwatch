@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DarkWatch — Setup</title>
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <img src="/static/logo.svg" alt="DarkWatch" class="brand-logo" width="320">
+    <div>
+      <h1>DarkWatch Setup</h1>
+      <p class="subtitle">
+        Configure your Telegram credentials and the two WireGuard tunnels.
+        Saved values write directly to <code>/var/lib/darkwebapp/</code>
+        on the host and restart the affected containers.
+      </p>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ─── Status ─────────────────────────────────────────────── -->
+    <section class="card" id="state-card">
+      <h2>Current state</h2>
+      <table class="state">
+        <tr>
+          <th>Telegram <code>api_id</code></th>
+          <td id="state-tg-id">{% if state.telegram_api_id_set %}<span class="status status-running">set</span>{% else %}<span class="status status-absent">not set</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <th>Telegram <code>api_hash</code></th>
+          <td id="state-tg-hash">{% if state.telegram_api_hash_set %}<span class="status status-running">set</span>{% else %}<span class="status status-absent">not set</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <th>Tunnel 1 (Tor research path)</th>
+          <td id="state-tunnel1">{% if state.tunnel1_conf_present %}<span class="status status-running">{{ state.tunnel1_size }} bytes</span>{% else %}<span class="status status-absent">not configured</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <th>Tunnel 2 (Telegram research path)</th>
+          <td id="state-tunnel2">{% if state.tunnel2_conf_present %}<span class="status status-running">{{ state.tunnel2_size }} bytes</span>{% else %}<span class="status status-absent">not configured</span>{% endif %}</td>
+        </tr>
+      </table>
+      {% if state.containers %}
+      <h3>Containers</h3>
+      <table class="containers" id="state-containers">
+        {% for name, status_val in state.containers.items() %}
+        <tr>
+          <th>{{ name }}</th>
+          <td><span class="status status-{{ status_val }}">{{ status_val }}</span></td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% endif %}
+    </section>
+
+    <!-- ─── Telegram ───────────────────────────────────────────── -->
+    <section class="card">
+      <h2>Telegram credentials</h2>
+      <p class="helper">
+        From <a href="https://my.telegram.org/apps" target="_blank" rel="noopener">my.telegram.org/apps</a>.
+        Stored in <code>/var/lib/darkwebapp/env</code> as
+        <code>TELEGRAM_API_ID</code> + <code>TELEGRAM_API_HASH</code>.
+        {% if state.telegram_api_hash_set %}A hash is already stored — you must re-paste it here to change it (we never show the saved value).{% endif %}
+        Before saving, credentials are checked against Telegram
+        {% if state.tunnel2_conf_present %}(via Tunnel&nbsp;2){% else %}(direct if Tunnel&nbsp;2 is not configured yet){% endif %}.
+        Saving recreates the <code>darkwatch</code> container so it picks up
+        the new environment variables (a plain restart is not enough).
+      </p>
+      <form id="telegram-form" autocomplete="off">
+        <label>
+          <span>api_id</span>
+          <input type="text" name="api_id" placeholder="6–12 digit integer"
+                 required pattern="\d{6,12}"
+                 value="{{ state.telegram_api_id|default('') }}">
+        </label>
+        <label>
+          <span>
+            api_hash
+            <button type="button" id="reveal-api-hash"
+                    style="float:right;background:transparent;color:var(--accent);border:0;
+                           padding:0;font-size:0.8rem;cursor:pointer;"
+                    title="Toggle visibility">show</button>
+          </span>
+          <input type="password" name="api_hash" id="api-hash-input"
+                 placeholder="paste 32-char hex hash from my.telegram.org"
+                 autocomplete="new-password"
+                 required pattern="[a-fA-F0-9]{32}"
+                 value="">
+        </label>
+        <button type="submit">Save Telegram credentials</button>
+        <output class="result"></output>
+      </form>
+    </section>
+
+    <!-- ─── Tunnel 1 ───────────────────────────────────────────── -->
+    <section class="card">
+      <h2>Tunnel 1 — Tor research path</h2>
+      <p class="helper">
+        WireGuard config that carries the dark-web crawl traffic. Egress through
+        this tunnel reaches Tor entry guards. Paste the contents of your
+        provider's <code>wg0.conf</code> below. It must contain
+        <code>[Interface]</code> with a <code>PrivateKey</code> and
+        <code>[Peer]</code> with a <code>PublicKey</code> + <code>Endpoint</code>.
+        Saving restarts <code>tunnel1</code> + <code>tor</code> + <code>darkwatch</code>.
+      </p>
+      <form id="tunnel1-form" autocomplete="off">
+        <label>
+          <span>WireGuard config</span>
+          <textarea name="conf" rows="14"
+            placeholder="[Interface]
+PrivateKey = ...
+Address    = 10.x.x.x/32
+DNS        = 10.x.x.x
+
+[Peer]
+PublicKey  = ...
+AllowedIPs = 0.0.0.0/0
+Endpoint   = host.example.com:51820
+PersistentKeepalive = 25"
+            spellcheck="false" required>{{ state.tunnel1_conf|default('') }}</textarea>
+        </label>
+        <button type="submit">Save Tunnel 1 + restart services</button>
+        <output class="result"></output>
+      </form>
+    </section>
+
+    <!-- ─── Tunnel 2 ───────────────────────────────────────────── -->
+    <section class="card">
+      <h2>Tunnel 2 — Telegram research path</h2>
+      <p class="helper">
+        WireGuard config that carries Telegram MTProto traffic. Use a
+        <strong>different region / provider</strong> than Tunnel 1 — sharing
+        an exit IP across the two paths defeats the egress isolation.
+        Saving restarts <code>tunnel2</code> + <code>tg-socks</code> + <code>darkwatch</code>.
+      </p>
+      <form id="tunnel2-form" autocomplete="off">
+        <label>
+          <span>WireGuard config</span>
+          <textarea name="conf" rows="14" spellcheck="false" required>{{ state.tunnel2_conf|default('') }}</textarea>
+        </label>
+        <button type="submit">Save Tunnel 2 + restart services</button>
+        <output class="result"></output>
+      </form>
+    </section>
+
+  </main>
+
+  <footer>
+    <p>
+      Bring this UI down when you're done:
+      <code>docker compose --profile setup stop setup</code>.
+      Token persists in <code>/var/lib/darkwebapp/env</code>; rotate via
+      <code>openssl rand -hex 32</code>.
+    </p>
+    <!--
+        AGPL-3.0 §13 — running source notice.
+        If you fork and modify DarkWatch, replace the link below with your
+        own source URL so users of your hosted instance can obtain the
+        corresponding source.
+    -->
+    <p class="license">
+      DarkWatch &middot;
+      <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer">AGPL-3.0</a> &middot;
+      Source: <a href="https://github.com/omarinfosec/darkwatch" target="_blank" rel="noopener noreferrer">github.com/omarinfosec/darkwatch</a>
+    </p>
+  </footer>
+
+  <script>
+    // ── Token handling ────────────────────────────────────────────────────
+    // On first load: read ?token=... from the URL, stash in sessionStorage,
+    // then strip the URL so it doesn't sit in the address bar / browser history.
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlToken = urlParams.get("token");
+    if (urlToken) {
+      sessionStorage.setItem("setup_token", urlToken);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    const TOKEN = sessionStorage.getItem("setup_token") || "";
+
+    function authHeaders() {
+      const h = {};
+      if (TOKEN) h["Authorization"] = "Bearer " + TOKEN;
+      return h;
+    }
+
+    function statusBadge(ok, okLabel, noLabel) {
+      const cls = ok ? "status status-running" : "status status-absent";
+      const text = ok ? okLabel : noLabel;
+      return `<span class="${cls}">${text}</span>`;
+    }
+
+    function applyState(s) {
+      const tgId = document.getElementById("state-tg-id");
+      const tgHash = document.getElementById("state-tg-hash");
+      const t1 = document.getElementById("state-tunnel1");
+      const t2 = document.getElementById("state-tunnel2");
+      const ctrTable = document.getElementById("state-containers");
+      if (tgId) tgId.innerHTML = statusBadge(s.telegram_api_id_set, "set", "not set");
+      if (tgHash) tgHash.innerHTML = statusBadge(s.telegram_api_hash_set, "set", "not set");
+      if (t1) {
+        t1.innerHTML = s.tunnel1_conf_present
+          ? statusBadge(true, `${s.tunnel1_size} bytes`, "")
+          : statusBadge(false, "", "not configured");
+      }
+      if (t2) {
+        t2.innerHTML = s.tunnel2_conf_present
+          ? statusBadge(true, `${s.tunnel2_size} bytes`, "")
+          : statusBadge(false, "", "not configured");
+      }
+      if (ctrTable && s.containers) {
+        ctrTable.innerHTML = Object.entries(s.containers).map(([name, st]) =>
+          `<tr><th>${name}</th><td><span class="status status-${st}">${st}</span></td></tr>`
+        ).join("");
+      }
+    }
+
+    // ── Form helpers ──────────────────────────────────────────────────────
+    function bindForm(formId, endpoint, { slow = false } = {}) {
+      const form = document.getElementById(formId);
+      if (!form) return;
+      const out = form.querySelector(".result");
+      const submitBtn = form.querySelector('button[type="submit"]');
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        out.textContent = slow
+          ? "saving… recreating darkwatch (may take ~30s)"
+          : "saving…";
+        out.className = "result pending";
+        if (submitBtn) submitBtn.disabled = true;
+        const fd = new FormData(form);
+        try {
+          const res = await fetch(endpoint, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: authHeaders(),
+            body: fd,
+          });
+          const data = await res.json();
+          if (data.ok) {
+            const detail = data.started
+              || ((data.restarted || []).join(", ") || "done");
+            out.textContent = "✓ saved — " + detail;
+            out.className = "result ok";
+            setTimeout(refreshState, slow ? 2500 : 800);
+          } else {
+            const msg = data.error || (data.errors || []).join("; ") || "unknown error";
+            out.textContent = "✗ " + msg;
+            out.className = "result err";
+          }
+        } catch (err) {
+          out.textContent = "✗ network error: " + err.message;
+          out.className = "result err";
+        } finally {
+          if (submitBtn) submitBtn.disabled = false;
+        }
+      });
+    }
+
+    bindForm("telegram-form", "/api/telegram", { slow: true });
+    bindForm("tunnel1-form", "/api/tunnel/1");
+    bindForm("tunnel2-form", "/api/tunnel/2");
+
+    // ── api_hash visibility toggle ────────────────────────────────────────
+    const revealBtn = document.getElementById("reveal-api-hash");
+    const hashInput = document.getElementById("api-hash-input");
+    if (revealBtn && hashInput) {
+      revealBtn.addEventListener("click", () => {
+        if (hashInput.type === "password") {
+          hashInput.type = "text";
+          revealBtn.textContent = "hide";
+        } else {
+          hashInput.type = "password";
+          revealBtn.textContent = "show";
+        }
+      });
+    }
+
+    // ── Live state refresh ─────────────────────────────────────────────────
+    async function refreshState() {
+      try {
+        const res = await fetch("/api/state", {
+          credentials: "same-origin",
+          headers: authHeaders(),
+        });
+        if (!res.ok) return;
+        applyState(await res.json());
+      } catch (e) { /* ignore */ }
+    }
+  </script>
+</body>
+</html>

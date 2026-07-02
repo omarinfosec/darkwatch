@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 180" role="img" aria-label="DarkWatch — dark-web threat intelligence">
+  <title>DarkWatch</title>
+  <desc>Concentric onion-routing rings around a watchful eye, beside the DarkWatch wordmark and tagline.</desc>
+
+  <!-- ─── Mark: layered onion rings + central eye ─────────────────────── -->
+  <g transform="translate(90 90)" fill="none" stroke="#4A9EFF" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Outer rings: stylised Tor onion layers, broken to suggest "circuits" -->
+    <circle cx="0" cy="0" r="72" stroke-width="2" stroke-dasharray="120 30" opacity="0.55"/>
+    <circle cx="0" cy="0" r="56" stroke-width="2" stroke-dasharray="90 20" opacity="0.7"/>
+    <circle cx="0" cy="0" r="40" stroke-width="2.5" opacity="0.9"/>
+
+    <!-- Eye: an almond shape made from two arcs, with a solid pupil -->
+    <path d="M -26 0 Q 0 -20 26 0 Q 0 20 -26 0 Z" stroke-width="2.5" fill="none"/>
+    <circle cx="0" cy="0" r="7" fill="#4A9EFF" stroke="none"/>
+    <!-- Catchlight on the pupil — small white dot for "watchful" feel -->
+    <circle cx="-2" cy="-2" r="1.8" fill="#FFFFFF" stroke="none"/>
+
+    <!-- Subtle crosshair ticks at cardinal points of the outer ring -->
+    <line x1="0" y1="-80" x2="0" y2="-72" stroke-width="2" opacity="0.7"/>
+    <line x1="0" y1="72" x2="0" y2="80" stroke-width="2" opacity="0.7"/>
+    <line x1="-80" y1="0" x2="-72" y2="0" stroke-width="2" opacity="0.7"/>
+    <line x1="72" y1="0" x2="80" y2="0" stroke-width="2" opacity="0.7"/>
+  </g>
+
+  <!-- ─── Wordmark ────────────────────────────────────────────────────── -->
+  <!-- Mid-tone slate that reads on both light and dark GitHub themes. -->
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="200" y="92" font-size="62" font-weight="700" letter-spacing="-1.5" fill="#5B6F89">Dark<tspan fill="#4A9EFF">Watch</tspan></text>
+    <text x="202" y="128" font-size="18" font-weight="500" letter-spacing="3.5" fill="#5B6F89" opacity="0.85">DARK&#160;WEB&#160;&#160;·&#160;&#160;THREAT&#160;INTELLIGENCE</text>
+  </g>
+</svg>

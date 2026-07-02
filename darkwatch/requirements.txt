@@ -1,0 +1,25 @@
+# DarkWatch Python dependencies — pinned for reproducibility + audit.
+# Update via: pip install --upgrade ... && pip-compile / pip freeze.
+
+# ── HTTP, parsing, scanning ────────────────────────────────────────────────
+requests==2.32.3
+PySocks==1.7.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+yara-python==4.5.1
+
+# ── Web framework + screenshotting ────────────────────────────────────────
+flask==3.0.3
+playwright==1.47.0
+Pillow==10.4.0
+
+# ── Tor control + Telegram ────────────────────────────────────────────────
+stem==1.8.2
+telethon==1.36.0
+cryptg==0.4.0
+python-socks[asyncio]==2.5.1
+async-timeout==4.0.3
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+qrcode==7.4.2
+prometheus-client==0.20.0

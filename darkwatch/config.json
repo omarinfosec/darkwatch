@@ -1,0 +1,100 @@
+{
+    "proxy": {
+        "host": "tunnel1",
+        "port": 9050,
+        "type": "socks5h"
+    },
+    "crawler": {
+        "max_depth": 2,
+        "max_threads": 5,
+        "timeout": 60,
+        "retries": 3,
+        "retry_delay": 10,
+        "max_pages_per_site": 100,
+        "rescan_days": 7,
+        "scan_pdfs": false,
+        "screenshot_mode": "tor_render",
+        "newnym_between_sites": true,
+        "domain_fail_breaker": 3,
+        "tor_control_host": "tor",
+        "tor_control_port": 9051,
+        "tor_control_password": "${TOR_CONTROL_PASSWORD}",
+        "user_agents": [
+            "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:128.0) Gecko/20100101 Firefox/128.0"
+        ]
+    },
+    "stealth": {
+        "min_delay": 2,
+        "max_delay": 8,
+        "randomize_header_order": true,
+        "referer_spoof": true,
+        "accept_language_variants": [
+            "en-US,en;q=0.9",
+            "en-GB,en;q=0.9",
+            "en-US,en;q=0.5",
+            "en;q=0.8,en-US;q=0.6"
+        ]
+    },
+    "security": {
+        "max_response_size_mb": 10,
+        "allowed_content_types": [
+            "text/html",
+            "application/xhtml+xml",
+            "text/plain"
+        ],
+        "strip_scripts": true,
+        "strip_iframes": true,
+        "strip_objects": true,
+        "strip_tracking": true,
+        "block_binary_downloads": true,
+        "sanitize_saved_html": true
+    },
+    "yara": {
+        "keywords_file": "yara/keywords.yar",
+        "categories_file": "yara/categories.yar"
+    },
+    "alerts": {
+        "telegram_enabled": false,
+        "telegram_bot_token": "${TELEGRAM_ALERT_BOT_TOKEN}",
+        "telegram_chat_id": "${TELEGRAM_ALERT_CHAT_ID}",
+        "slack_enabled": false,
+        "slack_webhook_url": "${SLACK_WEBHOOK_URL}",
+        "min_alert_score": 80
+    },
+    "database": {
+        "path": "data/darkwatch.db"
+    },
+    "telegram": {
+        "api_id": "${TELEGRAM_API_ID}",
+        "api_hash": "${TELEGRAM_API_HASH}",
+        "session_path": "data/telegram.session",
+        "proxy_host": "tunnel2",
+        "proxy_port": 1080,
+        "proxy_type": "socks5",
+        "use_tor": false,
+        "scrape_limit_per_tick": 100,
+        "scrape_delay_s": 3,
+        "rate_per_s": 0.33,
+        "burst": 1,
+        "jitter": 0.5,
+        "max_deep_budget": 20,
+        "entity_ttl_s": 900,
+        "thorough_rate_per_s": 0.66,
+        "thorough_burst": 1,
+        "thorough_jitter": 0.35,
+        "thorough_max_deep_budget": 40,
+        "pressure_skip_threshold": 30,
+        "live_enabled": false,
+        "persistent_client": false
+    },
+    "output": {
+        "loot_dir": "/loot",
+        "save_pages": true,
+        "save_screenshots": true,
+        "reports_dir": "/loot/reports",
+        "thumbnails_dir": "/loot/thumbnails"
+    }
+}

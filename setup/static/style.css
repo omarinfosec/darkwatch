@@ -1,0 +1,342 @@
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:           #0b0d14;
+  --surface:      #13161f;
+  --surface-2:    #1a1d2b;
+  --surface-hov:  #1f2335;
+  --border:       #252836;
+  --border-2:     #2e3248;
+  --text:         #e2e4ed;
+  --text-2:       #9ca3b0;
+  --muted:        #5a6070;
+  /* Brand accent — matches /assets/logo.svg (#4A9EFF). Status colors
+     (success/danger/warn) are defined separately below; this controls
+     interactive feedback only — focus rings, primary buttons, link hover. */
+  --accent:       #4A9EFF;
+  --accent-dim:   rgba(74,158,255,0.12);
+  --accent-glow:  rgba(74,158,255,0.3);
+  --ok:           #22c55e;
+  --ok-dim:       rgba(34,197,94,0.12);
+  --warn:         #f59e0b;
+  --warn-dim:     rgba(245,158,11,0.12);
+  --err:          #ef4444;
+  --err-dim:      rgba(239,68,68,0.12);
+  --pending:      #5a6070;
+  --code-bg:      rgba(255,255,255,0.04);
+  --radius:       6px;
+  --radius-lg:    10px;
+  --shadow:       0 1px 3px rgba(0,0,0,0.4);
+  --shadow-lg:    0 8px 24px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.2);
+}
+
+html { scroll-behavior: smooth; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: radial-gradient(ellipse at top, #11141f 0%, var(--bg) 60%) no-repeat fixed;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100vh;
+  padding: 32px 16px 80px;
+}
+
+a { color: var(--accent); text-decoration: none; transition: color 0.15s; }
+a:hover { color: #6ea4ff; }
+
+code {
+  font-family: 'Menlo', 'Monaco', 'Consolas', ui-monospace, monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  padding: 2px 7px;
+  border-radius: 4px;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+
+/* ── Header ────────────────────────────────────────────────────────────── */
+/* Brand mark + wordmark image sits above the H1; the H1 and subtitle
+   render below. The old gradient-square + "DW" pseudo-element pair was
+   replaced by /static/logo.svg on 2026-06-01. */
+header {
+  max-width: 920px;
+  margin: 0 auto 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+header .brand-logo {
+  display: block;
+  max-width: 320px;
+  height: auto;
+  margin-bottom: 4px;
+}
+header > div { flex: 1; min-width: 0; }
+h1 {
+  margin: 0 0 4px;
+  font-size: 1.55rem;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+}
+.subtitle { color: var(--text-2); margin: 0; font-size: 0.95rem; }
+
+/* ── Main + cards ──────────────────────────────────────────────────────── */
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px 28px;
+  box-shadow: var(--shadow);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.card:hover { border-color: var(--border-2); }
+
+.card h2 {
+  margin: 0 0 6px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+.card h3 {
+  margin: 18px 0 10px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.helper {
+  color: var(--text-2);
+  margin: 0 0 18px;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+.helper a { color: var(--accent); }
+.helper strong { color: var(--text); font-weight: 600; }
+
+/* ── State tables (Current state, Containers) ─────────────────────────── */
+.state, .containers { width: 100%; border-collapse: collapse; }
+.state th, .state td,
+.containers th, .containers td {
+  text-align: left;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+.state tr:last-child th,
+.state tr:last-child td,
+.containers tr:last-child th,
+.containers tr:last-child td { border-bottom: 0; }
+.state th, .containers th {
+  color: var(--text-2);
+  font-weight: 400;
+  width: 55%;
+  vertical-align: middle;
+}
+.state td, .containers td {
+  font-family: 'Menlo', ui-monospace, monospace;
+  font-size: 0.85rem;
+  text-align: right;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* Status dots */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: 'Menlo', ui-monospace, monospace;
+  font-size: 0.82rem;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  letter-spacing: 0.02em;
+}
+.status::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.04);
+}
+.status-running   { color: var(--ok);      background: var(--ok-dim); }
+.status-restarting { color: var(--warn);   background: var(--warn-dim); }
+.status-exited, .status-dead { color: var(--err); background: var(--err-dim); }
+.status-absent, .status-created { color: var(--muted); }
+
+/* ── Forms ──────────────────────────────────────────────────────────────── */
+form { display: flex; flex-direction: column; gap: 14px; }
+label { display: flex; flex-direction: column; gap: 6px; }
+label > span {
+  font-size: 0.78rem;
+  color: var(--text-2);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+input[type=text], input[type=password], textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: 'Menlo', ui-monospace, monospace;
+  font-size: 0.88rem;
+  width: 100%;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+input[type=text]:hover, input[type=password]:hover, textarea:hover { border-color: var(--border-2); }
+input[type=text]:focus, input[type=password]:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface-2);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+input::placeholder, textarea::placeholder { color: var(--muted); }
+textarea {
+  resize: vertical;
+  min-height: 220px;
+  line-height: 1.55;
+}
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 11px 18px;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  letter-spacing: 0.01em;
+  align-self: flex-start;
+  transition: filter 0.15s, transform 0.05s, box-shadow 0.15s;
+  box-shadow: 0 2px 6px rgba(79,142,247,0.25);
+}
+button:hover { filter: brightness(1.08); box-shadow: 0 4px 10px rgba(79,142,247,0.35); }
+button:active { transform: translateY(1px); }
+button:disabled {
+  filter: grayscale(0.6) brightness(0.7);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Small inline button (the show/hide toggle on api_hash) */
+button[type=button] {
+  background: transparent !important;
+  color: var(--accent) !important;
+  border: 0;
+  padding: 0;
+  font-size: 0.78rem;
+  font-weight: 500;
+  box-shadow: none !important;
+  letter-spacing: 0;
+}
+button[type=button]:hover { filter: brightness(1.2); }
+
+/* Result line — saved / pending / error */
+.result {
+  font-size: 0.86rem;
+  font-family: 'Menlo', ui-monospace, monospace;
+  margin-top: 4px;
+  min-height: 1.4em;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: background 0.15s, border-color 0.15s;
+}
+.result.pending {
+  color: var(--text-2);
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+.result.pending::before {
+  content: "◐";
+  display: inline-block;
+  animation: spin 1s linear infinite;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.result.ok {
+  color: var(--ok);
+  background: var(--ok-dim);
+  border-color: rgba(34,197,94,0.3);
+}
+.result.err {
+  color: var(--err);
+  background: var(--err-dim);
+  border-color: rgba(239,68,68,0.3);
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+footer {
+  max-width: 920px;
+  margin: 40px auto 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+  border-top: 1px solid var(--border);
+  padding-top: 18px;
+}
+footer p { margin: 0; line-height: 1.7; }
+footer p + p { margin-top: 8px; }
+footer code { font-size: 0.8em; }
+footer .license {
+  font-size: 0.78rem;
+  opacity: 0.75;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+footer .license a {
+  color: var(--muted);
+  text-decoration: underline dotted;
+}
+footer .license a:hover { color: var(--fg); }
+
+/* ── no_token.html code blocks ─────────────────────────────────────────── */
+.code-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-family: 'Menlo', ui-monospace, monospace;
+  font-size: 0.84rem;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0 0 18px;
+  color: var(--text);
+}
+.code-block::before {
+  content: "$";
+  color: var(--muted);
+  margin-right: 8px;
+  user-select: none;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 640px) {
+  body { padding: 20px 12px 60px; }
+  .card { padding: 18px 18px; }
+  header > div { padding-left: 56px; margin-left: -56px; }
+  h1 { font-size: 1.3rem; }
+}

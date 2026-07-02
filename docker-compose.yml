@@ -1,0 +1,213 @@
+# DarkWatch — merged compose stack
+#
+# All services run on a single darknet bridge.
+# Everything that talks to the outside goes through one of two WireGuard tunnels
+# (tunnel1 = Tor egress path; tunnel2 = Telegram egress path). Bring your own
+# WG provider configs — ProtonVPN, Mullvad, IVPN, anything that gives you a
+# wg0.conf-shaped file.
+#
+# Nothing is published on 0.0.0.0; all host bindings respect ${DARKWATCH_BIND_IP}.
+#
+# Image pinning:
+#   Third-party images SHOULD be pinned by SHA256 digest in production. Tags are
+#   used here for readability of the initial scaffold. Run `ops/pin-images.sh`
+#   before first production deploy to swap tags for digests and commit the result.
+
+name: darkwatch
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+services:
+  # ─── Tunnel 1 — dark-web crawl egress path ────────────────────────────────
+  # Gated by the `tor` profile. Enable with `docker compose --profile tor up`,
+  # or let deploy.sh auto-enable when secrets/tunnel1/wg_confs/wg0.conf exists.
+  # If disabled, darkwatch still starts but Tor crawling is unavailable.
+  tunnel1:
+    <<: *restart-policy
+    profiles: ["tor"]
+    image: linuxserver/wireguard@sha256:0291ea6379ffb2eed1296676853e24b2774a6b2dc820771b350249d6fe95c6ca    # PIN: replace with @sha256:... before prod
+    container_name: tunnel1
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      # NOT :ro — linuxserver/wireguard writes runtime state under /config.
+      # Operator places the WG config at:
+      #   ${DATA_ROOT}/secrets/tunnel1/wg_confs/wg0.conf
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/secrets/tunnel1:/config
+    networks:
+      - darknet
+    healthcheck:
+      # Each WG container runs in its own netns; both configs use the
+      # filename wg0.conf (=> interface wg0) without conflict.
+      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk '{exit ($2 == 0)}'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  tor:
+    <<: *restart-policy
+    profiles: ["tor"]
+    # Custom-built Tor sidecar — torrc is templated at start from
+    # ${TOR_CONTROL_PASSWORD} so NEWNYM circuit rotation actually works.
+    # See tor/Dockerfile + tor/entrypoint.sh.
+    build:
+      context: ./tor
+      dockerfile: Dockerfile
+    image: darkwatch-tor:local
+    container_name: tor
+    # Inherits the WG netns: tor's egress is the tunnel1 only.
+    network_mode: "service:tunnel1"
+    env_file:
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
+    depends_on:
+      tunnel1:
+        condition: service_healthy
+    # Healthcheck lives in the Dockerfile (HEALTHCHECK directive).
+
+  # ─── Tunnel 2 — Telegram egress path (separate WG tunnel) ─────────────────
+  # Gated by the `tg` profile. Enable with `docker compose --profile tg up`.
+  # If disabled, darkwatch still starts but Telegram scraping is unavailable.
+  tunnel2:
+    <<: *restart-policy
+    profiles: ["tg"]
+    image: linuxserver/wireguard@sha256:0291ea6379ffb2eed1296676853e24b2774a6b2dc820771b350249d6fe95c6ca    # PIN: replace with @sha256:... before prod
+    container_name: tunnel2
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      # NOT :ro — linuxserver/wireguard writes runtime state under /config.
+      # Operator places the WG config at:
+      #   ${DATA_ROOT}/secrets/tunnel2/wg_confs/wg0.conf
+      # (wg0.conf, same filename as tunnel1 — own netns, name doesn't collide.)
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/secrets/tunnel2:/config
+    networks:
+      - darknet
+    healthcheck:
+      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk '{exit ($2 == 0)}'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  tg-socks:
+    <<: *restart-policy
+    profiles: ["tg"]
+    image: serjs/go-socks5-proxy@sha256:0af522996f402c03ecd985a87997158eabeb28935365e3a384df37eafcf740ea    # PIN: replace with @sha256:... before prod
+    container_name: tg-socks
+    network_mode: "service:tunnel2"
+    depends_on:
+      tunnel2:
+        condition: service_healthy
+    environment:
+      - PROXY_PORT=1080
+      - REQUIRE_AUTH=false  # only reachable via darknet bridge from darkwatch
+
+  # ─── DarkWatch crawler + dashboard ─────────────────────────────────────────
+  # Egress isolation is verified out-of-band by ops/verify-egress.sh,
+  # which deploy.sh runs after the stack reports healthy.
+  darkwatch:
+    <<: *restart-policy
+    build:
+      context: ./darkwatch
+      dockerfile: Dockerfile
+    image: darkwatch:local
+    container_name: darkwatch
+    env_file:
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
+    ports:
+      - "${DARKWATCH_BIND_IP:-127.0.0.1}:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/darkwatch/loot:/loot
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/darkwatch/data:/app/data
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/darkwatch/investigations:/app/investigations
+      # Curated YARA rules ship in the repo, mounted read-only.
+      - ./darkwatch/yara:/app/yara:ro
+      # Operator-specific user.yar lives next to darkwatch.db on the
+      # writable data mount above (path derived in code from db_path).
+      # Operator-private YARA rules drop-in: any *.yar / *.yara files placed
+      # at ${DARKWEBAPP_DATA_ROOT}/darkwatch/yara-private/ on the host are
+      # compiled at startup and via the Rules tab. Writable from the dashboard.
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/darkwatch/yara-private:/app/yara-private:rw
+      - ./darkwatch/config.json:/app/config.json:ro
+    environment:
+      - DARKWATCH_CONFIG=/app/config.json
+    networks:
+      - darknet
+    # No `depends_on` of tor / tg-socks: those are profile-gated and may
+    # not be present. darkwatch starts regardless; if a tunnel is missing
+    # the corresponding feature (Tor crawl or Telegram scrape) is just
+    # unavailable, and the dashboard shows it as such.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/status > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+
+  # ─── Setup UI (profile-gated; off by default) ──────────────────────────────
+  # Bring up only when configuring credentials/tunnels:
+  #   docker compose --profile setup up -d setup
+  # Take down when done:
+  #   docker compose --profile setup stop setup
+  #
+  # Has elevated privileges (writes secrets, restarts services). Bind to
+  # ${DARKWATCH_BIND_IP} (default 127.0.0.1) and gate access via SSH tunnel,
+  # operator's own VPN, or a reverse proxy with auth. Bearer-token auth via
+  # SETUP_AUTH_TOKEN is required regardless.
+  setup:
+    <<: *restart-policy
+    profiles: ["setup"]
+    build:
+      context: ./setup
+      dockerfile: Dockerfile
+    image: darkwatch-setup:local
+    container_name: setup
+    env_file:
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
+    ports:
+      # Container listens on 8090; host-published on 8082 because some
+      # client firewalls / networks block 8090 specifically while leaving
+      # the 8080-8082 range open. Adjust SETUP_HOST_PORT in env if 8082
+      # also fails on your network.
+      - "${DARKWATCH_BIND_IP:-127.0.0.1}:${SETUP_HOST_PORT:-8082}:8090"
+    volumes:
+      # Writes to env file + WG configs. Mount as rw — that's the whole point.
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}:/data
+      # Setup invokes `docker compose` via the socket. Compose validates each
+      # service's env_file path from *this* container's filesystem, so the host
+      # data root must also appear at the same absolute path (read-only is fine).
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}:${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}:ro
+      # Read-only compose project — setup runs `docker compose up` after saves.
+      - .:/repo:ro
+      # Docker socket — needed RW because POST /containers/<id>/restart is a
+      # write operation. Any container with docker.sock access is effectively
+      # root on the host — keep this profile OFF except during config changes.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DARKWEBAPP_DATA_ROOT=/data
+      - DARKWATCH_REPO_ROOT=/repo
+      # Host paths for `docker compose` invoked via the mounted socket (must
+      # match the VM checkout and operator state dir, not /repo or /data).
+      - DARKWATCH_HOST_REPO_ROOT=${DARKWATCH_HOST_REPO_ROOT:-/opt/darkwebapp}
+      - DARKWATCH_HOST_DATA_ROOT=${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}
+      - SETUP_BIND_PORT=8090
+    networks:
+      - darknet
+    # darknet: reach tunnel2:1080 (tg-socks) for live Telegram credential checks.
+
+networks:
+  darknet:
+    driver: bridge

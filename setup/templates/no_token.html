@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DarkWatch Setup — token required</title>
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <img src="/static/logo.svg" alt="DarkWatch" class="brand-logo" width="320">
+    <div>
+      <h1>DarkWatch Setup</h1>
+      <p class="subtitle">This page is gated by a bearer token.</p>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Sign in</h2>
+      <p class="helper">
+        Paste your <code>SETUP_AUTH_TOKEN</code> once. A secure session cookie
+        is stored for 7 days so you can open Settings from the main dashboard
+        without the long URL.
+      </p>
+      {% if auth_error %}
+      <p class="result err">{{ auth_error }}</p>
+      {% endif %}
+      <form method="post" action="/auth" autocomplete="off">
+        <label>
+          <span>Setup token</span>
+          <input type="password" name="token" required
+                 placeholder="64-character hex token from bootstrap / env file"
+                 pattern="[a-fA-F0-9]{64}"
+                 spellcheck="false">
+        </label>
+        <button type="submit">Sign in</button>
+      </form>
+
+      <h3>Or use the full URL once</h3>
+      <p class="helper">
+        Append <code>?token=&lt;SETUP_AUTH_TOKEN&gt;</code> to the URL:
+      </p>
+      <pre class="code-block">http://&lt;your-bind-ip&gt;:8082/?token=&lt;long-hex-token&gt;</pre>
+
+      <h3>Where the token lives</h3>
+      <p class="helper">On the VM:</p>
+      <pre class="code-block">sudo grep ^SETUP_AUTH_TOKEN= /var/lib/darkwebapp/env</pre>
+
+      <h3>Why a token at all?</h3>
+      <p class="helper">
+        This UI can write VPN private keys and Telegram credentials to disk
+        and restart services. The token plus your network gating (SSH tunnel,
+        your own VPN, or a reverse proxy with auth) keeps it from being open to the internet.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>HTTP 401 — invalid or missing token.</p>
+    <p class="license">
+      DarkWatch &middot;
+      <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer">AGPL-3.0</a> &middot;
+      Source: <a href="https://github.com/omarinfosec/darkwatch" target="_blank" rel="noopener noreferrer">github.com/omarinfosec/darkwatch</a>
+    </p>
+  </footer>
+</body>
+</html>
