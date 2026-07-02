@@ -261,10 +261,6 @@ DarkWatch stands on free-software shoulders. The list is intentionally explicit 
 - **[WireGuard](https://www.wireguard.com/)** — modern, audited VPN protocol that makes two-tunnel egress isolation tractable to deploy. Container is built on [linuxserver/wireguard](https://hub.docker.com/r/linuxserver/wireguard). The two-tunnel design (separate Tor egress + separate Telegram egress) is the entire OPSEC backbone of this project.
 - **[serjs/go-socks5-proxy](https://github.com/serjs/go-socks5-server)** — the small SOCKS5 proxy we drop alongside the Telegram WG container so darkwatch can reach Telegram via that tunnel.
 
-#### Detection + classification
-
-- **[YARA](https://virustotal.github.io/yara/)** by VirusTotal — the rules engine that classifies findings. The shipped `darkwatch/yara/categories.yar` and `darkwatch/yara/keywords.yar` are intentionally generic; operator-specific rules go in `user.yar` (out of git).
-- **[abuse.ch](https://abuse.ch/)** ([URLhaus](https://urlhaus.abuse.ch/), [Feodo Tracker](https://feodotracker.abuse.ch/)) — threat-intel feeds the `threat_intel.py` module ingests. Their continuous IOC publishing is the reason a small operator can have decent intel coverage without a paid subscription.
 
 #### Crawl + capture
 
@@ -286,21 +282,11 @@ DarkWatch stands on free-software shoulders. The list is intentionally explicit 
 - **[stem](https://stem.torproject.org/)** — Tor controller library (used for NEWNYM circuit rotation between investigations).
 - **[Prometheus client](https://github.com/prometheus/client_python)** — metrics export hooks (currently dormant; reserved for future scraping).
 
-#### Hardening + supply chain
-
-- **[gitleaks](https://github.com/gitleaks/gitleaks)** — secret scanning in pre-commit and CI; the single biggest OPSEC failure-mode preventer.
-- **[detect-secrets](https://github.com/Yelp/detect-secrets)** — second-opinion secret scanner.
-- **[trivy](https://github.com/aquasecurity/trivy)**, **[pip-audit](https://github.com/pypa/pip-audit)**, **[hadolint](https://github.com/hadolint/hadolint)**, **[ruff](https://github.com/astral-sh/ruff)** — CI gates.
-- **[fail2ban](https://github.com/fail2ban/fail2ban)** + **[ufw](https://launchpad.net/ufw)** — host-level intrusion prevention applied by `ops/harden.sh`.
-
 ### Inspirations and influences
 
-> *Operator: replace this section with the specific projects, papers, or write-ups that shaped your design choices. Examples of the genre below — keep what fits, replace what doesn't.*
+> *I always used telegram OSINT tools like Telethon, but wanted a GUI interface for it. "Thanks to AI", started updating the GUI added features like Onione site crawler, alerting , Yara rules detection. *
 
-- The broader **CTI / OSINT community** for the OPSEC patterns this project tries to follow: separate egress paths per workload, never trust the network, encrypt at rest, decouple operator state from code, never commit secrets.
-- **[OnionScan](https://github.com/s-rah/onionscan)** — early proof that automated `.onion` scanning was a thing worth doing carefully.
-- **[Recon-NG](https://github.com/lanmaster53/recon-ng)** — module-driven OSINT framework that taught a generation of analysts to think in pipelines.
-- **[MISP](https://www.misp-project.org/)** — taught us what a real CTI sharing platform looks like, even though DarkWatch is a much smaller scope.
+- The broader **CTI / OSINT community** for the OPSEC patterns this project tries to follow: separate egress paths per workload, never trust the network.
 
 ### Upstream licenses
 
