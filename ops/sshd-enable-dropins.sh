@@ -9,7 +9,7 @@
 # never actually been in effect.
 #
 # This script adds the Include directive at the top of main sshd_config so
-# the existing 99-darkwatch-hardening.conf drop-in starts applying. To
+# the existing 01-darkwatch-hardening.conf drop-in starts applying. To
 # survive a bad config, it schedules a systemd-run auto-rollback timer
 # that restores the backup in 2 min unless cancelled.
 #
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 CFG=/etc/ssh/sshd_config
-DROPIN=/etc/ssh/sshd_config.d/99-darkwatch-hardening.conf
+DROPIN=/etc/ssh/sshd_config.d/01-darkwatch-hardening.conf
 INCLUDE_LINE='Include /etc/ssh/sshd_config.d/*.conf'
 
 MODE=""
@@ -97,15 +97,15 @@ if ! sshd -t 2>/tmp/sshd-validate.err; then
 fi
 
 log "5. scheduling 2-min auto-rollback"
-cat > /tmp/sshd-rollback.sh <<EOF
+cat > /run/darkwatch-sshd-rollback.sh <<EOF
 #!/bin/bash
 # Auto-restore the sshd config to the pre-change state.
 cp "$BAK_CFG" "$CFG"
 [[ -f "$BAK_DROPIN" ]] && cp "$BAK_DROPIN" "$DROPIN"
 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 EOF
-chmod 0700 /tmp/sshd-rollback.sh
-systemd-run --on-active=2min --unit=sshd-rollback /tmp/sshd-rollback.sh
+chmod 0700 /run/darkwatch-sshd-rollback.sh
+systemd-run --on-active=2min --unit=sshd-rollback /run/darkwatch-sshd-rollback.sh
 
 log "6. reloading sshd"
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
