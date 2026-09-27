@@ -25,6 +25,11 @@ set -euo pipefail
 
 CFG=/etc/ssh/sshd_config
 DROPIN=/etc/ssh/sshd_config.d/01-darkwatch-hardening.conf
+# Hosts hardened before the rename only have the legacy 99- file; operate on
+# it so its PermitRootLogin line still gets stripped below.
+if [[ ! -f "$DROPIN" && -f /etc/ssh/sshd_config.d/99-darkwatch-hardening.conf ]]; then
+    DROPIN=/etc/ssh/sshd_config.d/99-darkwatch-hardening.conf
+fi
 INCLUDE_LINE='Include /etc/ssh/sshd_config.d/*.conf'
 
 MODE=""

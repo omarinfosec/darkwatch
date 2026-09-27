@@ -97,11 +97,20 @@ def _same_origin(request: Request) -> bool:
     same-site and would get the cookie attached. Require Origin (or Referer,
     for older clients) to name this exact host:port. The scheme is not
     compared so a TLS-terminating reverse proxy in front still works."""
-    host = request.headers.get("host", "").lower()
+    # Behind a reverse proxy Host is usually rewritten (nginx: $proxy_host),
+    # so also accept X-Forwarded-Host. A cross-site page can't set that
+    # header on a cookie-carrying request without a CORS preflight, which
+    # this app never grants.
+    hosts = {
+        h.strip().lower()
+        for h in (request.headers.get("host", ""),
+                  *request.headers.get("x-forwarded-host", "").split(","))
+        if h.strip()
+    }
     source = request.headers.get("origin") or request.headers.get("referer") or ""
-    if not host or not source:
+    if not hosts or not source:
         return False
-    return urlsplit(source).netloc.lower() == host
+    return urlsplit(source).netloc.lower() in hosts
 
 
 def _set_session_cookie(response) -> None:

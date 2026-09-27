@@ -88,3 +88,12 @@ def test_update_env_is_atomic_and_private(tmp_path, monkeypatch):
     )
     assert oct(env.stat().st_mode & 0o777) == "0o600"
     assert not (tmp_path / "env.tmp").exists()
+
+
+def test_cookie_post_behind_reverse_proxy(client):
+    client.cookies.set(main.SESSION_COOKIE, TOKEN)
+    # nginx default: Host rewritten to the upstream, public host in X-Forwarded-Host.
+    r = client.post("/api/tunnel/1", data={"conf": "x"},
+                    headers={"Origin": "https://setup.example.org",
+                             "X-Forwarded-Host": "setup.example.org"})
+    assert r.status_code == 400
