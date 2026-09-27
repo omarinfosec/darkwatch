@@ -42,4 +42,6 @@ ENV DARKWEBAPP_DATA_ROOT=/data \
 
 EXPOSE 8090
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8090"]
+# --no-access-log: the first visit is GET /?token=<SETUP_AUTH_TOKEN>, which
+# would otherwise be written to `docker logs setup` in full.
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8090", "--no-access-log"]

@@ -24,7 +24,9 @@ import re
 import secrets
 import stat
 import subprocess
+import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import docker
 from fastapi import FastAPI, Form, HTTPException, Request, status
@@ -83,6 +85,25 @@ if not _expected_token():
     raise SystemExit(2)
 
 
+def _token_eq(provided: str, expected: str) -> bool:
+    """Constant-time compare on bytes. compare_digest(str, str) raises
+    TypeError on non-ASCII input, which surfaced as HTTP 500s."""
+    return secrets.compare_digest(provided.encode(), expected.encode())
+
+
+def _same_origin(request: Request) -> bool:
+    """CSRF guard for cookie-authenticated writes. SameSite=Lax ignores the
+    port, so the dashboard on :8080 (or anything else on this host) counts as
+    same-site and would get the cookie attached. Require Origin (or Referer,
+    for older clients) to name this exact host:port. The scheme is not
+    compared so a TLS-terminating reverse proxy in front still works."""
+    host = request.headers.get("host", "").lower()
+    source = request.headers.get("origin") or request.headers.get("referer") or ""
+    if not host or not source:
+        return False
+    return urlsplit(source).netloc.lower() == host
+
+
 def _set_session_cookie(response) -> None:
     response.set_cookie(
         SESSION_COOKIE,
@@ -101,19 +122,22 @@ def _is_authenticated(request: Request) -> bool:
     expected = _expected_token()
     if not expected:
         return False
-    cookie = request.cookies.get(SESSION_COOKIE, "")
-    if cookie and secrets.compare_digest(cookie, expected):
-        return True
-    # Header form: Authorization: Bearer <token>
+    # Header form: Authorization: Bearer <token>. Not sent automatically by
+    # browsers, so it needs no CSRF check.
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         provided = auth[7:].strip()
-        if provided and secrets.compare_digest(provided, expected):
+        if provided and _token_eq(provided, expected):
             return True
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    if cookie and _token_eq(cookie, expected):
+        if request.method in ("GET", "HEAD"):
+            return True
+        return _same_origin(request)
     # Query form (only valid for GET/HEAD; POSTs use cookie or header).
     if request.method in ("GET", "HEAD"):
         provided = request.query_params.get("token", "")
-        if provided and secrets.compare_digest(provided, expected):
+        if provided and _token_eq(provided, expected):
             return True
     return False
 
@@ -131,8 +155,9 @@ def _check_token(request: Request) -> None:
 
 # ── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="DarkWatch Setup", docs_url=None, redoc_url=None)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+_BASE = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=_BASE / "static"), name="static")
+templates = Jinja2Templates(directory=_BASE / "templates")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -143,12 +168,18 @@ async def index(request: Request):
             {"request": request, "auth_error": None},
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
+    if request.query_params.get("token"):
+        # Trade the URL token for the HttpOnly cookie and drop it from the
+        # address bar / history straight away.
+        response = RedirectResponse(url="/", status_code=303)
+        _set_session_cookie(response)
+        return response
     state = _current_state(include_values=True)
     response = templates.TemplateResponse(
         "index.html",
         {"request": request, "state": state, "token_present": True},
     )
-    if request.query_params.get("token") or not request.cookies.get(SESSION_COOKIE):
+    if not request.cookies.get(SESSION_COOKIE):
         _set_session_cookie(response)
     return response
 
@@ -156,7 +187,7 @@ async def index(request: Request):
 @app.post("/auth", response_class=HTMLResponse)
 async def auth_login(request: Request, token: str = Form(...)):
     provided = token.strip()
-    if not provided or not secrets.compare_digest(provided, _expected_token()):
+    if not provided or not _token_eq(provided, _expected_token()):
         return templates.TemplateResponse(
             "no_token.html",
             {"request": request, "auth_error": "Invalid token — check /var/lib/darkwebapp/env"},
@@ -176,6 +207,13 @@ _WG_PEER = re.compile(r"^\s*\[Peer\]\s*$", re.MULTILINE)
 _WG_PRIVKEY = re.compile(r"^\s*PrivateKey\s*=\s*[A-Za-z0-9+/]{43}=\s*$", re.MULTILINE)
 _WG_PUBKEY = re.compile(r"^\s*PublicKey\s*=\s*[A-Za-z0-9+/]{43}=\s*$", re.MULTILINE)
 _WG_ENDPOINT = re.compile(r"^\s*Endpoint\s*=\s*\S+:\d+\s*$", re.MULTILINE)
+# Plain client keys only. wg-quick runs PreUp/PostUp/PreDown/PostDown as root
+# inside the tunnel container (NET_ADMIN + SYS_MODULE), so a pasted config
+# must never be able to carry shell hooks.
+_WG_ALLOWED_KEYS = {
+    "privatekey", "address", "dns", "mtu", "listenport", "fwmark", "table",
+    "publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive",
+}
 
 
 def _validate_wg_config(text: str) -> list[str]:
@@ -193,6 +231,13 @@ def _validate_wg_config(text: str) -> list[str]:
         errors.append("missing or malformed PublicKey (expected 44-char base64 in [Peer])")
     if not _WG_ENDPOINT.search(text):
         errors.append("missing Endpoint (expected host:port in [Peer])")
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", ";", "[")):
+            continue
+        key = s.split("=", 1)[0].strip()
+        if key.lower() not in _WG_ALLOWED_KEYS:
+            errors.append(f"disallowed key: {key} (hooks like PostUp are not accepted)")
     return errors
 
 
@@ -257,8 +302,7 @@ async def save_tunnel(request: Request, n: int, conf: str = Form(...)):
     # Write atomically (tmpfile + rename) so a half-written file can't ever
     # be picked up by the next container restart.
     tmp = target.with_suffix(".tmp")
-    tmp.write_text(conf if conf.endswith("\n") else conf + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    _write_private(tmp, conf if conf.endswith("\n") else conf + "\n")
     os.replace(tmp, target)
     # Best-effort: own as root (we're root inside the container during the
     # entrypoint hand-off period). Falls back silently if not allowed.
@@ -289,13 +333,30 @@ async def state(request: Request):
 
 
 # ── Helpers: env file munging ────────────────────────────────────────────────
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path`, created 0600 from the start (never briefly
+    world-readable under the default umask)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+
+
+_ENV_LOCK = threading.Lock()
+
+
 def _update_env(updates: dict[str, str]) -> None:
     """Merge {VAR: VALUE} into ENV_FILE, preserving comments and order.
-    If a var already exists, replace its value. Otherwise append."""
-    if not ENV_FILE.exists():
-        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ENV_FILE.write_text("")
-    lines = ENV_FILE.read_text().splitlines()
+    If a var already exists, replace its value. Otherwise append.
+    Atomic (tmp + rename) and serialized: a crash or concurrent save must not
+    truncate the env file — it holds SETUP_AUTH_TOKEN and every secret."""
+    with _ENV_LOCK:
+        _update_env_locked(updates)
+
+
+def _update_env_locked(updates: dict[str, str]) -> None:
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
     seen = set()
     out = []
     for line in lines:
@@ -308,8 +369,9 @@ def _update_env(updates: dict[str, str]) -> None:
     for k, v in updates.items():
         if k not in seen:
             out.append(f"{k}={v}")
-    ENV_FILE.write_text("\n".join(out) + "\n")
-    os.chmod(ENV_FILE, 0o600)
+    tmp = ENV_FILE.with_name(ENV_FILE.name + ".tmp")
+    _write_private(tmp, "\n".join(out) + "\n")
+    os.replace(tmp, ENV_FILE)
 
 
 # ── Helpers: docker compose ──────────────────────────────────────────────────
