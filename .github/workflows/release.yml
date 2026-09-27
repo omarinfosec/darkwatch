@@ -1,10 +1,17 @@
 name: Release
 
-# Push a tag like v0.2.0 to publish a GitHub Release. The notes are the
-# matching "## vX.Y.Z" section of CHANGELOG.md.
+# Publish a GitHub Release whose notes are the matching "## vX.Y.Z" section
+# of CHANGELOG.md. Either push a tag like v0.2.0, or run this workflow by
+# hand (Actions -> Release -> Run workflow) with the version: it then creates
+# the tag on the current main commit.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to release, e.g. v0.2.0"
+        required: true
 
 permissions:
   contents: write
@@ -14,9 +21,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must look like v1.2.3 (got: $tag)" >&2; exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - name: Extract release notes from CHANGELOG.md
         run: |
-          tag="${GITHUB_REF_NAME}"
+          tag="$TAG"
           awk -v tag="$tag" '
             $0 ~ "^## " tag "( |$)" {found=1; next}
             found && /^## / {exit}
@@ -28,4 +44,10 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "DarkWatch $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Creates the tag on the commit this run checked out.
+            gh release create "$TAG" --title "DarkWatch $TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          else
+            gh release create "$TAG" --title "DarkWatch $TAG" --notes-file notes.md --verify-tag
+          fi
