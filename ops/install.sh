@@ -114,7 +114,7 @@ if [[ "$current_bind" == "127.0.0.1" || -z "$current_bind" ]]; then
     else
         warn "leaving DARKWATCH_BIND_IP=127.0.0.1"
         warn "reach dashboards via SSH tunnel:"
-        warn "    ssh -L 8080:localhost:8080 -L 8081:localhost:8081 -L 8082:localhost:8082 -p 6245 root@<vm>"
+        warn "    ssh -L 8080:localhost:8080 -L 8082:localhost:8082 <user>@<vm>"
     fi
 fi
 
@@ -189,20 +189,20 @@ hdr "7. Done"
 BIND_IP=$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | cut -d= -f2-)
 BIND_IP="${BIND_IP:-127.0.0.1}"
 
-ok "Dashboards:"
+ok "Dashboard:"
 echo "      DarkWatch:       http://$BIND_IP:8080/"
-echo "      Recon dashboard: http://$BIND_IP:8081/"
 echo
 ok "Bring up the Setup UI to configure tunnels + Telegram from your browser:"
-echo "      docker compose --profile setup up -d setup"
+echo "      cd $REPO_ROOT"
+echo "      sudo docker compose --profile setup up -d setup"
 echo "      open http://$BIND_IP:8082/?token=$SETUP_TOKEN"
-echo "      docker compose --profile setup stop setup    # bring it down when done"
+echo "      sudo docker compose --profile setup stop setup    # bring it down when done"
 echo
 ok "Day-to-day:"
 echo "      ssh deploy@<vm>"
-echo "      cd /opt/darkwebapp"
+echo "      cd $REPO_ROOT"
 echo "      sudo ./ops/deploy.sh           # pull + build + up + healthcheck + egress verify"
 echo "      sudo ./ops/verify-egress.sh    # confirm Tor + TG egress isolation"
-echo "      docker compose logs -f darkwatch"
+echo "      sudo docker compose logs -f darkwatch"
 echo
 ok "Operator runbook: $REPO_ROOT/ops/RUNBOOK.md"

@@ -16,7 +16,7 @@
         "screenshot_mode": "tor_render",
         "newnym_between_sites": true,
         "domain_fail_breaker": 3,
-        "tor_control_host": "tor",
+        "tor_control_host": "tunnel1",
         "tor_control_port": 9051,
         "tor_control_password": "${TOR_CONTROL_PASSWORD}",
         "user_agents": [
