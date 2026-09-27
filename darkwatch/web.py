@@ -1789,6 +1789,8 @@ def route_tg_search():
         # Enrich with channel_username so the UI can build t.me links.
         for m in msgs:
             m["channel_username"] = info["tg_username"]
+        # Exact keyword hits first; Telegram's fuzzy matches after.
+        msgs.sort(key=lambda m: not m.get("exact_match"))
         return jsonify({"scope": "channel", "hits": len(msgs),
                         "results": msgs})
 
@@ -1809,6 +1811,7 @@ def route_tg_search():
                     m["url_id"] = ch["id"]
                 out.extend(hits)
         out.sort(key=lambda m: m.get("date_iso") or "", reverse=True)
+        out.sort(key=lambda m: not m.get("exact_match"))   # stable: exact first
         return jsonify({"scope": "all", "channels_searched": len(channels),
                         "hits": len(out), "results": out[:limit * 3]})
 

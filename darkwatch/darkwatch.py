@@ -935,8 +935,12 @@ class Database:
         messages. O(log N) via the sqlite_ftx-style LIKE plus the
         `idx_tg_messages_url` index when url_ids is narrow. Returns rows
         with channel context + finding counts."""
-        where = ["m.text IS NOT NULL", "LOWER(m.text) LIKE LOWER(?)"]
-        params = ["%" + query + "%"]
+        # Escape LIKE metacharacters so % and _ in a keyword match literally
+        # (e.g. "user_name" must not match "userXname").
+        escaped = (query.replace("\\", "\\\\")
+                        .replace("%", "\\%").replace("_", "\\_"))
+        where = ["m.text IS NOT NULL", "LOWER(m.text) LIKE LOWER(?) ESCAPE '\\'"]
+        params = ["%" + escaped + "%"]
         if min_date_iso:
             where.append("m.date_iso >= ?")
             params.append(min_date_iso)
@@ -2789,8 +2793,10 @@ class DarkMTProto:
     def _proxy_tuple(self):
         """Return the (type, host, port) tuple Telethon expects, or None."""
         if self.use_tor:
+            # The tor sidecar shares tunnel1's netns and has no DNS name of
+            # its own, so the SOCKS port lives at tunnel1:9050.
             p = self.config.get("proxy", {})
-            return ("socks5", p.get("host", "tor"), int(p.get("port", 9050)))
+            return ("socks5", p.get("host", "tunnel1"), int(p.get("port", 9050)))
         if self.proxy_host:
             return (self.proxy_type, self.proxy_host, self.proxy_port)
         return None
@@ -2818,6 +2824,13 @@ class DarkMTProto:
         proxy = self._proxy_tuple()
         if proxy:
             kwargs["proxy"] = proxy
+        elif not self.config.get("telegram", {}).get("allow_direct"):
+            # Fail closed: without a proxy Telethon connects straight from
+            # the host's IP, bypassing the tunnel2 egress path. Opt in with
+            # telegram.allow_direct=true only if that is really intended.
+            raise RuntimeError(
+                "telegram proxy not configured (telegram.proxy_host / use_tor) — "
+                "refusing a direct connection; set telegram.allow_direct=true to override")
         return TelegramClient(**kwargs)
 
     def status(self):
@@ -3888,18 +3901,31 @@ class DarkMTProto:
                     return []
                 kwargs = {"entity": entity, "search": query,
                           "limit": limit}
+                # iter_messages walks newest -> oldest. Its offset_date means
+                # "start at this date and go OLDER", which inverted the
+                # "on/after min_date" filter. Stop once we pass the cutoff.
+                min_date = None
                 if min_date_iso:
                     try:
                         from datetime import datetime as _dt
-                        kwargs["offset_date"] = _dt.fromisoformat(min_date_iso)
+                        min_date = _dt.fromisoformat(min_date_iso)
+                        if min_date.tzinfo is None:
+                            min_date = min_date.replace(tzinfo=timezone.utc)
                     except Exception:
-                        pass
+                        min_date = None
+                q_lower = (query or "").lower()
                 out = []
                 async for msg in c.iter_messages(**kwargs):
                     if msg is None: continue
+                    if min_date and msg.date and msg.date < min_date:
+                        break
                     text = msg.message or ""
                     if not text: continue
                     out.append({
+                        # Telegram's server search is fuzzy (stemming,
+                        # word-prefix). Flag hits that really contain the
+                        # keyword so they can be told apart / ranked first.
+                        "exact_match": q_lower in text.lower(),
                         "channel_id": channel_id,
                         "msg_id": msg.id,
                         "date_iso": msg.date.isoformat() if msg.date else None,
@@ -4194,7 +4220,7 @@ class DarkMTProto:
                 # Sort: verified first, then scam-flagged last, then
                 # by subscriber count desc (missing last).
                 channels.sort(key=lambda c: (
-                    not c["verified"], c["scam"],
+                    c["scam"] or c["fake"], not c["verified"],
                     -(c["subscribers"] or 0)))
                 return {"channels": channels, "users": users}
             finally:
@@ -4432,8 +4458,12 @@ class DarkMTProto:
             rec["variant_hits"] = sorted(rec["variant_hits"])
             rec["signals"]      = sorted(rec["signals"])
 
+        # Telegram-flagged scam/fake channels always rank below every
+        # unflagged one: subscriber counts are cheap to inflate, so the
+        # score penalty alone could leave a big fake near the top.
         channels = sorted(agg_channels.values(),
-                          key=lambda r: -r["score"])[:limit]
+                          key=lambda r: (bool(r.get("scam") or r.get("fake")),
+                                         -r["score"]))[:limit]
         users = list(agg_users.values())[:limit]
 
         return {
