@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0-blue.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.0-blue.svg">
   <img alt="Status: public release" src="https://img.shields.io/badge/status-public%20release-brightgreen.svg">
   <img alt="Platform: Linux + Docker" src="https://img.shields.io/badge/platform-linux%20%2B%20docker-informational">
   <img alt="OPSEC: first" src="https://img.shields.io/badge/OPSEC-first-critical">
@@ -18,7 +18,7 @@
 
 ---
 
-**Status:** Public release — **v0.1.0**
+**Status:** Public release — **v0.2.0**
 
 <p align="center">
   <img src="assets/dashboard.png" alt="DarkWatch dashboard — scan panel with security gate, targets, and live log" width="900">

@@ -5,7 +5,7 @@ Custom-built for CTI teams to monitor .onion sites for organizational mentions.
 Hardened edition with anti-detection and security controls.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import os
 import sys
