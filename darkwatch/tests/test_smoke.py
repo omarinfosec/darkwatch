@@ -150,7 +150,11 @@ def test_save_custom_rule_compiles_and_lists(tmp_path):
     assert custom[0]["custom_file"] == "corp_leak.yar"
     removed = scanner.delete_custom_files(["corp_leak.yar"])
     assert removed == 1
-    assert scanner.list_rules() == []
+    # list_rules() also returns curated rules (here "c"); only the custom one
+    # must be gone.
+    remaining = scanner.list_rules()
+    assert not [r for r in remaining if r.get("custom")]
+    assert "corp_leak" not in {r["name"] for r in remaining}
 
 
 def test_save_custom_rule_rejects_duplicate_filename(tmp_path):
