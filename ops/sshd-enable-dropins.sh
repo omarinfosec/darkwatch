@@ -115,8 +115,8 @@ log "  ════════════════════════�
 log "  sshd reloaded. Auto-rollback in 2 min if NOT cancelled."
 log ""
 log "  From a second shell / machine, verify SSH still works:"
-log "      ssh -p 6245 deploy@<vm> 'date'"
-log "      ssh -p 6245 root@<vm>   'date'"
+log "      ssh -p <ssh-port> deploy@<vm> 'date'"
+log "      ssh -p <ssh-port> root@<vm>   'date'"
 log ""
 log "  Effective config now:"
 sshd -T | grep -iE 'permitrootlogin|passwordauthentication|maxauthtries|x11forwarding|allowtcpforwarding|kbdinteractive' | sed 's/^/      /'

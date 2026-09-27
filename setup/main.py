@@ -267,8 +267,10 @@ async def save_tunnel(request: Request, n: int, conf: str = Form(...)):
     except (PermissionError, OSError):
         pass
 
-    # Bring up profile-gated services — restart alone is a no-op on first save.
-    ok, detail = _compose_up_stack()
+    # Recreate this tunnel + its sidecar. A plain `up -d` is a no-op when the
+    # container already exists (only the mounted file changed), so an edited
+    # WG config would otherwise never be applied.
+    ok, detail = _compose_up_tunnel(n)
     if not ok:
         log.error("tunnel%d saved but compose up failed: %s", n, detail)
         return JSONResponse(
@@ -382,17 +384,16 @@ def _compose_run(
     return True, ", ".join(services)
 
 
-def _compose_up_stack() -> tuple[bool, str]:
-    """Create/start tunnel sidecars after WG configs are saved via the UI."""
-    services: list[str] = []
-    if TUNNEL1_CONF.is_file():
-        services.extend(["tunnel1", "tor"])
-    if TUNNEL2_CONF.is_file():
-        services.extend(["tunnel2", "tg-socks"])
-    services.append("darkwatch")
-    if not _compose_profiles():
-        return True, "no tunnel profiles to enable"
-    return _compose_run(services)
+def _compose_up_tunnel(n: int) -> tuple[bool, str]:
+    """Force-recreate tunnel N and its sidecar so a new WG config takes effect.
+    Only the listed services are force-recreated; the other tunnel is untouched."""
+    services = ["tunnel1", "tor"] if n == 1 else ["tunnel2", "tg-socks"]
+    ok, detail = _compose_run(services, force_recreate=True)
+    if not ok:
+        return ok, detail
+    # Make sure darkwatch is up too (no-op when it already is).
+    ok, more = _compose_run(["darkwatch"], no_deps=True)
+    return ok, f"{detail}, {more}" if ok else more
 
 
 def _recreate_darkwatch() -> tuple[bool, str]:

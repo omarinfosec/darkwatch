@@ -849,6 +849,14 @@ def route_ui_config():
     })
 
 
+@app.route("/healthz")
+def route_healthz():
+    # Container liveness only. Don't point the Docker healthcheck at
+    # /api/status: that endpoint drains the live-log queue, so every probe
+    # would steal log lines from the dashboard.
+    return "ok\n", 200, {"Content-Type": "text/plain"}
+
+
 @app.route("/api/health")
 def route_health():
     fresh = request.args.get("fresh") == "1"

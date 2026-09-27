@@ -1,0 +1,9 @@
+# Symlink to operator state created by ops/bootstrap.sh — never commit.
+.env
+
+# Real WireGuard configs never enter the repo (templates + examples only).
+tunnels/*/wg_confs/*.conf
+
+__pycache__/
+*.pyc
+.pytest_cache/

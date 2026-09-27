@@ -7,7 +7,12 @@
 #      goes via the tunnel1 netns, not the host).
 #
 # Run anytime:
-#   sudo ./ops/verify-egress.sh
+#   sudo ./ops/verify-egress.sh            # auto-detect configured tunnels
+#   sudo ./ops/verify-egress.sh --tor      # only check the Tor path
+#   sudo ./ops/verify-egress.sh --tor --tg # check both explicitly
+#
+# Paths whose tunnel isn't configured are skipped, not failed — deploy.sh
+# only enables the compose profiles whose WG config exists.
 #
 # Exit codes:
 #   0 — all checks passed
@@ -22,9 +27,38 @@ FAILED=0
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (uses docker)" >&2; exit 1; }
 
+CHECK_TOR=0
+CHECK_TG=0
+for arg in "$@"; do
+    case "$arg" in
+        --tor) CHECK_TOR=1 ;;
+        --tg)  CHECK_TG=1 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    esac
+done
+if (( ! CHECK_TOR && ! CHECK_TG )); then
+    DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
+    [[ -f "$DATA_ROOT/secrets/tunnel1/wg_confs/wg0.conf" ]] && CHECK_TOR=1
+    [[ -f "$DATA_ROOT/secrets/tunnel2/wg_confs/wg0.conf" ]] && CHECK_TG=1
+fi
+if (( ! CHECK_TOR && ! CHECK_TG )); then
+    echo "no tunnels configured — nothing to verify" >&2
+    exit 1
+fi
+
+# JSON parsing runs inside the darkwatch image so the host needs no python3.
+json_field() {
+    docker exec -i darkwatch python -c \
+        'import sys,json; d=json.load(sys.stdin); print(d.get(sys.argv[1], ""))' "$1" 2>/dev/null || true
+}
+
 # ─── 1. Containers up? ──────────────────────────────────────────────────────
 log "checking containers"
-for svc in tunnel1 tunnel2 tor tg-socks darkwatch; do
+SERVICES=(darkwatch)
+(( CHECK_TOR )) && SERVICES+=(tunnel1 tor)
+(( CHECK_TG ))  && SERVICES+=(tunnel2 tg-socks)
+for svc in "${SERVICES[@]}"; do
     if docker ps --format '{{.Names}}' | grep -q "^${svc}$"; then
         ok "$svc running"
     else
@@ -37,25 +71,35 @@ done
 # no DNS entry of their own; the SOCKS port is reachable via the WG
 # container's hostname because they share the netns. Hence tunnel1:9050,
 # tunnel2:1080 below.
-log "checking Tor egress (check.torproject.org)"
-TOR_RESP="$(docker exec darkwatch curl -s --socks5-hostname tunnel1:9050 --max-time 30 \
-            https://check.torproject.org/api/ip 2>/dev/null || echo '{}')"
-TOR_IS_TOR="$(echo "$TOR_RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("IsTor", False))' 2>/dev/null || echo "False")"
-TOR_EXIT_IP="$(echo "$TOR_RESP" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("IP", ""))' 2>/dev/null || echo "")"
-if [[ "$TOR_IS_TOR" == "True" ]]; then
-    ok "tor exit identified as Tor (exit IP: $TOR_EXIT_IP)"
+TOR_EXIT_IP=""
+if (( CHECK_TOR )); then
+    log "checking Tor egress (check.torproject.org)"
+    TOR_RESP="$(docker exec darkwatch curl -s --socks5-hostname tunnel1:9050 --max-time 30 \
+                https://check.torproject.org/api/ip 2>/dev/null || echo '{}')"
+    TOR_IS_TOR="$(printf '%s' "$TOR_RESP" | json_field IsTor)"
+    TOR_EXIT_IP="$(printf '%s' "$TOR_RESP" | json_field IP)"
+    if [[ "$TOR_IS_TOR" == "True" ]]; then
+        ok "tor exit identified as Tor (exit IP: $TOR_EXIT_IP)"
+    else
+        bad "tor egress did NOT identify as Tor: $TOR_RESP"
+    fi
 else
-    bad "tor egress did NOT identify as Tor: $TOR_RESP"
+    log "skipping Tor egress check (tunnel1 not configured)"
 fi
 
 # ─── 3. TG path exit IP ─────────────────────────────────────────────────────
-log "checking Telegram-path exit IP"
-TG_EXIT="$(docker exec darkwatch curl -s --socks5 tunnel2:1080 --max-time 30 \
-           https://api.ipify.org 2>/dev/null || echo "")"
-if [[ -n "$TG_EXIT" ]]; then
-    ok "tg-socks exit IP: $TG_EXIT"
+TG_EXIT=""
+if (( CHECK_TG )); then
+    log "checking Telegram-path exit IP"
+    TG_EXIT="$(docker exec darkwatch curl -s --socks5-hostname tunnel2:1080 --max-time 30 \
+               https://api.ipify.org 2>/dev/null || echo "")"
+    if [[ -n "$TG_EXIT" ]]; then
+        ok "tg-socks exit IP: $TG_EXIT"
+    else
+        bad "tg-socks egress not reachable"
+    fi
 else
-    bad "tg-socks egress not reachable"
+    log "skipping Telegram-path check (tunnel2 not configured)"
 fi
 
 # ─── 4. Tor IP and TG IP must differ ────────────────────────────────────────
