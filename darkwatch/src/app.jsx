@@ -2976,6 +2976,12 @@ function SmartSearchResultRow({ m, q, onOpenChannel }) {
                 <span className="mono text-gray-500">#{m.msg_id}</span>
                 <span className="mono text-gray-500">{m.date_iso}</span>
                 {m._stage && <Pill tone="gray">stage {m._stage}</Pill>}
+                {m.exact_match === false && (
+                    <Pill tone="yellow"
+                          title="Telegram's server search matched a related word (stemming / prefix); the exact keyword is not in this message">
+                        fuzzy match
+                    </Pill>
+                )}
                 {m.finding_count > 0 && (
                     <Pill tone="red">⚑ {m.finding_count} finding</Pill>
                 )}
@@ -3010,6 +3016,9 @@ function SmartSearchResults({ results, q, onOpenChannel }) {
         if (seen.has(k)) return false;
         seen.add(k); return true;
     });
+    // Exact keyword hits first; Telegram's fuzzy matches (exact_match ===
+    // false) after. Stable, so each group keeps its original order.
+    unique.sort((a, b) => (a.exact_match === false) - (b.exact_match === false));
     return (
         <div className="space-y-2 max-h-[60vh] overflow-y-auto">
             <div className="text-[10px] text-gray-500 mono">
