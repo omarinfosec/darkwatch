@@ -224,3 +224,38 @@ def test_save_custom_rule_rejects_invalid_syntax(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_rescan_tg_channel_is_idempotent_and_releases_db_lock(tmp_path):
+    """Prior findings are purged under db.lock in one transaction; the YARA
+    pass (which takes the non-reentrant db.lock itself) runs after it."""
+    from types import SimpleNamespace
+    from darkwatch import Database, DarkWebCrawler
+
+    db = Database(str(tmp_path / "dw.db"))
+    db.add_url("tg://leaks", source="telegram")
+    url_id = db.conn.execute("SELECT id FROM urls").fetchone()[0]
+    db.conn.execute("UPDATE urls SET tg_username = 'leaks' WHERE id = ?", (url_id,))
+    for msg_id in (1, 2):
+        db.add_page(url_id, f"https://t.me/leaks/{msg_id}", "t", f"hash{msg_id}",
+                    page_type="telegram_message")
+        page_id = db.conn.execute(
+            "SELECT id FROM pages WHERE content_hash = ?", (f"hash{msg_id}",)).fetchone()[0]
+        db.conn.execute(
+            "INSERT INTO tg_messages (page_id, url_id, msg_id, text) VALUES (?, ?, ?, ?)",
+            (page_id, url_id, msg_id, f"message {msg_id}"))
+    db.conn.commit()
+
+    def fake_match(url_id_, page_url, text):
+        # Would deadlock if rescan still held db.lock here.
+        assert db.lock.acquire(timeout=1)
+        db.lock.release()
+        db.add_finding(url_id_, page_url, "r", "keyword:text", 50, "m", "s", "medium")
+        return 1
+
+    fake = SimpleNamespace(db=db, _yara_match_text=fake_match)
+    for _ in range(2):
+        out = DarkWebCrawler.rescan_tg_channel(fake, url_id)
+        assert out == {"scanned": 2, "findings": 2}
+    # Second run purged the first run's findings instead of doubling them.
+    assert db.conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 2
