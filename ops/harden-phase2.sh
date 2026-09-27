@@ -154,22 +154,41 @@ lock_root_ssh() {
         echo "PermitRootLogin no" >> "$CFG"
     fi
 
+    # sshd keeps the FIRST value it reads. When sshd_config Includes
+    # sshd_config.d/ (at the top, on Debian/Ubuntu), a drop-in such as
+    # 50-cloud-init.conf wins over the main file — so also write a drop-in
+    # that sorts first.
+    local DROPIN=/etc/ssh/sshd_config.d/00-darkwatch-rootlogin.conf
+    if grep -qE "^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d" "$CFG"; then
+        log "writing $DROPIN (drop-ins are read before the main file's own lines)"
+        printf '# Managed by DarkWatch ops/harden-phase2.sh\nPermitRootLogin no\n' > "$DROPIN"
+        chmod 0644 "$DROPIN"
+    fi
+
     log "validating new config"
-    sshd -t || { cp "$BAK" "$CFG"; fail "sshd config invalid — reverted from backup"; }
+    sshd -t || { cp "$BAK" "$CFG"; rm -f "$DROPIN"; fail "sshd config invalid — reverted from backup"; }
 
     log "scheduling 2-min auto-rollback (cancel manually after verifying access)"
     # If anything goes wrong, this restores the backup and restarts sshd.
     # Cancel manually with: systemctl stop sshd-rollback.timer
-    cat > /tmp/sshd-rollback.sh <<EOF
+    cat > /run/darkwatch-sshd-rollback.sh <<EOF
 #!/bin/bash
 cp "$BAK" "$CFG"
+rm -f "$DROPIN"
 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 EOF
-    chmod 0700 /tmp/sshd-rollback.sh
-    systemd-run --on-active=2min --unit=sshd-rollback /tmp/sshd-rollback.sh
+    chmod 0700 /run/darkwatch-sshd-rollback.sh
+    systemd-run --on-active=2min --unit=sshd-rollback /run/darkwatch-sshd-rollback.sh
 
     log "reloading sshd"
     systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
+
+    local eff
+    eff="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')"
+    if [[ "$eff" != "no" ]]; then
+        warn "effective PermitRootLogin is '$eff', expected 'no' — another sshd config line wins"
+        warn "check: grep -rn PermitRootLogin /etc/ssh/sshd_config /etc/ssh/sshd_config.d/"
+    fi
 
     log ""
     log "  ════════════════════════════════════════════════════════════════"

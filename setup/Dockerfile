@@ -1,15 +1,23 @@
-FROM docker:27-cli AS dockercli
+FROM docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
 
 FROM python:3.11-slim-bookworm@sha256:ee710afcfb733f4a750d9be683cf054b5cd247b6c5f5237a6849ea568b90ab15
 
+# Compose v2.29.0 is checksum-verified against the release checksums.txt.
 # docker compose is needed to create profile-gated tunnel containers after the
 # operator saves a WG config (restart alone is a no-op if they were never up).
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
-    && curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.0/docker-compose-linux-$(uname -m)" \
+    && arch="$(uname -m)" \
+    && case "$arch" in \
+         x86_64)  sum=fb3f6c317056ec54e8756851663ca788521f7a9c60afb8a595bc7a05ffaa8951 ;; \
+         aarch64) sum=49941418051846d72c74dd8df1f8b4ff753ca74d29986361d937384fbfb63569 ;; \
+         *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.0/docker-compose-linux-${arch}" \
          -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    && echo "${sum}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c - \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
@@ -42,4 +50,6 @@ ENV DARKWEBAPP_DATA_ROOT=/data \
 
 EXPOSE 8090
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8090"]
+# --no-access-log: the first visit is GET /?token=<SETUP_AUTH_TOKEN>, which
+# would otherwise be written to `docker logs setup` in full.
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8090", "--no-access-log"]

@@ -358,15 +358,23 @@ def _run_health_checks():
         "tg_vpn": _check_tg_vpn,
     }
     results = {}
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    # One shared 20s deadline, and don't wait for stragglers on exit: the
+    # `with` form's shutdown(wait=True) blocked for the slowest check
+    # (_check_dns can take ~60s), stalling /api/scan's security gate.
+    ex = ThreadPoolExecutor(max_workers=5)
+    deadline = time.monotonic() + 20
+    try:
         futs = {name: ex.submit(fn) for name, fn in checks.items()}
         for name, fut in futs.items():
             try:
-                results[name] = fut.result(timeout=20)
+                results[name] = fut.result(
+                    timeout=max(0.0, deadline - time.monotonic()))
             except FuturesTimeout:
                 results[name] = {"ok": False, "detail": "timed out"}
             except Exception as e:
                 results[name] = {"ok": False, "detail": f"error: {e}"}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     # IP-leak must run after Tor to share connection pools sensibly.
     results["ip_leak"] = _check_ip_leak(results["tor"])
     # `dns` (onion canary) is required for scans — clearnet exit via Tor
@@ -2349,7 +2357,22 @@ def route_tg_media_serve(relpath):
         abort(404)
     if not os.path.isfile(target):
         abort(404)
-    return send_file(target, as_attachment=False)
+    # Media comes from untrusted channels. Serving e.g. an .html/.svg file
+    # inline from the dashboard origin would run its script with full API
+    # access, so only raster images render inline; everything else is a
+    # forced download. CSP sandbox + nosniff as defense in depth.
+    ext = os.path.splitext(target)[1].lower()
+    inline_types = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".png": "image/png", ".gif": "image/gif",
+                    ".webp": "image/webp"}
+    if ext in inline_types:
+        resp = send_file(target, mimetype=inline_types[ext])
+    else:
+        resp = send_file(target, as_attachment=True,
+                         mimetype="application/octet-stream")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    return resp
 
 
 @app.route("/api/keywords/export.<fmt>")

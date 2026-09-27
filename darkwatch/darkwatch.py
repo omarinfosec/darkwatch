@@ -10,6 +10,7 @@ __version__ = "0.1.0"
 import os
 import sys
 import json
+import socket
 import time
 import sqlite3
 import hashlib
@@ -2446,6 +2447,7 @@ try:
         FloodWaitError, AuthKeyUnregisteredError,
     )
     from telethon.tl.types import Channel, Chat
+    from telethon.utils import resolve_id as tg_resolve_id
     import asyncio
     TELETHON_AVAILABLE = True
 except ImportError:
@@ -2833,9 +2835,28 @@ class DarkMTProto:
         sess_exists = os.path.exists(self.session_path) or \
                       os.path.exists(self.session_path + ".session")
         return {**base, "configured": True,
-                "authenticated": self._check_authorized() if sess_exists else False,
+                "authenticated": self._cached_authorized() if sess_exists else False,
                 "proxy": self._proxy_tuple(),
                 "use_tor": self.use_tor}
+
+    def _cached_authorized(self, ttl=300):
+        """status() is polled every ~15s per open tab; opening a fresh
+        MTProto connection each time burned rate-limit tokens and produced a
+        fingerprintable connect pattern. Cache the answer for `ttl` seconds,
+        keyed on the session file's mtime so login/logout invalidate it."""
+        try:
+            mtime = max(os.path.getmtime(p) for p in
+                        (self.session_path, self.session_path + ".session")
+                        if os.path.exists(p))
+        except ValueError:
+            mtime = None
+        cache = getattr(self, "_auth_cache", None)
+        now = time.time()
+        if cache and cache[0] == mtime and now - cache[1] < ttl:
+            return cache[2]
+        ok = self._check_authorized()
+        self._auth_cache = (mtime, now, ok)
+        return ok
 
     def _check_authorized(self):
         """Synchronous wrapper: is the persisted session still valid?"""
@@ -4575,11 +4596,13 @@ class TelegramLiveListener:
                 @self._client.on(events.NewMessage)
                 async def _handler(event):
                     try:
-                        cid = getattr(event.chat_id, "channel_id", None) \
-                              or event.chat_id
-                        # Telethon normalizes to negative IDs for channels;
-                        # use abs when comparing against our positive ids.
-                        cid_norm = abs(int(cid)) if cid is not None else None
+                        # event.chat_id is the "marked" id (-100<id> for
+                        # channels); abs() of that is 100<id>, which never
+                        # matched the raw ids we store. resolve_id() strips
+                        # the marker and returns the raw positive id.
+                        cid = event.chat_id
+                        cid_norm = (tg_resolve_id(int(cid))[0]
+                                    if cid is not None else None)
                         if cid_norm and cid_norm not in {abs(int(c))
                                                          for c in self._channel_ids}:
                             return
@@ -4862,9 +4885,13 @@ class DarkWebCrawler:
         if not self.newnym_between_sites or not STEM_AVAILABLE:
             return False
         try:
+            # stem's from_port only accepts an IP literal ("Invalid IP
+            # address: tunnel1"), so resolve the container name first.
+            # This is Docker's internal DNS for a sidecar, not a target lookup.
+            addr = socket.gethostbyname(self.tor_control_host)
             with Controller.from_port(
-                address=self.tor_control_host,
-                port=self.tor_control_port,
+                address=addr,
+                port=int(self.tor_control_port),
             ) as ctrl:
                 if self.tor_control_password:
                     ctrl.authenticate(password=self.tor_control_password)
@@ -4934,7 +4961,11 @@ class DarkWebCrawler:
                 # check size before downloading
                 content_length = resp.headers.get("Content-Length")
                 max_size = self.security_cfg.get("max_response_size_mb", 10) * 1024 * 1024
-                if content_length and int(content_length) > max_size:
+                try:
+                    declared = int(content_length or 0)
+                except ValueError:
+                    declared = 0  # malformed header; streamed cap below still applies
+                if declared > max_size:
                     log.warning(f"  Response too large ({content_length} bytes), skipping")
                     resp.close()
                     return None, "size"

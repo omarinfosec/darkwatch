@@ -73,7 +73,7 @@ run "systemctl disable --now cups cups-browsed 2>/dev/null || true"
 # This is the part of the script that has the most "I broke SSH and locked
 # myself out" failure mode, so it's defensive on three axes:
 #
-#   1. We write the directives to a drop-in (99-darkwatch-hardening.conf)
+#   1. We write the directives to a drop-in (01-darkwatch-hardening.conf)
 #      so they're easy to read, diff, and revert with a single rm.
 #   2. We DETECT whether main /etc/ssh/sshd_config has an `Include` for
 #      the drop-in directory. If it doesn't, the drop-in is dead weight —
@@ -86,7 +86,11 @@ run "systemctl disable --now cups cups-browsed 2>/dev/null || true"
 #      timer. If the new config locks them out, the auto-revert fires and
 #      they don't lose access.
 log "tightening sshd config"
-SSHD_DROPIN=/etc/ssh/sshd_config.d/99-darkwatch-hardening.conf
+# sshd keeps the FIRST value it reads for each option, and Include sits at
+# the top of sshd_config — so the drop-in must sort before distro/cloud-init
+# files like 50-cloud-init.conf (which often sets PasswordAuthentication yes).
+SSHD_DROPIN=/etc/ssh/sshd_config.d/01-darkwatch-hardening.conf
+SSHD_DROPIN_LEGACY=/etc/ssh/sshd_config.d/99-darkwatch-hardening.conf
 
 # PasswordAuthentication=no locks out anyone without a key. Refuse to apply
 # unless at least one authorized_keys file exists for root or the sudo user.
@@ -117,7 +121,7 @@ EOF
 
 if (( ! DRY_RUN )); then
     install -m 0644 /tmp/sshd-darkwatch.conf "$SSHD_DROPIN"
-    rm -f /tmp/sshd-darkwatch.conf
+    rm -f /tmp/sshd-darkwatch.conf "$SSHD_DROPIN_LEGACY"
 
     # Check whether main sshd_config has an Include directive that would
     # actually cause our drop-in to be loaded.
@@ -140,14 +144,14 @@ if (( ! DRY_RUN )); then
 
         # Schedule auto-rollback in case the reload + new config break
         # SSH access in a way the validator didn't catch.
-        cat > /tmp/sshd-rollback.sh <<EOF
+        cat > /run/darkwatch-sshd-rollback.sh <<EOF
 #!/bin/bash
 cp "$BAK_MAIN" "$SSHD_MAIN"
 rm -f "$SSHD_DROPIN"
 systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 EOF
-        chmod 0700 /tmp/sshd-rollback.sh
-        systemd-run --on-active=2min --unit=sshd-rollback /tmp/sshd-rollback.sh
+        chmod 0700 /run/darkwatch-sshd-rollback.sh
+        systemd-run --on-active=2min --unit=sshd-rollback /run/darkwatch-sshd-rollback.sh
         warn "  scheduled 2-min auto-rollback. AFTER this returns, verify SSH from"
         warn "  a SECOND machine, then cancel: sudo systemctl stop sshd-rollback.timer"
     fi
@@ -165,8 +169,9 @@ EOF
     eff_pwauth=$(sshd -T 2>/dev/null | awk '/passwordauthentication/{print $2}')
     if [[ "$eff_pwauth" != "no" ]]; then
         warn "  PasswordAuthentication is '$eff_pwauth', expected 'no'"
-        warn "  Likely cause: main $SSHD_MAIN has 'PasswordAuthentication yes' overriding our drop-in"
-        warn "  Fix: edit $SSHD_MAIN to comment out the conflicting line, then re-run this script"
+        warn "  Likely cause: a 'PasswordAuthentication yes' line read before our drop-in"
+        warn "  (in $SSHD_MAIN above its Include line, or a drop-in sorting before $(basename "$SSHD_DROPIN"))"
+        warn "  Fix: comment out the conflicting line, then re-run this script"
     fi
 fi
 
