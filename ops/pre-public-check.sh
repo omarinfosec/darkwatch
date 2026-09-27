@@ -23,13 +23,14 @@ if git ls-files | grep -E '(^|/)\.env$|\.env\.[^/]+$|\.pem$|\.key$|\.session$|wg
     git ls-files | grep -E '(^|/)\.env$|\.env\.[^/]+$|\.pem$|\.key$|\.session$|wg_confs/[^/]+\.conf$' | grep -v '^\.env\.example$' | while read -r f; do
         bad "tracked file must not ship: $f"
     done
+    fail=1  # `bad` above runs in a pipeline subshell; its fail=1 is lost
 else
     ok "no .env / keys / sessions / real wg configs tracked"
 fi
 
 hdr "Gitleaks (working tree + full git history)"
 if command -v gitleaks >/dev/null 2>&1; then
-    if gitleaks detect --source . --no-banner --redact >/tmp/gitleaks-now.txt 2>&1; then
+    if gitleaks detect --source . --no-git --no-banner --redact >/tmp/gitleaks-now.txt 2>&1; then
         ok "gitleaks clean (current tree)"
     else
         bad "gitleaks findings in current tree — see /tmp/gitleaks-now.txt"
@@ -44,7 +45,9 @@ else
 fi
 
 hdr "High-risk patterns in tracked files"
-if rg -n --hidden --glob '!.git' \
+if ! command -v rg >/dev/null 2>&1; then
+    bad "ripgrep (rg) not installed — pattern scan skipped; install ripgrep"
+elif rg -n --hidden --glob '!.git' \
     -e 'ghp_[A-Za-z0-9]{20,}' \
     -e 'github_pat_[A-Za-z0-9_]{20,}' \
     -e 'sk-[A-Za-z0-9]{20,}' \

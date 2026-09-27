@@ -66,6 +66,10 @@ services:
     network_mode: "service:tunnel1"
     env_file:
       - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
+    volumes:
+      # Persist Tor state (guard nodes, consensus cache) across recreates.
+      # Re-picking guards on every deploy is slower and worse for anonymity.
+      - tor-data:/var/lib/tor
     depends_on:
       tunnel1:
         condition: service_healthy
@@ -212,6 +216,9 @@ services:
     networks:
       - darknet
     # darknet: reach tunnel2:1080 (tg-socks) for live Telegram credential checks.
+
+volumes:
+  tor-data:
 
 networks:
   darknet:

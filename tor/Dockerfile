@@ -24,16 +24,16 @@ RUN apt-get update && \
 # config dir owned by it so the entrypoint can write torrc there.
 RUN install -d -m 0700 -o debian-tor -g debian-tor /etc/tor/run
 
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh
+COPY entrypoint.sh healthcheck.sh /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 
 USER debian-tor
 
 EXPOSE 9050 9051
 
-# Tor's own healthcheck: the SOCKS port responds to a connection.
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20s \
-  CMD bash -c 'echo > /dev/tcp/127.0.0.1/9050' || exit 1
+# Healthy once a circuit is established (asked over the ControlPort).
+HEALTHCHECK --interval=30s --timeout=6s --retries=3 --start-period=60s \
+  CMD /usr/local/bin/healthcheck.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["tor", "-f", "/etc/tor/run/torrc"]

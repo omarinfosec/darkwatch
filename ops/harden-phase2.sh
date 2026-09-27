@@ -105,6 +105,12 @@ ${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/git -C ${DARKWEBAPP_REPO} fetch
 ${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/git -C ${DARKWEBAPP_REPO} status
 ${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/git -C ${DARKWEBAPP_REPO} log *
 
+# docker / docker compose. `docker compose` reads the root-only env file
+# (via the .env symlink and env_file:), so it has to run under sudo. This
+# grants nothing new: membership in the docker group is already
+# root-equivalent.
+${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/docker
+
 # Read-only inspection of operator state (env file is 0600 root)
 ${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/cat /var/lib/darkwebapp/env
 ${DEPLOY_USER} ALL=(root) NOPASSWD: /usr/bin/grep * /var/lib/darkwebapp/env
