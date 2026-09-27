@@ -169,21 +169,11 @@ PersistentKeepalive = 25"
   </footer>
 
   <script>
-    // ── Token handling ────────────────────────────────────────────────────
-    // On first load: read ?token=... from the URL, stash in sessionStorage,
-    // then strip the URL so it doesn't sit in the address bar / browser history.
-    const urlParams = new URLSearchParams(window.location.search);
-    const urlToken = urlParams.get("token");
-    if (urlToken) {
-      sessionStorage.setItem("setup_token", urlToken);
-      window.history.replaceState({}, "", window.location.pathname);
-    }
-    const TOKEN = sessionStorage.getItem("setup_token") || "";
-
+    // ── Auth ──────────────────────────────────────────────────────────────
+    // The server trades ?token= for an HttpOnly session cookie and redirects,
+    // so page JS never sees the token. Requests authenticate via that cookie.
     function authHeaders() {
-      const h = {};
-      if (TOKEN) h["Authorization"] = "Bearer " + TOKEN;
-      return h;
+      return {};
     }
 
     function statusBadge(ok, okLabel, noLabel) {
