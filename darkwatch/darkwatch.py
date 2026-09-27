@@ -66,7 +66,7 @@ DEFAULT_CONFIG = {
         "screenshot_mode": "tor_render",
         "newnym_between_sites": True,
         "domain_fail_breaker": 3,
-        "tor_control_host": "tor",
+        "tor_control_host": "tunnel1",
         "tor_control_port": 9051,
         "tor_control_password": "",
         # Auto-rescan cadence (hours). 0 = disabled. When >0, the
@@ -4844,7 +4844,7 @@ class DarkWebCrawler:
         self.scan_pdfs = cc.get("scan_pdfs", False)
         self.newnym_between_sites = cc.get("newnym_between_sites", True)
         self.domain_fail_breaker = cc.get("domain_fail_breaker", 3)
-        self.tor_control_host = cc.get("tor_control_host", "tor")
+        self.tor_control_host = cc.get("tor_control_host", "tunnel1")
         self.tor_control_port = cc.get("tor_control_port", 9051)
         self.tor_control_password = cc.get("tor_control_password", "")
 

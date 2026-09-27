@@ -6,7 +6,7 @@
 #
 # Implements baseline VM hardening:
 #   - UFW default-deny + allow SSH + WG outbound
-#   - fail2ban sshd jail (ssh on 6245)
+#   - fail2ban sshd jail (on the port sshd already uses)
 #   - disable CUPS
 #   - PostgreSQL bind to 127.0.0.1
 #   - sshd: PasswordAuthentication no, PubkeyAuthentication yes
@@ -24,7 +24,10 @@ fail() { printf '\033[1;31m[harden ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || fail "must run as root"
 
-SSH_PORT="${SSH_PORT:-6245}"
+# Default to the port sshd is ACTUALLY listening on. Hard-coding a custom
+# port here (without moving sshd) made `ufw default deny` lock operators out.
+_detected_ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+SSH_PORT="${SSH_PORT:-${_detected_ssh_port:-22}}"
 
 # ─── 1. UFW ──────────────────────────────────────────────────────────────────
 log "installing ufw fail2ban unattended-upgrades"
@@ -84,6 +87,16 @@ run "systemctl disable --now cups cups-browsed 2>/dev/null || true"
 #      they don't lose access.
 log "tightening sshd config"
 SSHD_DROPIN=/etc/ssh/sshd_config.d/99-darkwatch-hardening.conf
+
+# PasswordAuthentication=no locks out anyone without a key. Refuse to apply
+# unless at least one authorized_keys file exists for root or the sudo user.
+_have_keys=0
+for _home in /root "$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"; do
+    [[ -s "$_home/.ssh/authorized_keys" ]] && _have_keys=1
+done
+if (( ! _have_keys )) && (( ! DRY_RUN )); then
+    fail "no ~/.ssh/authorized_keys for root or ${SUDO_USER:-root} — add an SSH key before disabling password auth"
+fi
 SSHD_MAIN=/etc/ssh/sshd_config
 
 cat > /tmp/sshd-darkwatch.conf <<EOF
@@ -93,7 +106,9 @@ PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 X11Forwarding no
-AllowTcpForwarding no
+# `local` still permits `ssh -L 8080:localhost:8080` (the documented way to
+# reach the dashboards) while blocking remote/reverse forwards.
+AllowTcpForwarding local
 ClientAliveInterval 300
 ClientAliveCountMax 2
 MaxAuthTries 3

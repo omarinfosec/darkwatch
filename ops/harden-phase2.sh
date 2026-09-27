@@ -19,9 +19,9 @@
 # The split exists so you can verify SSH-as-deploy from another machine
 # BEFORE locking root out. Recommended flow:
 #   1. sudo ./ops/harden-phase2.sh --create
-#   2. From your laptop: ssh deploy@<vm> -p 6245 'date'   (must succeed)
+#   2. From your laptop: ssh deploy@<vm> -p <ssh-port> 'date'   (must succeed)
 #   3. sudo ./ops/harden-phase2.sh --lock-root
-#   4. From your laptop, IMMEDIATELY: ssh deploy@<vm> -p 6245 'date'
+#   4. From your laptop, IMMEDIATELY: ssh deploy@<vm> -p <ssh-port> 'date'
 #      - If it works: sudo systemctl stop sshd-rollback.timer
 #      - If it fails: do nothing — the timer auto-restores in 2 min
 #      - root SSH should be denied either way
@@ -29,7 +29,10 @@
 set -euo pipefail
 
 DEPLOY_USER="deploy"
-SSH_PORT="${SSH_PORT:-6245}"
+# Default to the port sshd is ACTUALLY listening on. Hard-coding a custom
+# port here (without moving sshd) made `ufw default deny` lock operators out.
+_detected_ssh_port="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+SSH_PORT="${SSH_PORT:-${_detected_ssh_port:-22}}"
 DARKWEBAPP_REPO="${DARKWEBAPP_REPO:-/opt/darkwebapp}"
 
 MODE=""

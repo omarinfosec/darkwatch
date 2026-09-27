@@ -69,17 +69,20 @@ fi
 # present. Operator can run with one tunnel, both, or neither — degraded
 # functionality (no Tor crawl / no Telegram scrape) but darkwatch still starts.
 COMPOSE_PROFILES_ARGS=""
+VERIFY_ARGS=()
 TUNNEL1_CONF="$DATA_ROOT/secrets/tunnel1/wg_confs/wg0.conf"
 TUNNEL2_CONF="$DATA_ROOT/secrets/tunnel2/wg_confs/wg0.conf"
 if [[ -f "$TUNNEL1_CONF" ]]; then
     log "  found Tunnel 1 (Tor research) WG config — enabling 'tor' profile"
     COMPOSE_PROFILES_ARGS+=" --profile tor"
+    VERIFY_ARGS+=(--tor)
 else
     log "  no Tunnel 1 WG config at $TUNNEL1_CONF — Tor crawling will be unavailable"
 fi
 if [[ -f "$TUNNEL2_CONF" ]]; then
     log "  found Tunnel 2 (Telegram) WG config — enabling 'tg' profile"
     COMPOSE_PROFILES_ARGS+=" --profile tg"
+    VERIFY_ARGS+=(--tg)
     if ! grep -qE '^TELEGRAM_API_ID=.+' "$DATA_ROOT/env" || \
        ! grep -qE '^TELEGRAM_API_HASH=.+' "$DATA_ROOT/env"; then
         warn "  Tunnel 2 is up but Telegram credentials are not set yet"
@@ -93,16 +96,23 @@ if [[ -z "$COMPOSE_PROFILES_ARGS" ]]; then
     warn "  configure a WG tunnel via the Setup UI or place a wg0.conf at one of the paths above"
 fi
 
-# Operational data dirs must exist (compose mounts them)
-mkdir -p "$DATA_ROOT/darkwatch/loot" \
-         "$DATA_ROOT/darkwatch/data" \
-         "$DATA_ROOT/darkwatch/investigations" \
-         "$DATA_ROOT/yara-private"
+# Operational data dirs must exist and be writable by the container user
+# (uid 999). Re-running bootstrap is idempotent and gets ownership right —
+# a plain `mkdir -p` here would leave root-owned dirs darkwatch can't write.
+for d in loot data investigations yara-private; do
+    if [[ ! -d "$DATA_ROOT/darkwatch/$d" ]]; then
+        log "  $DATA_ROOT/darkwatch/$d missing — re-running bootstrap"
+        "$SCRIPT_DIR/bootstrap.sh"
+        break
+    fi
+done
 
-# Working tree must be clean (refuse to deploy uncommitted changes)
+# Working tree must be clean (refuse to deploy uncommitted changes).
+# Untracked files are ignored: bootstrap's .env symlink lives in the repo root.
 if [[ -d .git ]]; then
-    if [[ -n "$(git status --porcelain)" ]]; then
-        fail "git working tree is dirty. Commit or stash before deploying."
+    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+        git status --short --untracked-files=no >&2
+        fail "git working tree has uncommitted changes. Commit or stash before deploying."
     fi
     log "git: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
 fi
@@ -113,32 +123,45 @@ if (( ! SKIP_PULL )) && [[ -d .git ]]; then
     git pull --ff-only
 fi
 
-# ─── Build / pull images ─────────────────────────────────────────────────────
+# ─── Pull / build images ─────────────────────────────────────────────────────
+log "docker compose pull (third-party images only)"
+docker compose $COMPOSE_PROFILES_ARGS pull --ignore-buildable --quiet \
+    || warn "image pull failed — continuing with locally cached images"
+
 if (( ! SKIP_BUILD )); then
     log "docker compose build"
     docker compose $COMPOSE_PROFILES_ARGS build
 fi
 
-log "docker compose pull (third-party images only)"
-docker compose pull --ignore-buildable || true  # don't fail if some images haven't been pulled before
-
 # ─── Bring stack up ──────────────────────────────────────────────────────────
+# Tunnel sidecars wait for their WireGuard container to report a handshake;
+# if that never happens `up` fails. Show why instead of dying silently.
 log "docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans"
-docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans
+if ! docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans; then
+    docker compose $COMPOSE_PROFILES_ARGS ps -a >&2 || true
+    for svc in tunnel1 tunnel2; do
+        if docker ps -a --format '{{.Names}}' | grep -qx "$svc"; then
+            warn "last $svc logs:"
+            docker logs --tail=20 "$svc" >&2 || true
+        fi
+    done
+    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong or the VPN endpoint is unreachable (no handshake)."
+fi
 
 # ─── Health verification ────────────────────────────────────────────────────
-log "waiting up to 90s for darkwatch to report healthy..."
-for i in $(seq 1 18); do
-    if docker compose ps darkwatch --format json | grep -q '"Health":"healthy"'; then
+log "waiting up to 120s for darkwatch to report healthy..."
+for i in $(seq 1 60); do
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' darkwatch 2>/dev/null || echo missing)"
+    if [[ "$status" == "healthy" ]]; then
         log "darkwatch is healthy"
         break
     fi
-    if (( i == 18 )); then
-        log "darkwatch did not report healthy in time. Recent logs:"
+    if (( i == 60 )); then
+        log "darkwatch did not report healthy in time (status: $status). Recent logs:"
         docker compose logs --tail=40 darkwatch
         fail "darkwatch healthcheck timeout"
     fi
-    sleep 5
+    sleep 2
 done
 
 # ─── Optional egress leak check (slow; can skip in dev loops) ───────────────
@@ -147,7 +170,7 @@ if (( ! NO_EGRESS_CHECK )); then
         warn "skipping egress check — no tunnels configured yet"
     else
         log "running egress leak check"
-        "$SCRIPT_DIR/verify-egress.sh" || fail "egress check failed — stack is up but may be leaking"
+        "$SCRIPT_DIR/verify-egress.sh" "${VERIFY_ARGS[@]}" || fail "egress check failed — stack is up but may be leaking"
     fi
 fi
 

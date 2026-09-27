@@ -43,7 +43,9 @@ services:
     healthcheck:
       # Each WG container runs in its own netns; both configs use the
       # filename wg0.conf (=> interface wg0) without conflict.
-      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk '{exit ($2 == 0)}'"]
+      # Healthy only once a peer has completed a handshake. With no output
+      # (wg0 missing) awk must exit non-zero, not fall through to success.
+      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -91,7 +93,9 @@ services:
     networks:
       - darknet
     healthcheck:
-      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk '{exit ($2 == 0)}'"]
+      # Healthy only once a peer has completed a handshake. With no output
+      # (wg0 missing) awk must exit non-zero, not fall through to success.
+      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -150,8 +154,9 @@ services:
     # the corresponding feature (Tor crawl or Telegram scrape) is just
     # unavailable, and the dashboard shows it as such.
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/status > /dev/null || exit 1"]
-      interval: 60s
+      # /healthz, not /api/status — the latter drains the dashboard log queue.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz > /dev/null || exit 1"]
+      interval: 15s
       timeout: 10s
       retries: 3
       start_period: 30s
