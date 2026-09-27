@@ -1,6 +1,8 @@
-# DarkWatch — WireGuard config template (Tor egress path)
+# DarkWatch — WireGuard config template (Telegram egress path)
 # Replace with a real config from your VPN provider.
-# Real configs live at /var/lib/darkwebapp/secrets/proton_wg/wg_confs/wg0.conf and never enter the repo.
+# Real configs live at /var/lib/darkwebapp/secrets/tunnel2/wg_confs/wg0.conf and never enter the repo.
+# Plain client keys only: PreUp/PostUp/PreDown/PostDown and other hook keys
+# are rejected by the Setup UI (wg-quick would run them as root).
 
 [Interface]
 PrivateKey = <YOUR_WG_PRIVATE_KEY>
