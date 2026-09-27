@@ -8,46 +8,46 @@
 # Usage: ./scan.sh <command> [args]
 
 CONTAINER="darkwatch"
-CMD="docker exec $CONTAINER python3 darkwatch.py -c config.json"
+CMD=(docker exec "$CONTAINER" python3 darkwatch.py -c config.json)
 
 case "$1" in
     url)
         # Crawl single URL: ./scan.sh url http://target.onion [depth]
         DEPTH="${3:-2}"
-        $CMD --url "$2" --depth "$DEPTH"
+        "${CMD[@]}" --url "$2" --depth "$DEPTH"
         ;;
     all)
         # Crawl all URLs in database: ./scan.sh all
-        $CMD --crawl-all
+        "${CMD[@]}" --crawl-all
         ;;
     import)
         # Import URLs from file: ./scan.sh import urls.txt
-        $CMD --import-urls "/loot/$2"
+        "${CMD[@]}" --import-urls "/loot/$2"
         ;;
     find)
         # Show findings: ./scan.sh find [keyword] [min-score]
-        ARGS="--findings"
-        [ -n "$2" ] && ARGS="$ARGS --keyword $2"
-        [ -n "$3" ] && ARGS="$ARGS --min-score $3"
-        $CMD $ARGS
+        ARGS=(--findings)
+        [ -n "$2" ] && ARGS+=(--keyword "$2")
+        [ -n "$3" ] && ARGS+=(--min-score "$3")
+        "${CMD[@]}" "${ARGS[@]}"
         ;;
     report)
         # Generate report: ./scan.sh report [min-score]
-        ARGS="--report"
-        [ -n "$2" ] && ARGS="$ARGS --min-score $2"
-        $CMD $ARGS
+        ARGS=(--report)
+        [ -n "$2" ] && ARGS+=(--min-score "$2")
+        "${CMD[@]}" "${ARGS[@]}"
         ;;
     stats)
         # Show stats: ./scan.sh stats
-        $CMD --stats
+        "${CMD[@]}" --stats
         ;;
     test)
         # Test Tor: ./scan.sh test
-        $CMD --test-tor
+        "${CMD[@]}" --test-tor
         ;;
     db)
         # Raw DB query: ./scan.sh db "SELECT * FROM findings"
-        docker exec $CONTAINER sqlite3 -header -column data/darkwatch.db "$2"
+        docker exec "$CONTAINER" sqlite3 -header -column data/darkwatch.db "$2"
         ;;
     *)
         echo "DarkWatch Scanner"
@@ -58,7 +58,7 @@ case "$1" in
         echo "Commands:"
         echo "  url <onion_url> [depth]     Crawl a single .onion site"
         echo "  all                         Crawl all URLs in database"
-        echo "  import <file>               Import URLs from file in ./loot/"
+        echo "  import <file>               Import URLs from file in /var/lib/darkwebapp/darkwatch/loot/"
         echo "  find [keyword] [min-score]  Search findings"
         echo "  report [min-score]          Generate JSON + text report"
         echo "  stats                       Show database statistics"

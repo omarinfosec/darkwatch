@@ -4,19 +4,28 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# Every download below is verified against a pinned SHA-256. Bumping a
+# version means updating its checksum too (sha256sum of the new artifact).
 ARG ESBUILD_VER=0.21.5
+ARG ESBUILD_SHA256=d3c7e7e0991f28e987c8a8f1163ffebf326dfff80228afc7f12669a120591fe4
 ARG TAILWIND_VER=3.4.10
+ARG TAILWIND_SHA256=0c3e21d8479a4c53ffe1cfc7fe965f6b60d8cf597bdf34db132b8c65c6143541
 ARG REACT_VER=18.3.1
+ARG REACT_SHA256=8d9bed01a672e7eaf387942d781ad47c6a43089a30a0306060f9fd5ac7870347
+ARG REACT_DOM_SHA256=031d4427a99f2f3f6cac18bbbf308594a67e4f47d10f4896fdec446505b040e0
 
 # esbuild standalone binary (Go, no Node required)
-RUN curl -fsSL "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-${ESBUILD_VER}.tgz" \
-      | tar -xz -C /tmp && \
+RUN curl -fsSLo /tmp/esbuild.tgz \
+      "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-${ESBUILD_VER}.tgz" && \
+    echo "${ESBUILD_SHA256}  /tmp/esbuild.tgz" | sha256sum -c - && \
+    tar -xzf /tmp/esbuild.tgz -C /tmp && \
     mv /tmp/package/bin/esbuild /usr/local/bin/ && \
-    rm -rf /tmp/package
+    rm -rf /tmp/package /tmp/esbuild.tgz
 
 # Tailwind CLI standalone binary (Rust+Go, no Node required)
 RUN curl -fsSLo /usr/local/bin/tailwindcss \
       "https://github.com/tailwindlabs/tailwindcss/releases/download/v${TAILWIND_VER}/tailwindcss-linux-x64" && \
+    echo "${TAILWIND_SHA256}  /usr/local/bin/tailwindcss" | sha256sum -c - && \
     chmod +x /usr/local/bin/tailwindcss
 
 WORKDIR /build
@@ -38,10 +47,15 @@ RUN mkdir -p static && \
     # src/app.jsx survive (~20 KB vs 3 MB CDN runtime).
     tailwindcss -c tailwind.config.js -i src/styles.css -o static/styles.css --minify && \
     # Self-host React UMD bundles so the runtime makes zero CDN calls.
-    curl -fsSLo static/react.production.min.js \
-      "https://unpkg.com/react@${REACT_VER}/umd/react.production.min.js" && \
-    curl -fsSLo static/react-dom.production.min.js \
-      "https://unpkg.com/react-dom@${REACT_VER}/umd/react-dom.production.min.js"
+    # Taken from the checksummed npm tarballs (unpkg serves the same files
+    # but offers nothing to verify them against).
+    curl -fsSLo /tmp/react.tgz "https://registry.npmjs.org/react/-/react-${REACT_VER}.tgz" && \
+    echo "${REACT_SHA256}  /tmp/react.tgz" | sha256sum -c - && \
+    curl -fsSLo /tmp/react-dom.tgz "https://registry.npmjs.org/react-dom/-/react-dom-${REACT_VER}.tgz" && \
+    echo "${REACT_DOM_SHA256}  /tmp/react-dom.tgz" | sha256sum -c - && \
+    tar -xzf /tmp/react.tgz -O package/umd/react.production.min.js > static/react.production.min.js && \
+    tar -xzf /tmp/react-dom.tgz -O package/umd/react-dom.production.min.js > static/react-dom.production.min.js && \
+    rm -f /tmp/react.tgz /tmp/react-dom.tgz
 
 
 # ─── Runtime stage: Python + crawler ──────────────────────────────────────

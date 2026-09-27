@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timedelta
 
 import requests
+from urllib.parse import urlsplit
 from flask import Flask, abort, jsonify, request, send_file, Response
 
 from darkwatch import (DarkWebCrawler, TelegramScraper, TelegramLiveListener,
@@ -52,6 +53,69 @@ log = logging.getLogger("darkwatch.web")
 app = Flask(__name__,
             static_folder=os.path.join(os.path.dirname(__file__), "static"),
             static_url_path="/static")
+
+# ─── Request guard (DNS rebinding + cross-site requests) ─────────────────────
+# The dashboard has no login; it relies on being reachable only via
+# localhost / an SSH tunnel. That alone doesn't stop a web page the operator
+# visits: DNS rebinding makes evil.example resolve to 127.0.0.1 (same-origin
+# with the dashboard, full API access), and plain cross-site form POSTs hit
+# body-less endpoints (/api/stop, /api/rescan, ...). So:
+#   - the Host header must name this dashboard (loopback, DARKWATCH_BIND_IP,
+#     the container name, or DARKWATCH_ALLOWED_HOSTS for a reverse proxy);
+#   - state-changing requests must not come from another origin.
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "darkwatch"} | {
+    h.strip().lower().strip("[]")
+    for h in (os.environ.get("DARKWATCH_BIND_IP", ""),
+              *os.environ.get("DARKWATCH_ALLOWED_HOSTS", "").split(","))
+    if h.strip()
+}
+
+
+def _hostname(value):
+    """Host/netloc -> bare lowercase hostname (port and IPv6 brackets removed)."""
+    try:
+        return (urlsplit("//" + value).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+@app.before_request
+def _request_guard():
+    if _hostname(request.host) not in _ALLOWED_HOSTS:
+        abort(403)
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+        abort(403)
+    origin = request.headers.get("Origin")
+    # "null" = sandboxed iframe / file:// page: never the dashboard itself.
+    if origin and (origin == "null"
+                   or _hostname(urlsplit(origin).netloc) not in _ALLOWED_HOSTS):
+        abort(403)
+    return None
+
+
+def _int_param(value, default):
+    """Parse an int request parameter; bad input -> HTTP 400, not a 500."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        abort(400, description=f"invalid integer: {value!r}")
+
+
+def _csv_safe(value):
+    """Neutralize spreadsheet formula injection: page/channel content is
+    attacker-controlled, and cells starting with = + - @ (or tab/CR) are
+    evaluated by Excel/LibreOffice when the analyst opens the export."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def _csv_row(row, cols):
+    return {c: _csv_safe(row.get(c, "")) for c in cols}
 
 # ─── Shared state (single scan at a time) ────────────────────────────────────
 
@@ -918,7 +982,10 @@ def route_scan():
     global _scan_thread
     body = request.get_json(silent=True) or {}
     raw_urls = body.get("urls") or []
-    depth = int(body.get("depth") or _crawler.max_depth)
+    if not isinstance(raw_urls, list):
+        # A bare string would otherwise be iterated per character.
+        return jsonify({"error": "urls must be an array"}), 400
+    depth = _int_param(body.get("depth"), _crawler.max_depth)
 
     urls = [u.strip() for u in raw_urls if isinstance(u, str) and u.strip()]
     if not urls:
@@ -1080,7 +1147,7 @@ def route_threat_intel_status():
 @app.route("/api/findings")
 def route_findings():
     severity = request.args.get("severity")
-    min_score = int(request.args.get("min_score") or 0)
+    min_score = _int_param(request.args.get("min_score"), 0)
     # Cursor + page size: pass the last finding id from the previous page
     # as ?before_id= to fetch older rows. Default page is the newest 100;
     # UI requests bigger pages by raising ?limit= (capped server-side).
@@ -1129,8 +1196,7 @@ def route_delete_finding(finding_id):
 @app.route("/api/findings", methods=["DELETE"])
 def route_delete_findings():
     severity = request.args.get("severity")
-    min_score = request.args.get("min_score")
-    min_score = int(min_score) if min_score is not None else None
+    min_score = _int_param(request.args.get("min_score"), None)
     n = _crawler.db.delete_findings(severity=severity, min_score=min_score)
     return jsonify({"deleted": n})
 
@@ -1144,7 +1210,7 @@ def route_findings_csv():
     writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
     writer.writeheader()
     for f in findings:
-        writer.writerow({c: f.get(c, "") for c in cols})
+        writer.writerow(_csv_row(f, cols))
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
@@ -2096,7 +2162,7 @@ def route_tg_export(url_id, fmt):
         w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for m in msgs:
-            w.writerow({c: m.get(c, "") for c in cols})
+            w.writerow(_csv_row(m, cols))
         return Response(
             buf.getvalue(),
             mimetype="text/csv",
@@ -2123,7 +2189,7 @@ def route_tg_export(url_id, fmt):
                     "fwd_from_username", "reply_to_msg_id", "finding_count"]
             w = csv.DictWriter(csv_buf, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
-            for m in msgs: w.writerow({c: m.get(c, "") for c in cols})
+            for m in msgs: w.writerow(_csv_row(m, cols))
             z.writestr(f"{stem}/messages.csv", csv_buf.getvalue())
             # Any media that's been downloaded, nested under media/.
             media_root = os.path.join(
@@ -2160,7 +2226,7 @@ def route_url_set_monitor(url_id):
         abort(404)
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled"))
-    interval = int(body.get("interval_min") or 60)
+    interval = _int_param(body.get("interval_min"), 60)
     if interval not in (15, 30, 60, 120, 360):
         return jsonify({"error": "invalid interval_min (allowed: 15, 30, 60, 120, 360)"}), 400
     # When enabling, schedule the FIRST check for "now" so the scheduler
@@ -2178,7 +2244,7 @@ def route_urls_bulk_monitor():
     body = request.get_json(silent=True) or {}
     ids = body.get("ids") or []
     enabled = bool(body.get("enabled"))
-    interval = int(body.get("interval_min") or 60)
+    interval = _int_param(body.get("interval_min"), 60)
     if not isinstance(ids, list) or not ids:
         return jsonify({"error": "ids must be a non-empty array"}), 400
     if interval not in (15, 30, 60, 120, 360):
@@ -2406,7 +2472,7 @@ def route_keywords_export(fmt):
         cols = ["id", "keyword", "severity", "category", "added_at"]
         w = csv.DictWriter(sio, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
-        for r in rows: w.writerow(r)
+        for r in rows: w.writerow(_csv_row(r, cols))
         return Response(
             sio.getvalue(),
             mimetype="text/csv",

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Tests (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [darkwatch, setup]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches the Docker images
+          cache: pip
+          cache-dependency-path: ${{ matrix.suite }}/requirements.txt
+      - name: Install dependencies
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ${{ matrix.suite }}/requirements.txt pytest httpx
+      - name: Run tests
+        run: python -m pytest -q ${{ matrix.suite }}/tests
+
+  shell-and-compose:
+    name: Shell syntax + compose config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n on all ops scripts
+        run: for f in ops/*.sh tor/entrypoint.sh darkwatch/scan.sh; do bash -n "$f"; done
+      - name: shellcheck (errors only)
+        run: shellcheck -S error ops/*.sh tor/entrypoint.sh
+      - name: docker compose config
+        run: |
+          data="$(mktemp -d)" && touch "$data/env"
+          DARKWEBAPP_DATA_ROOT="$data" docker compose \
+            --profile tor --profile tg --profile setup config -q

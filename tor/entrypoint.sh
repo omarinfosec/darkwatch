@@ -15,6 +15,10 @@ fi
 
 # `tor --hash-password` writes one line: 16:....
 HASH="$(tor --hash-password "$TOR_CONTROL_PASSWORD" | tail -1)"
+if [[ "$HASH" != 16:* ]]; then
+    echo "[tor entrypoint] FATAL: tor --hash-password failed (got: ${HASH:-nothing})" >&2
+    exit 1
+fi
 
 cat > "$TORRC" <<EOF
 # Auto-generated at container start by entrypoint.sh.

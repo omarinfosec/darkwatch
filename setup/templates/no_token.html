@@ -20,7 +20,7 @@
     <section class="card">
       <h2>Sign in</h2>
       <p class="helper">
-        Paste your <code>SETUP_AUTH_TOKEN</code> once. A secure session cookie
+        Paste your <code>SETUP_AUTH_TOKEN</code> once. An HttpOnly session cookie
         is stored for 7 days so you can open Settings from the main dashboard
         without the long URL.
       </p>
@@ -40,7 +40,8 @@
 
       <h3>Or use the full URL once</h3>
       <p class="helper">
-        Append <code>?token=&lt;SETUP_AUTH_TOKEN&gt;</code> to the URL:
+        Append <code>?token=&lt;SETUP_AUTH_TOKEN&gt;</code> to the URL. The token is
+        exchanged for the session cookie and removed from the address bar:
       </p>
       <pre class="code-block">http://&lt;your-bind-ip&gt;:8082/?token=&lt;long-hex-token&gt;</pre>
 

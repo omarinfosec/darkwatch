@@ -41,7 +41,8 @@ install -d -m 0700 -o "$DARKWATCH_UID" -g "$DARKWATCH_GID" "$DATA_ROOT/darkwatch
 install -d -m 0700 -o "$DARKWATCH_UID" -g "$DARKWATCH_GID" "$DATA_ROOT/darkwatch/investigations"
 # yara-private/ is the drop-in dir for operator-specific *.yar files that
 # must NOT enter the repo. Mounted into the container at /app/yara-private
-# read-only; compiled at startup. Empty by design — operators drop files
+# read-write (the dashboard's Rules tab saves custom rules there); compiled
+# at startup. Empty by design — operators drop files
 # in over time. Create even on first bootstrap so the compose mount has
 # something to bind.
 install -d -m 0700 -o "$DARKWATCH_UID" -g "$DARKWATCH_GID" "$DATA_ROOT/darkwatch/yara-private"

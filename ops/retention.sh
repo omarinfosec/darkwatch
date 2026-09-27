@@ -22,10 +22,12 @@ prune() {
     [[ -d "$LOOT/$subdir" ]] || return 0
     local before count
     before=$(find "$LOOT/$subdir" -name "$pattern" -type f | wc -l)
-    find "$LOOT/$subdir" -name "$pattern" -type f -mtime "+$days" -print -delete | while read -r f; do
-        sha="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || echo unknown)"
-        log "PURGED $subdir: $f sha256=$sha (>$days days)"
-    done || true
+    # Hash BEFORE deleting (hashing after -delete always logged "unknown"),
+    # and use NUL-separated names so odd filenames can't break the loop.
+    while IFS= read -r -d '' f; do
+        sha="$(sha256sum -- "$f" 2>/dev/null | awk '{print $1}')"
+        rm -f -- "$f" && log "PURGED $subdir: $f sha256=${sha:-unknown} (>$days days)"
+    done < <(find "$LOOT/$subdir" -name "$pattern" -type f -mtime "+$days" -print0)
     local after
     after=$(find "$LOOT/$subdir" -name "$pattern" -type f | wc -l)
     count=$(( before - after ))
@@ -36,6 +38,8 @@ log "retention run start (data_root=$DATA_ROOT)"
 prune screenshots "$SCREENSHOT_DAYS" "*.png"
 prune screenshots "$SCREENSHOT_DAYS" "*.jpg"
 prune pages       "$PAGE_DAYS"       "*.html"
+prune thumbnails  "$SCREENSHOT_DAYS" "*.jpg"
+prune thumbnails  "$SCREENSHOT_DAYS" "*.png"
 prune reports     "$REPORT_DAYS"     "*.json"
 prune reports     "$REPORT_DAYS"     "*.txt"
 log "retention run done"

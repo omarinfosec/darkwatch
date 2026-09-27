@@ -54,7 +54,7 @@ Runs via `docker compose` on a single Linux VM. Operator state — credentials, 
 
 - **Not a tool for accessing illegal content.** The crawler exists to detect and triage threats. What you do with what it finds is on you, and your legal posture is your responsibility.
 - **Not a turn-key SaaS.** You bring your own VM, your own VPN, your own YARA rules, and your own legal review.
-- **Not safe to expose to the public internet.** The dashboards have no built-in auth — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
+- **Not safe to expose to the public internet.** The DarkWatch dashboard (:8080) has no built-in login (it only accepts requests addressed to localhost / `DARKWATCH_BIND_IP`; set `DARKWATCH_ALLOWED_HOSTS` for a reverse proxy), and the Setup UI (:8082) is gated by a bearer token — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
 
 ## Architecture
 
@@ -215,10 +215,10 @@ cd /opt/darkwebapp
 
 sudo ./ops/deploy.sh                       # pull + build + up + healthcheck + egress verify
 sudo ./ops/verify-egress.sh                # confirm Tor + TG isolation
-docker compose ps                          # what's running
-docker compose logs -f darkwatch           # tail one service
-docker compose restart tunnel1             # restart a specific service
-sudo ./ops/retention.sh                    # enforce loot/ retention windows (also runs nightly via cron)
+sudo docker compose ps                     # what's running
+sudo docker compose logs -f darkwatch      # tail one service
+sudo docker compose restart tunnel1        # restart a specific service
+sudo ./ops/retention.sh                    # enforce loot/ retention windows (schedule nightly: RUNBOOK → Cron setup)
 ```
 
 Full operator runbook including incident playbooks, maintenance schedule, and environment cheat sheet: [ops/RUNBOOK.md](ops/RUNBOOK.md).
@@ -277,10 +277,10 @@ DarkWatch stands on free-software shoulders. The list is intentionally explicit 
 
 #### Data + ops
 
-- **[SQLite](https://www.sqlite.org/)** — local-first persistence. Three separate databases (darkwatch findings, recon pipeline, telegram session); no server to operate.
+- **[SQLite](https://www.sqlite.org/)** — local-first persistence. Two local files (the darkwatch findings database and the Telegram session); no server to operate.
 - **[Docker Compose](https://docs.docker.com/compose/)** — service orchestration on a single VM.
 - **[stem](https://stem.torproject.org/)** — Tor controller library (used for NEWNYM circuit rotation between investigations).
-- **[Prometheus client](https://github.com/prometheus/client_python)** — metrics export hooks (currently dormant; reserved for future scraping).
+- **[Prometheus client](https://github.com/prometheus/client_python)** — `/metrics` endpoint for Prometheus scraping.
 
 ### Inspirations and influences
 
