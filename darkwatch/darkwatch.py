@@ -5320,19 +5320,22 @@ class DarkWebCrawler:
             "FROM tg_messages m JOIN urls u ON u.id = m.url_id "
             "WHERE m.url_id = ? AND m.text IS NOT NULL AND m.text != ''",
             (url_id,)).fetchall()
-        scanned = 0
-        found = 0
-        for r in rows:
-            url_id_, msg_id, text, username = r
-            page_url = f"https://t.me/{username}/{msg_id}"
-            # Purge any prior findings on this page_url so rescan is idempotent.
-            self.db.conn.execute(
+        targets = [(url_id_, f"https://t.me/{username}/{msg_id}", text)
+                   for url_id_, msg_id, text, username in rows]
+        # Purge prior findings first so the rescan is idempotent. Done in one
+        # transaction under db.lock: the connection is shared with the crawler
+        # thread, and an unlocked DELETE could be committed (or interleaved)
+        # by another thread's commit. _yara_match_text takes db.lock itself
+        # (non-reentrant), so it runs after the lock is released.
+        with self.db.lock:
+            self.db.conn.executemany(
                 "DELETE FROM findings WHERE url_id = ? AND page_url = ?",
-                (url_id_, page_url))
+                [(u, page_url) for u, page_url, _ in targets])
+            self.db.conn.commit()
+        found = 0
+        for url_id_, page_url, text in targets:
             found += self._yara_match_text(url_id_, page_url, text)
-            scanned += 1
-        self.db.conn.commit()
-        return {"scanned": scanned, "findings": found}
+        return {"scanned": len(targets), "findings": found}
 
     # Severity ordering used for the selective-screenshot threshold.
     _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}

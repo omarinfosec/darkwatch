@@ -60,6 +60,12 @@ _state_lock = threading.Lock()
 # one Playwright browser and one DB connection). Separate from
 # `_state_lock` so API reads stay fast during long scans.
 _crawl_lock = threading.Lock()
+# Serializes Telegram work (the DarkMTProto client, its session file and the
+# per-channel high-water marks). Deliberately NOT _crawl_lock: a single .onion
+# site crawl can run for tens of minutes, and Telegram login codes expire in
+# that time. Telegram paths never touch Playwright or the crawler's HTTP
+# session; the DB has its own lock. Never acquire both locks at once.
+_tg_lock = threading.Lock()
 _scan_thread = None
 _stop_event = threading.Event()
 _log_queue: "queue.Queue[str]" = queue.Queue(maxsize=10000)
@@ -126,7 +132,7 @@ def _bump(name, n=1):
 # Real-time live listener. Off by default; enable via config.telegram.live_enabled.
 # When on, a persistent Telethon session fires an events.NewMessage handler for
 # every tracked channel. Handler enqueues; a consumer thread drains the queue
-# under _crawl_lock and scans exactly like _monitor_tg_channel would.
+# under _tg_lock and scans exactly like _monitor_tg_channel would.
 _tg_live = None                          # TelegramLiveListener instance
 _tg_live_queue: "queue.Queue" = queue.Queue(maxsize=500)
 _tg_live_consumer_thread = None
@@ -494,7 +500,7 @@ def _next_check_at(interval_min):
 def _monitor_tg_channel(url_id):
     """Incremental Telegram channel scrape: pull messages newer than
     tg_last_msg_id, scan each, record a monitor event. Runs under
-    _crawl_lock (caller).
+    _tg_lock (caller).
 
     Adds a randomized 0-15 s pre-fetch delay on top of the scheduler's
     existing ±25% next_check_at jitter, so the scheduler wake-up time and
@@ -542,7 +548,7 @@ def _monitor_one(url_id, url):
         if source == "telegram":
             # Separate path — scraper uses its own SOCKS tunnel; crawl_site
             # (Tor + Playwright) isn't relevant here.
-            with _crawl_lock:
+            with _tg_lock:
                 pages, findings = _monitor_tg_channel(url_id)
             status = 200 if pages > 0 else 0
             _crawler.db.update_scan(url_id, status)
@@ -677,7 +683,7 @@ def _tg_live_on_message(channel_id, username, msg):
 
 
 def _tg_live_consumer():
-    """Drain the live-event queue, scan each message under _crawl_lock.
+    """Drain the live-event queue, scan each message under _tg_lock.
     Same scan path as _monitor_tg_channel but one message at a time."""
     while not _tg_live_stop.is_set():
         try:
@@ -693,7 +699,7 @@ def _tg_live_consumer():
             if not row:
                 continue
             url_id, uname = row[0], row[1]
-            with _crawl_lock:
+            with _tg_lock:
                 _crawler.scan_tg_message(url_id, uname, ev["msg"])
                 # Advance the high-water mark so the polling scheduler
                 # doesn't re-fetch this message.
@@ -1242,7 +1248,7 @@ def route_tg_auth_start():
         return jsonify({"error": "phone is required"}), 400
     if not _tg.configured():
         return jsonify({"error": "telegram not configured (set api_id/api_hash)"}), 400
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.auth_send_code(phone)
     if not r.get("ok"):
         return jsonify({"error": r.get("error", "auth_send_code failed")}), 400
@@ -1258,7 +1264,7 @@ def route_tg_auth_confirm():
     phone_code_hash = body.get("phone_code_hash")
     if not phone or not code:
         return jsonify({"error": "phone and code are required"}), 400
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.auth_confirm(phone, code, password=password,
                               phone_code_hash=phone_code_hash)
     if not r.get("ok"):
@@ -1269,7 +1275,7 @@ def route_tg_auth_confirm():
 
 @app.route("/api/telegram/auth/logout", methods=["POST"])
 def route_tg_auth_logout():
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.logout()
     return jsonify(r)
 
@@ -1305,7 +1311,7 @@ def route_tg_auth_qr_password():
     password = body.get("password")
     if not token or not password:
         return jsonify({"error": "token and password required"}), 400
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.auth_qr_password(token, password)
     return jsonify(r), (200 if r.get("ok") else 400)
 
@@ -1342,7 +1348,7 @@ def route_tg_add_channel():
     ident = (body.get("identifier") or "").strip()
     if not ident:
         return jsonify({"error": "identifier is required"}), 400
-    with _crawl_lock:
+    with _tg_lock:
         info = _tg.resolve_channel(ident)
     if info.get("error"):
         return jsonify(info), 400
@@ -1396,7 +1402,7 @@ def route_tg_channel_details(url_id):
         return jsonify({"source": "cache", "stale": True,
                         **_slim_details_from_cache(cached)})
     photo_dir = os.path.join(_crawler.loot_dir, "tg-media", "channels")
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.get_channel_details(
             cached["tg_channel_id"], username=cached.get("tg_username"),
             photo_dest_dir=photo_dir)
@@ -1482,8 +1488,8 @@ def route_tg_channel_messages(url_id):
 
 @app.route("/api/telegram/channels/<int:url_id>/scrape", methods=["POST"])
 def route_tg_scrape(url_id):
-    """One-shot historical pull. Runs under _crawl_lock so it can't race a
-    monitor tick or a manual .onion scan. For channels the operator wants
+    """One-shot historical pull. Runs under _tg_lock so it can't race a
+    Telegram monitor tick or another Telegram operation. For channels the operator wants
     monitored continuously they should toggle the monitor on instead."""
     if not _crawler.db.url_exists(url_id):
         abort(404)
@@ -1515,7 +1521,7 @@ def route_tg_scrape(url_id):
     fetched_total = 0
     found = 0
     latest_id = info.get("tg_last_msg_id") or 0
-    with _crawl_lock:
+    with _tg_lock:
         # min_id cursor walks BACKWARD through history. On the first
         # batch we fetch the newest N; subsequent batches use max_id
         # to keep walking back. Current fetch_new_messages doesn't
@@ -1584,7 +1590,7 @@ def route_tg_join(url_id):
         return jsonify({"error": "telegram not authenticated"}), 401
     body = request.get_json(silent=True) or {}
     invite_hash = (body.get("invite_hash") or "").strip() or None
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.join_channel(info["tg_channel_id"],
                              username=info.get("tg_username"),
                              invite_hash=invite_hash)
@@ -1605,7 +1611,7 @@ def route_tg_leave(url_id):
         return jsonify({"error": "not a telegram channel"}), 400
     if not _tg.configured() or not _tg.status().get("authenticated"):
         return jsonify({"error": "telegram not authenticated"}), 401
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.leave_channel(info["tg_channel_id"],
                               username=info.get("tg_username"))
     if r.get("ok"):
@@ -1625,7 +1631,7 @@ def route_tg_rescan(url_id):
     info = _crawler.db.get_tg_channel(url_id)
     if not info:
         return jsonify({"error": "not a telegram channel"}), 400
-    with _crawl_lock:
+    with _tg_lock:
         r = _crawler.rescan_tg_channel(url_id)
     log.info(f"[tg-rescan] @{info.get('tg_username')} "
              f"scanned={r['scanned']} findings={r['findings']}")
@@ -1645,7 +1651,7 @@ def route_tg_discover():
         limit = max(1, min(50, int(request.args.get("limit") or 30)))
     except Exception:
         limit = 30
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.search_directory(q, limit=limit)
     if r.get("error"):
         return jsonify(r), 400
@@ -1686,7 +1692,7 @@ def route_tg_discover_smart():
                      "username":   t.get("tg_username")}
                     for t in tracked if t.get("tg_channel_id")]
 
-    with _crawl_lock:
+    with _tg_lock:
         _tg.set_mode(mode)
         r = _tg.smart_discover(
             q, limit=limit, max_variants=max_variants,
@@ -1719,7 +1725,7 @@ def route_tg_user_lookup(handle):
     photos = (request.args.get("photos") or "1") not in ("0", "false", "no")
     download = (request.args.get("download") or "0") in ("1", "true", "yes")
     dest = os.path.join(_crawler.loot_dir, "tg-media", "users") if download else None
-    with _crawl_lock:
+    with _tg_lock:
         info = _tg.lookup_user(
             handle, photo_history=photos,
             photo_history_limit=int(request.args.get("photo_limit") or 10),
@@ -1776,7 +1782,7 @@ def route_tg_search():
         info = _crawler.db.get_tg_channel(url_id)
         if not info:
             return jsonify({"error": "channel_id not a known tg channel"}), 400
-        with _crawl_lock:
+        with _tg_lock:
             msgs = _tg.search_in_channel(
                 info["tg_channel_id"], q, limit=limit, min_date_iso=since,
                 username=info.get("tg_username"))
@@ -1789,7 +1795,7 @@ def route_tg_search():
     if scope == "all":
         channels = _crawler.db.get_url_rows(limit=500, source="telegram")
         out = []
-        with _crawl_lock:
+        with _tg_lock:
             for ch in channels:
                 if not ch.get("tg_channel_id"):
                     continue
@@ -1873,7 +1879,7 @@ def route_tg_search_deep():
             if not try_spend():
                 return 0
             searched_channels.add(channel_id)
-            with _crawl_lock:
+            with _tg_lock:
                 msgs = _tg.search_in_channel(
                     channel_id, q, limit=50, min_date_iso=since,
                     username=username)
@@ -1942,7 +1948,7 @@ def route_tg_search_deep():
             s3_hits = 0
             for name in list(fwd_origins - known)[:10]:
                 if not try_spend(): break
-                with _crawl_lock:
+                with _tg_lock:
                     info = _tg.cached_resolve(name)
                 if info.get("error"):
                     discovered.append({"handle": name, "via": "forward",
@@ -1978,7 +1984,7 @@ def route_tg_search_deep():
                 s4_hits = 0
                 for name in list(mentions)[:max_hops * 5]:
                     if not try_spend(): break
-                    with _crawl_lock:
+                    with _tg_lock:
                         info = _tg.cached_resolve(name)
                     if info.get("error"):
                         discovered.append({"handle": name, "via": "mention",
@@ -2050,7 +2056,7 @@ def route_tg_chain(identifier):
     if not _tg.configured():
         return jsonify({"error": "telegram not configured"}), 400
     max_hops = max(1, min(8, int(request.args.get("max_hops") or 5)))
-    with _crawl_lock:
+    with _tg_lock:
         chain = _tg.follow_channel_chain(identifier, max_hops=max_hops)
     return jsonify({"starting": identifier, "hops": len(chain),
                     "chain": chain})
@@ -2307,7 +2313,7 @@ def route_tg_channel_members(url_id):
     except Exception:
         limit = 200
     query = request.args.get("query") or None
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.list_members(info["tg_channel_id"], limit=limit, query=query,
                               username=info.get("tg_username"))
     if r.get("error"):
@@ -2334,7 +2340,7 @@ def route_tg_message_download_media(msg_row_id):
     # One sub-dir per channel keeps download listings browsable.
     dest = os.path.join(_crawler.loot_dir, "tg-media",
                         (row.get("tg_username") or str(row["url_id"])))
-    with _crawl_lock:
+    with _tg_lock:
         r = _tg.download_message_media(
             row["tg_channel_id"], row["msg_id"], dest_dir=dest,
             username=row.get("tg_username"))
