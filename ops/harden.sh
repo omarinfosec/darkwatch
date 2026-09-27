@@ -103,14 +103,15 @@ if (( ! _have_keys )) && (( ! DRY_RUN )); then
 fi
 SSHD_MAIN=/etc/ssh/sshd_config
 
-cat > /tmp/sshd-darkwatch.conf <<EOF
+# Quoted heredoc: nothing in here is expanded or executed by the shell.
+cat > /tmp/sshd-darkwatch.conf <<'EOF'
 # Managed by DarkWatch ops/harden.sh
 PasswordAuthentication no
 PubkeyAuthentication yes
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 X11Forwarding no
-# `local` still permits `ssh -L 8080:localhost:8080` (the documented way to
+# AllowTcpForwarding local still permits ssh -L 8080:localhost:8080 (the documented way to
 # reach the dashboards) while blocking remote/reverse forwards.
 AllowTcpForwarding local
 ClientAliveInterval 300
