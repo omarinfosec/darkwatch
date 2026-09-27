@@ -1341,7 +1341,7 @@ class YaraScanner:
         if not (path and os.path.exists(path)):
             return None
         try:
-            return yara.compile(filepath=path)
+            return yara.compile(filepath=path, includes=False)
         except yara.Error as e:
             log.error(f"Failed to compile YARA {path}: {e}")
             return None
@@ -1371,7 +1371,7 @@ class YaraScanner:
         if not paths:
             return None
         try:
-            return yara.compile(filepaths=paths)
+            return yara.compile(filepaths=paths, includes=False)
         except yara.Error as e:
             log.error(f"Failed to compile YARA private rules in "
                       f"{self.private_dir}: {e}")
@@ -1574,7 +1574,7 @@ class YaraScanner:
                 raise ValueError(f"cannot read existing rule {path!r}: {e}") from e
         sources[ns] = text
         try:
-            yara.compile(sources=sources)
+            yara.compile(sources=sources, includes=False)
         except yara.Error as e:
             raise ValueError(f"YARA compile error: {e}") from e
 
@@ -1768,7 +1768,7 @@ class YaraScanner:
             self.intel_rules = None
             return False
         try:
-            self.intel_rules = yara.compile(filepath=path)
+            self.intel_rules = yara.compile(filepath=path, includes=False)
             log.info(f"Loaded threat-intel rules from {path}")
             return True
         except yara.Error as e:

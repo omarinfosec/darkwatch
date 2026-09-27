@@ -196,8 +196,24 @@ class ThreatIntelFeed:
             log.warning(f"threat_intel[{name}] fetch error: {e}")
             return []
 
+    @staticmethod
+    def _rule_ident(name: str) -> str:
+        return "intel_" + re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+    def _existing_rule_blocks(self) -> Dict[str, str]:
+        """rule-identifier -> full rule text from the current output file."""
+        try:
+            with open(self.output_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return {}
+        return {m.group(1): m.group(0).rstrip("\n") + "\n"
+                for m in re.finditer(r"^rule (intel_\w+)\n\{.*?^\}$",
+                                     text, re.M | re.S)}
+
     def _emit_rule(self, name: str, score: int, severity: str,
-                    description: str, indicators: List[str]) -> str:
+                    description: str, indicators: List[str],
+                    ident: Optional[str] = None) -> str:
         """Build one YARA rule body for a feed. Deduplicates + caps to
         stay under yara's per-rule string count (practical limit ~10k)."""
         seen = set()
@@ -212,7 +228,7 @@ class ThreatIntelFeed:
                 break
         if not unique:
             return ""
-        lines = [f"rule intel_{re.sub(r'[^A-Za-z0-9_]', '_', name)}", "{",
+        lines = [f"rule {ident or self._rule_ident(name)}", "{",
                  "    meta:",
                  '        author = "threat_intel_feed"',
                  f'        feed = "{_yara_escape(name)}"',
@@ -234,26 +250,46 @@ class ThreatIntelFeed:
         rule_bodies: List[str] = []
         total_indicators = 0
         started = time.time()
+        previous = self._existing_rule_blocks()
+        used_idents = set()
+        fetched_any = False
         for feed in self.feeds:
             if not feed.get("enabled", True):
                 feeds_out.append({"name": feed.get("name"),
                                    "enabled": False, "indicators": 0})
                 continue
+            # Unique rule identifier: names like "a-b" and "a_b" sanitize to
+            # the same one, and a duplicate rule name fails the whole compile.
+            ident = base = self._rule_ident(feed.get("name", "feed"))
+            n = 2
+            while ident in used_idents:
+                ident = f"{base}_{n}"; n += 1
+            used_idents.add(ident)
             indicators = self._fetch_one(feed)
             body = self._emit_rule(
                 feed.get("name", "feed"),
                 int(feed.get("score", 50)),
                 feed.get("severity", "medium"),
                 feed.get("description", ""),
-                indicators)
+                indicators, ident=ident)
+            stale = False
+            if body:
+                fetched_any = True
+            elif ident in previous:
+                # This feed failed (timeout, Tor hiccup) while others worked:
+                # keep its last good rule instead of silently dropping it.
+                body = previous[ident]
+                stale = True
+                log.warning(f"threat_intel: {feed.get('name')} returned nothing; "
+                            f"keeping previous rule {ident}")
             if body:
                 rule_bodies.append(body)
             total_indicators += len(indicators)
             feeds_out.append({"name": feed.get("name"),
                                "indicators": len(indicators),
-                               "enabled": True})
+                               "enabled": True, "stale": stale})
 
-        if not rule_bodies:
+        if not fetched_any:
             # No indicators fetched — do NOT overwrite an existing file
             # with an empty one; that would silently clear good rules on
             # a transient network failure. Keep the old file in place.
@@ -273,6 +309,20 @@ class ThreatIntelFeed:
         tmp = self.output_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(payload)
+        # Compile-check before swapping in: a file that fails to compile
+        # would make load_intel_rules() drop ALL intel rules.
+        try:
+            import yara
+            yara.compile(filepath=tmp, includes=False)
+        except ImportError:
+            pass
+        except Exception as e:
+            os.remove(tmp)
+            log.error(f"threat_intel: generated rules failed to compile ({e}); "
+                      "keeping existing file")
+            return {"updated": False, "feeds": feeds_out, "error": str(e),
+                    "total_indicators": total_indicators,
+                    "elapsed_s": round(time.time() - started, 2)}
         os.replace(tmp, self.output_path)
         fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         log.info(f"threat_intel: wrote {self.output_path} "
