@@ -111,3 +111,13 @@ def test_threat_intel_duplicate_idents_still_compile(tmp_path, monkeypatch):
     assert ti.refresh()["updated"]
     import yara
     yara.compile(filepath=str(out))
+
+
+def test_ip_leak_gate_passes_when_direct_egress_is_blocked(web, monkeypatch):
+    """With the egress lockdown on, the direct IP probe failing is the
+    expected (safest) outcome, not a gate failure."""
+    monkeypatch.setattr(web, "_fetch_ip", lambda proxies=None, timeout=5: (None, "blocked"))
+    monkeypatch.delenv("DARKWATCH_EGRESS_LOCKDOWN", raising=False)
+    assert web._check_ip_leak({"exit_ip": "1.2.3.4"})["ok"] is True
+    monkeypatch.setenv("DARKWATCH_EGRESS_LOCKDOWN", "0")
+    assert web._check_ip_leak({"exit_ip": "1.2.3.4"})["ok"] is False

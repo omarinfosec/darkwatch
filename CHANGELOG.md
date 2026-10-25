@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+### Upgrade notes
+- `deploy.sh` generates a new `TG_SOCKS_PASSWORD` and recreates the Docker
+  network once (it now has a fixed subnet, `172.31.250.0/24`; override with
+  `DARKNET_SUBNET` / `DARKWATCH_IP` if that collides with a host network).
+- `deploy.sh` installs `darkwatch-egress-lockdown.service`, a host firewall
+  rule that keeps the darkwatch container off the internet except through
+  the tunnels. Opt out with `DARKWATCH_EGRESS_LOCKDOWN=0`.
+- Alerts (Telegram bot, Slack, Discord, webhooks) now go out through the
+  Telegram tunnel, falling back to Tor. Set `alerts.allow_direct: true` in
+  `config.json` only if you want them sent from the host.
+- WireGuard configs must be full-tunnel (`AllowedIPs` includes `0.0.0.0/0`);
+  `Table` and `FwMark` are no longer accepted.
+
+### Security
+- Kill switch in tunnel1/tunnel2: if a WireGuard tunnel drops, Tor and
+  Telegram traffic is rejected instead of leaving via the host's IP. Tunnels
+  only report healthy once it is in place; verify-egress checks it.
+- The Setup UI no longer accepts `Table = off` (which made traffic bypass
+  the tunnel), and never contacts Telegram directly: the credential check
+  runs only through the tunnel (no direct retry, no check without a tunnel).
+- darkwatch container's direct internet access blocked on the host;
+  alerts routed through the tunnels.
+- The tg-socks proxy now requires a password.
+- Screenshot browser: no redirects (they bypassed the same-origin filter),
+  no DNS prefetch / preconnect / pings, localhost proxied, and offline mode
+  runs behind a dead proxy.
+- tor and tg-socks drop all capabilities; Setup gets no-new-privileges and
+  no longer restarts on its own; container logs are size-capped.
+- Dependency updates: requests 2.33.0, Flask 3.1.3, Jinja2 3.1.6,
+  python-multipart 0.0.31.
+
+### Fixes
+- A malformed `Content-Length` no longer aborts a site crawl (second copy of
+  the check); downloads have a total time limit; PDF text is HTML-escaped.
+
 ## v0.2.0 — 2026-09-27
 
 Reliability and security release. No config migration is needed, but see

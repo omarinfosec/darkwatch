@@ -10,6 +10,7 @@ log = logging.getLogger("setup.telegram_validate")
 # Match darkwatch's Telegram egress path when Tunnel 2 is configured.
 TG_PROXY_HOST = "tunnel2"
 TG_PROXY_PORT = 1080
+TG_PROXY_USER = "darkwatch"
 # Dummy phone — never receives SMS; Telegram validates api_id/api_hash before
 # checking the number. PhoneNumberInvalidError means credentials were accepted.
 _PROBE_PHONE = "+99900000000"
@@ -19,7 +20,7 @@ async def _validate_async(
     api_id: str,
     api_hash: str,
     *,
-    proxy: tuple[str, str, int] | None,
+    proxy: tuple | None,
 ) -> tuple[bool, str]:
     try:
         from telethon import TelegramClient
@@ -75,7 +76,7 @@ def validate_telegram_credentials(
     api_id: str,
     api_hash: str,
     *,
-    proxy: tuple[str, str, int] | None = None,
+    proxy: tuple | None = None,
     timeout_s: float = 20.0,
 ) -> tuple[bool, str]:
     """Sync wrapper for scripts/tests. Do not call from inside a running loop."""
@@ -101,7 +102,7 @@ async def validate_telegram_credentials_async(
     api_id: str,
     api_hash: str,
     *,
-    proxy: tuple[str, str, int] | None = None,
+    proxy: tuple | None = None,
     timeout_s: float = 20.0,
 ) -> tuple[bool, str]:
     """Return (ok, error_message). error_message is empty when ok."""
@@ -113,24 +114,6 @@ async def validate_telegram_credentials_async(
         )
         if ok:
             return True, ""
-        if reason == "api_id_invalid" and proxy is not None:
-            # Some VPN exits make auth.SendCode return API_ID_INVALID even when
-            # the credentials are fine. Retry once without the tunnel proxy.
-            log.info("telegram cred check failed via proxy; retrying direct")
-            ok_direct, reason_direct = await asyncio.wait_for(
-                _validate_async(api_id, api_hash, proxy=None),
-                timeout=timeout_s,
-            )
-            if ok_direct:
-                return True, ""
-            if reason_direct == "api_id_invalid":
-                return (
-                    False,
-                    "Telegram rejected these credentials — api_id and api_hash must "
-                    "come from the same app at my.telegram.org/apps. Re-paste both "
-                    "values (do not reuse the old hash shown as dots).",
-                )
-            return False, reason_direct
         if reason == "api_id_invalid":
             return (
                 False,

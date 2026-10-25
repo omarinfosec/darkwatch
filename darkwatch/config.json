@@ -74,6 +74,8 @@
         "proxy_host": "tunnel2",
         "proxy_port": 1080,
         "proxy_type": "socks5",
+        "proxy_user": "darkwatch",
+        "proxy_password": "${TG_SOCKS_PASSWORD}",
         "use_tor": false,
         "scrape_limit_per_tick": 100,
         "scrape_delay_s": 3,
