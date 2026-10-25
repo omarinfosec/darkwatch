@@ -91,7 +91,10 @@ fi
 TG_EXIT=""
 if (( CHECK_TG )); then
     log "checking Telegram-path exit IP"
-    TG_EXIT="$(docker exec darkwatch curl -s --socks5-hostname tunnel2:1080 --max-time 30 \
+    # tg-socks requires a login (TG_SOCKS_PASSWORD, same value darkwatch uses).
+    TG_PASS="$(grep -E '^TG_SOCKS_PASSWORD=' "${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    TG_EXIT="$(docker exec darkwatch curl -s --socks5-hostname tunnel2:1080 \
+               --proxy-user "darkwatch:${TG_PASS}" --max-time 30 \
                https://api.ipify.org 2>/dev/null || echo "")"
     if [[ -n "$TG_EXIT" ]]; then
         ok "tg-socks exit IP: $TG_EXIT"
@@ -127,6 +130,27 @@ elif [[ "$DW_NETWORKS" == *darknet* ]]; then
 else
     bad "darkwatch isn't on the expected darknet bridge — review compose"
 fi
+
+# ─── 5b. darkwatch can't reach the internet except via the tunnels ──────────
+log "checking darkwatch has no direct internet route (egress lockdown)"
+if docker exec darkwatch curl -s --max-time 8 -o /dev/null https://api.ipify.org 2>/dev/null; then
+    if [[ "$(grep -E '^DARKWATCH_EGRESS_LOCKDOWN=' "${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env" 2>/dev/null | tail -1 | cut -d= -f2-)" == "0" ]]; then
+        log "  direct egress works (lockdown disabled by DARKWATCH_EGRESS_LOCKDOWN=0)"
+    else
+        bad "darkwatch reached the internet DIRECTLY — run: sudo ./ops/egress-lockdown.sh"
+    fi
+else
+    ok "darkwatch has no direct internet route"
+fi
+
+# ─── 5c. tunnel kill switches in place ──────────────────────────────────────
+for t in $( (( CHECK_TOR )) && echo tunnel1; (( CHECK_TG )) && echo tunnel2 ); do
+    if docker exec "$t" iptables -C OUTPUT -j DW_KILLSWITCH 2>/dev/null; then
+        ok "$t kill switch active (no egress except WireGuard)"
+    else
+        bad "$t kill switch MISSING — traffic could leave via the host if the tunnel drops"
+    fi
+done
 
 # ─── 6. DNS leak: darkwatch resolver should NOT be the host's resolver ──────
 log "checking DNS resolution path"

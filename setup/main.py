@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from telegram_validate import (
     TG_PROXY_HOST,
     TG_PROXY_PORT,
+    TG_PROXY_USER,
     validate_telegram_credentials_async,
 )
 
@@ -218,11 +219,15 @@ _WG_PUBKEY = re.compile(r"^\s*PublicKey\s*=\s*[A-Za-z0-9+/]{43}=\s*$", re.MULTIL
 _WG_ENDPOINT = re.compile(r"^\s*Endpoint\s*=\s*\S+:\d+\s*$", re.MULTILINE)
 # Plain client keys only. wg-quick runs PreUp/PostUp/PreDown/PostDown as root
 # inside the tunnel container (NET_ADMIN + SYS_MODULE), so a pasted config
-# must never be able to carry shell hooks.
+# must never be able to carry shell hooks. Table and FwMark are excluded too:
+# `Table = off` (or a custom table/mark) stops wg0 from being the default
+# route, and the kill switch (tunnels/killswitch) relies on wg-quick's
+# default fwmark for the tunnel's own packets.
 _WG_ALLOWED_KEYS = {
-    "privatekey", "address", "dns", "mtu", "listenport", "fwmark", "table",
+    "privatekey", "address", "dns", "mtu", "listenport",
     "publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive",
 }
+_WG_ALLOWEDIPS = re.compile(r"^\s*AllowedIPs\s*=\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
 
 def _validate_wg_config(text: str) -> list[str]:
@@ -246,7 +251,14 @@ def _validate_wg_config(text: str) -> list[str]:
             continue
         key = s.split("=", 1)[0].strip()
         if key.lower() not in _WG_ALLOWED_KEYS:
-            errors.append(f"disallowed key: {key} (hooks like PostUp are not accepted)")
+            errors.append(f"disallowed key: {key} (hooks like PostUp, and "
+                          "Table/FwMark, are not accepted)")
+    # Full tunnel only: all IPv4 traffic must go through the VPN.
+    allowed = [ip.strip() for m in _WG_ALLOWEDIPS.finditer(text)
+               for ip in m.group(1).split(",")]
+    if allowed and "0.0.0.0/0" not in allowed:
+        errors.append("AllowedIPs must include 0.0.0.0/0 (route all traffic "
+                      "through the tunnel; split-tunnel configs are not supported)")
     return errors
 
 
@@ -272,10 +284,17 @@ async def save_telegram(
             content={"ok": False, "error": "api_hash must be exactly 32 hex characters"},
         )
 
-    proxy = None
-    if TUNNEL2_CONF.is_file():
-        proxy = ("socks5", TG_PROXY_HOST, TG_PROXY_PORT)
-    ok, err = await validate_telegram_credentials_async(api_id, api_hash, proxy=proxy)
+    # The live check only ever runs through the Telegram tunnel. Without a
+    # tunnel (or its proxy password) we save after the format checks above
+    # rather than contact Telegram from this host's real IP.
+    proxy_password = _read_env_var("TG_SOCKS_PASSWORD")
+    if TUNNEL2_CONF.is_file() and proxy_password:
+        proxy = ("socks5", TG_PROXY_HOST, TG_PROXY_PORT, True,
+                 TG_PROXY_USER, proxy_password)
+        ok, err = await validate_telegram_credentials_async(api_id, api_hash, proxy=proxy)
+    else:
+        log.info("telegram creds: no tunnel2 yet; skipping live check (format only)")
+        ok, err = True, ""
     if not ok:
         return JSONResponse(
             status_code=400,

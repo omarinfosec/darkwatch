@@ -10,6 +10,7 @@ __version__ = "0.2.0"
 import os
 import sys
 import json
+import html as html_lib
 import socket
 import time
 import sqlite3
@@ -1779,9 +1780,54 @@ class YaraScanner:
 
 # ─── Alerting ────────────────────────────────────────────────────────────────
 
+def alert_proxy_routes(config):
+    """Ordered egress routes for alert webhooks.
+
+    Alerts carry the .onion URL and the matched text, so they must not leave
+    from the host's own IP. Try the Telegram tunnel (a VPN exit, which Slack /
+    Discord / Telegram accept), then Tor. A direct connection is used only if
+    the operator opts in with alerts.allow_direct = true."""
+    from urllib.parse import quote
+    routes = []
+    tg = config.get("telegram", {}) or {}
+    if tg.get("proxy_host"):
+        auth = ""
+        if tg.get("proxy_user") and tg.get("proxy_password"):
+            auth = (f"{quote(str(tg['proxy_user']), safe='')}:"
+                    f"{quote(str(tg['proxy_password']), safe='')}@")
+        url = f"socks5h://{auth}{tg['proxy_host']}:{int(tg.get('proxy_port') or 1080)}"
+        routes.append(("telegram tunnel", {"http": url, "https": url}))
+    p = config.get("proxy", {}) or {}
+    if p.get("host"):
+        url = f"{p.get('type', 'socks5h')}://{p['host']}:{int(p.get('port', 9050))}"
+        routes.append(("tor", {"http": url, "https": url}))
+    if (config.get("alerts", {}) or {}).get("allow_direct"):
+        routes.append(("direct", None))
+    return routes
+
+
 class Alerter:
-    def __init__(self, config):
+    def __init__(self, config, routes=None):
         self.config = config
+        self.routes = routes if routes is not None else []
+
+    def _post(self, url, payload):
+        """POST through the first route that connects. Only connection-level
+        failures fall through to the next route, so an alert that reached
+        the receiver is never sent twice."""
+        if not self.routes:
+            raise RuntimeError("no tunnel available for alerts "
+                               "(set alerts.allow_direct to send directly)")
+        last = None
+        for name, proxies in self.routes:
+            try:
+                return requests.post(url, json=payload, proxies=proxies, timeout=20)
+            except (requests.exceptions.ProxyError,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ConnectTimeout) as e:
+                last = e
+                log.debug(f"alert route '{name}' unavailable: {e}")
+        raise RuntimeError(f"all alert routes failed: {last}")
 
     def send(self, finding):
         score = finding.get("score", 0)
@@ -1813,7 +1859,8 @@ class Alerter:
         if not token or not chat_id:
             return
         try:
-            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg}, timeout=10)
+            self._post(f"https://api.telegram.org/bot{token}/sendMessage",
+                       {"chat_id": chat_id, "text": msg})
             log.info("Telegram alert sent")
         except Exception as e:
             log.error(f"Telegram alert failed: {e}")
@@ -1823,7 +1870,7 @@ class Alerter:
         if not webhook:
             return
         try:
-            requests.post(webhook, json={"text": msg}, timeout=10)
+            self._post(webhook, {"text": msg})
             log.info("Slack alert sent")
         except Exception as e:
             log.error(f"Slack alert failed: {e}")
@@ -1855,7 +1902,7 @@ class Alerter:
             }]
         }
         try:
-            requests.post(webhook, json=payload, timeout=10)
+            self._post(webhook, payload)
             log.info("Discord alert sent")
         except Exception as e:
             log.error(f"Discord alert failed: {e}")
@@ -1879,7 +1926,7 @@ class Alerter:
             "summary_text": msg,
         }
         try:
-            requests.post(webhook, json=payload, timeout=10)
+            self._post(webhook, payload)
             log.info("Generic webhook alert sent")
         except Exception as e:
             log.error(f"Generic webhook alert failed: {e}")
@@ -2089,7 +2136,31 @@ class ScreenshotEngine:
         # a hard-fail leak for onion targets and reveals the operator's
         # interest to whatever DNS resolver is in use.
         "network.proxy.socks_remote_dns": True,
+        # Send localhost/127.0.0.1 through the proxy too (Firefox exempts it
+        # by default), so a page can't point the browser at the dashboard
+        # or anything else listening inside this container.
+        "network.proxy.allow_hijacking_localhost": True,
+        # Speculative connections are not seen by Playwright's route handler:
+        # no DNS prefetch, link prefetch, preconnect, predictor or pings.
+        "network.dns.disablePrefetch": True,
+        "network.dns.disablePrefetchFromHTTPS": True,
+        "network.prefetch-next": False,
+        "network.predictor.enabled": False,
+        "network.http.speculative-parallel-limit": 0,
+        "browser.send_pings": False,
+        "media.navigator.enabled": False,
+        # Playwright's route handler only sees the first URL of a redirect
+        # chain, so a same-origin image answering 302 -> tracker.example
+        # would be fetched without passing the same-origin guard. Follow no
+        # redirects at all; a page that redirects is rendered offline from
+        # the HTML the crawler already fetched (see _render).
+        "network.http.redirection-limit": 0,
     }
+
+    # Unroutable proxy for "offline" mode: anything that slips past the
+    # route handler (speculative connections, etc.) fails instead of going
+    # out directly from the host.
+    DEAD_PROXY = "socks5://127.0.0.1:9"
     FIREFOX_ARGS = ["--disable-blink-features=AutomationControlled"]
 
     def __init__(self, output_dir, thumbnails_dir=None, proxy_url=None,
@@ -2130,6 +2201,10 @@ class ScreenshotEngine:
                     # network.proxy.socks_remote_dns pref instead.
                     pw_proxy = self.proxy_url.replace("socks5h://", "socks5://", 1)
                     launch_kwargs["proxy"] = {"server": pw_proxy}
+                else:
+                    # offline mode, or tor_render without a proxy: never let
+                    # the browser reach the network directly.
+                    launch_kwargs["proxy"] = {"server": self.DEAD_PROXY}
                 self._browser = self._playwright.firefox.launch(**launch_kwargs)
                 log.info(f"Screenshot engine ready (mode={self.mode}, "
                          f"proxy={launch_kwargs.get('proxy', {}).get('server', 'none')})")
@@ -2172,10 +2247,13 @@ class ScreenshotEngine:
             )
             page = context.new_page()
 
-            if self.mode == "offline":
+            def render_offline():
                 page.route("**/*", lambda route: route.abort())
                 page.set_content(html_content, wait_until="domcontentloaded",
                                  timeout=15000)
+
+            if self.mode == "offline" or not self.proxy_url:
+                render_offline()
             else:
                 page_host = urlparse(url).netloc
 
@@ -2202,7 +2280,15 @@ class ScreenshotEngine:
                         except Exception: pass
 
                 page.route("**/*", guard)
-                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as e:
+                    # Most often the page redirects (redirects are disabled,
+                    # see FIREFOX_PREFS). Render the HTML we already fetched,
+                    # with every network request aborted, instead of failing.
+                    log.debug(f"  tor_render failed ({e}); rendering offline")
+                    page.unroute("**/*")
+                    render_offline()
 
             page.screenshot(path=output_path, full_page=False, timeout=10000)
             return True
@@ -2416,7 +2502,13 @@ class ResponseValidator:
 
     def validate(self, response):
         content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > self.max_size:
+        try:
+            declared = int(content_length or 0)
+        except ValueError:
+            # Malformed header (e.g. "5, 5"): ignore it; the real body size
+            # is checked just below. Raising here aborted the whole site crawl.
+            declared = 0
+        if declared > self.max_size:
             return False, f"Response too large: {content_length} bytes"
         if len(response.content) > self.max_size:
             return False, f"Response body too large: {len(response.content)} bytes"
@@ -2649,6 +2741,9 @@ class DarkMTProto:
         self.proxy_host = tg.get("proxy_host") or ""
         self.proxy_port = int(tg.get("proxy_port") or 1080)
         self.proxy_type = tg.get("proxy_type") or "socks5"
+        # tg-socks requires a username/password (TG_SOCKS_PASSWORD).
+        self.proxy_user = tg.get("proxy_user") or ""
+        self.proxy_password = tg.get("proxy_password") or ""
         self.use_tor = bool(tg.get("use_tor"))
         self.scrape_delay_s = int(tg.get("scrape_delay_s") or 3)
         self.scrape_limit = int(tg.get("scrape_limit_per_tick") or 100)
@@ -2798,6 +2893,10 @@ class DarkMTProto:
             p = self.config.get("proxy", {})
             return ("socks5", p.get("host", "tunnel1"), int(p.get("port", 9050)))
         if self.proxy_host:
+            if self.proxy_user and self.proxy_password:
+                # (type, host, port, rdns, username, password)
+                return (self.proxy_type, self.proxy_host, self.proxy_port,
+                        True, self.proxy_user, self.proxy_password)
             return (self.proxy_type, self.proxy_host, self.proxy_port)
         return None
 
@@ -4846,7 +4945,7 @@ class DarkWebCrawler:
             user_file=user_yar_path,
             private_dir=private_dir,
         )
-        self.alerter = Alerter(config["alerts"])
+        self.alerter = Alerter(config["alerts"], routes=alert_proxy_routes(config))
         self.stealth = StealthEngine(config)
         self.validator = ResponseValidator(config)
         self.sanitizer = HTMLSanitizer()
@@ -5000,10 +5099,17 @@ class DarkWebCrawler:
                     resp.close()
                     return None, "size"
 
-                # stream with size limit
+                # stream with size AND total-time limits. requests' timeout
+                # applies per read, so a server dripping one byte just under
+                # it could otherwise hold this crawl thread indefinitely.
                 chunks = []
                 total = 0
+                deadline = time.monotonic() + max(120, 3 * self.timeout)
                 for chunk in resp.iter_content(chunk_size=8192):
+                    if time.monotonic() > deadline:
+                        resp.close()
+                        raise requests.exceptions.ReadTimeout(
+                            "download exceeded total time limit")
                     total += len(chunk)
                     if total > max_size:
                         log.warning(f"  Response exceeded size limit, aborting")
@@ -5650,8 +5756,10 @@ class DarkWebCrawler:
                 if not pdf_text:
                     log.debug(f"  PDF text extraction yielded nothing: {current_url}")
                     continue
-                html = f"<html><head><title>{current_url}</title></head>" \
-                       f"<body><pre>{pdf_text}</pre></body></html>"
+                # Escape: PDF text is attacker-controlled and this wrapper is
+                # parsed for links/forms and rendered for the screenshot.
+                html = f"<html><head><title>{html_lib.escape(current_url)}</title></head>" \
+                       f"<body><pre>{html_lib.escape(pdf_text)}</pre></body></html>"
             else:
                 html = resp.text
 

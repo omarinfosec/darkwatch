@@ -40,7 +40,11 @@ jobs:
       - name: bash -n on all ops scripts
         run: for f in ops/*.sh tor/entrypoint.sh darkwatch/scan.sh; do bash -n "$f"; done
       - name: shellcheck (errors only)
-        run: shellcheck -S error ops/*.sh tor/entrypoint.sh
+        run: shellcheck -S error ops/*.sh tor/*.sh tunnels/killswitch/*.sh tests/killswitch/*.sh
+      - name: WireGuard kill switch (network namespace test)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null
+          UNSHARE="sudo unshare -n" PYTHON=/usr/bin/python3 bash tests/killswitch/check.sh
       - name: docker compose config
         run: |
           data="$(mktemp -d)" && touch "$data/env"

@@ -17,6 +17,12 @@ name: darkwatch
 
 x-restart-policy: &restart-policy
   restart: unless-stopped
+  # Cap container logs; the default json-file driver grows until the disk fills.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   # ─── Tunnel 1 — dark-web crawl egress path ────────────────────────────────
@@ -38,6 +44,10 @@ services:
       # Operator places the WG config at:
       #   ${DATA_ROOT}/secrets/tunnel1/wg_confs/wg0.conf
       - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/secrets/tunnel1:/config
+      # Kill switch: the image runs /custom-cont-init.d/* as root at start.
+      # Blocks every egress path except WireGuard, so a dropped tunnel can't
+      # fall back to the Docker bridge and the host's real IP.
+      - ./tunnels/killswitch:/custom-cont-init.d:ro
     networks:
       - darknet
     healthcheck:
@@ -45,7 +55,9 @@ services:
       # filename wg0.conf (=> interface wg0) without conflict.
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch to be in place, so the tor / tg-socks
+      # sidecars (which wait for "healthy") never run without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -64,6 +76,10 @@ services:
     container_name: tor
     # Inherits the WG netns: tor's egress is the tunnel1 only.
     network_mode: "service:tunnel1"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     env_file:
       - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
     volumes:
@@ -94,12 +110,18 @@ services:
       #   ${DATA_ROOT}/secrets/tunnel2/wg_confs/wg0.conf
       # (wg0.conf, same filename as tunnel1 — own netns, name doesn't collide.)
       - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/secrets/tunnel2:/config
+      # Kill switch: the image runs /custom-cont-init.d/* as root at start.
+      # Blocks every egress path except WireGuard, so a dropped tunnel can't
+      # fall back to the Docker bridge and the host's real IP.
+      - ./tunnels/killswitch:/custom-cont-init.d:ro
     networks:
       - darknet
     healthcheck:
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      test: ["CMD-SHELL", "wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch to be in place, so the tor / tg-socks
+      # sidecars (which wait for "healthy") never run without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -111,12 +133,21 @@ services:
     image: serjs/go-socks5-proxy@sha256:0af522996f402c03ecd985a87997158eabeb28935365e3a384df37eafcf740ea    # PIN: replace with @sha256:... before prod
     container_name: tg-socks
     network_mode: "service:tunnel2"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     depends_on:
       tunnel2:
         condition: service_healthy
     environment:
       - PROXY_PORT=1080
-      - REQUIRE_AUTH=false  # only reachable via darknet bridge from darkwatch
+      # Password-protected: every container on the darknet bridge can reach
+      # this port, and it may also be reachable from the VPN side via wg0.
+      # deploy.sh generates TG_SOCKS_PASSWORD in the env file.
+      - REQUIRE_AUTH=true
+      - PROXY_USER=darkwatch
+      - PROXY_PASSWORD=${TG_SOCKS_PASSWORD:-}
 
   # ─── DarkWatch crawler + dashboard ─────────────────────────────────────────
   # Egress isolation is verified out-of-band by ops/verify-egress.sh,
@@ -151,8 +182,13 @@ services:
       - ./darkwatch/config.json:/app/config.json:ro
     environment:
       - DARKWATCH_CONFIG=/app/config.json
+    pids_limit: 1024
     networks:
-      - darknet
+      darknet:
+        # Fixed address so ops/egress-lockdown.sh can block this container's
+        # direct internet access on the host (it must only egress via the
+        # tunnels' SOCKS proxies).
+        ipv4_address: ${DARKWATCH_IP:-172.31.250.250}
     # No `depends_on` of tor / tg-socks: those are profile-gated and may
     # not be present. darkwatch starts regardless; if a tunnel is missing
     # the corresponding feature (Tor crawl or Telegram scrape) is just
@@ -178,7 +214,14 @@ services:
   # SETUP_AUTH_TOKEN is required regardless.
   setup:
     <<: *restart-policy
+    # Only run while configuring; never come back on its own after a reboot.
+    restart: "no"
     profiles: ["setup"]
+    # No cap_drop here: setup runs `docker compose`, which reads paths owned
+    # by uid 999 under the data root, and the docker.sock mount makes it
+    # root-equivalent regardless. Keep the profile off when not configuring.
+    security_opt:
+      - no-new-privileges:true
     build:
       context: ./setup
       dockerfile: Dockerfile
@@ -223,3 +266,8 @@ volumes:
 networks:
   darknet:
     driver: bridge
+    ipam:
+      config:
+        # Fixed subnet so the egress lockdown rule and DARKWATCH_IP are stable.
+        # Change both (in the env file) if it collides with a host network.
+        - subnet: ${DARKNET_SUBNET:-172.31.250.0/24}

@@ -361,6 +361,12 @@ def _check_ip_leak(tor_result):
 
     direct_ip, direct_err = _fetch_ip(proxies=None, timeout=5)
     if not direct_ip:
+        if os.environ.get("DARKWATCH_EGRESS_LOCKDOWN", "1") != "0":
+            # ops/egress-lockdown.sh blocks this container's direct internet
+            # access, so the direct probe failing is the expected, safest
+            # outcome: there is no non-Tor route for a request to leak over.
+            return {"ok": True,
+                    "detail": f"direct egress blocked (lockdown); tor_exit {tor_ip}"}
         return {"ok": False,
                 "detail": f"direct IP fetch failed (fail-closed): {direct_err}"}
 

@@ -48,6 +48,21 @@ log "pre-flight: verifying operator state at $DATA_ROOT"
 [[ -f "$DATA_ROOT/env" ]] || fail "$DATA_ROOT/env is missing. Copy .env.example and fill it in."
 [[ "$(stat -c %a "$DATA_ROOT/env")" == "600" ]] || fail "$DATA_ROOT/env permissions must be 0600 (got $(stat -c %a "$DATA_ROOT/env"))"
 
+# Secrets that newer versions need. Generated once, kept in the env file.
+ensure_secret() {
+    local key="$1"
+    if ! grep -qE "^${key}=.+" "$DATA_ROOT/env"; then
+        local val; val="$(openssl rand -hex 24)"
+        if grep -qE "^${key}=" "$DATA_ROOT/env"; then
+            sed -i "s|^${key}=.*|${key}=${val}|" "$DATA_ROOT/env"
+        else
+            printf '\n%s=%s\n' "$key" "$val" >> "$DATA_ROOT/env"
+        fi
+        log "  generated $key"
+    fi
+}
+ensure_secret TG_SOCKS_PASSWORD   # tg-socks proxy login (Telegram tunnel)
+
 # Required env vars must be present in /var/lib/darkwebapp/env
 required_vars=(
     DARKWEBAPP_DATA_ROOT
@@ -133,6 +148,19 @@ if (( ! SKIP_BUILD )); then
     docker compose $COMPOSE_PROFILES_ARGS build
 fi
 
+# ─── Network migration ───────────────────────────────────────────────────────
+# v0.3 pins the darknet subnet (egress lockdown needs a fixed address for
+# darkwatch). Compose refuses to reuse a network whose config changed, so
+# recreate it once: `down` stops the containers and removes the network.
+want_subnet="$(grep -E '^DARKNET_SUBNET=' "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)"
+want_subnet="${want_subnet:-172.31.250.0/24}"
+have_subnet="$(docker network inspect darkwatch_darknet \
+    -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
+if [[ -n "$have_subnet" && "$have_subnet" != "$want_subnet" ]]; then
+    log "darknet subnet changes ($have_subnet -> $want_subnet): recreating the network"
+    docker compose --profile tor --profile tg --profile setup down
+fi
+
 # ─── Bring stack up ──────────────────────────────────────────────────────────
 # Tunnel sidecars wait for their WireGuard container to report a handshake;
 # if that never happens `up` fails. Show why instead of dying silently.
@@ -145,7 +173,7 @@ if ! docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans; then
             docker logs --tail=20 "$svc" >&2 || true
         fi
     done
-    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong or the VPN endpoint is unreachable (no handshake)."
+    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong, the VPN endpoint is unreachable (no handshake), or the kill switch didn't load (check 'docker logs tunnelN' for [killswitch]; tunnels/killswitch must be owned by root)."
 fi
 
 # ─── Health verification ────────────────────────────────────────────────────
@@ -163,6 +191,32 @@ for i in $(seq 1 60); do
     fi
     sleep 2
 done
+
+# ─── Block darkwatch's direct internet access (host firewall) ───────────────
+"$SCRIPT_DIR/egress-lockdown.sh" || fail "could not apply egress lockdown"
+# Re-apply after reboots (iptables rules don't persist on their own).
+UNIT=/etc/systemd/system/darkwatch-egress-lockdown.service
+if command -v systemctl >/dev/null 2>&1; then
+    unit_body="[Unit]
+Description=DarkWatch: block the darkwatch container's direct internet access
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_DIR/egress-lockdown.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"
+    if [[ ! -f "$UNIT" ]] || [[ "$(cat "$UNIT")" != "$unit_body" ]]; then
+        printf '%s' "$unit_body" > "$UNIT"
+        systemctl daemon-reload
+        systemctl enable --quiet darkwatch-egress-lockdown.service
+        log "installed darkwatch-egress-lockdown.service (re-applies the rule at boot)"
+    fi
+fi
 
 # ─── Optional egress leak check (slow; can skip in dev loops) ───────────────
 if (( ! NO_EGRESS_CHECK )); then

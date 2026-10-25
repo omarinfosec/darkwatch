@@ -97,3 +97,51 @@ def test_cookie_post_behind_reverse_proxy(client):
                     headers={"Origin": "https://setup.example.org",
                              "X-Forwarded-Host": "setup.example.org"})
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("line", ["Table = off", "Table = 1234", "FwMark = 0x1"])
+def test_wg_config_rejects_routing_overrides(line):
+    # Table = off would stop wg0 being the default route (traffic would leave
+    # via the Docker bridge); the kill switch relies on the default fwmark.
+    conf = VALID_WG.replace("[Peer]", f"{line}\n\n[Peer]")
+    assert any("disallowed key" in e for e in main._validate_wg_config(conf))
+
+
+def test_wg_config_requires_full_tunnel():
+    split = VALID_WG.replace("AllowedIPs = 0.0.0.0/0", "AllowedIPs = 10.0.0.0/8")
+    assert any("0.0.0.0/0" in e for e in main._validate_wg_config(split))
+    both = VALID_WG.replace("AllowedIPs = 0.0.0.0/0", "AllowedIPs = 0.0.0.0/0, ::/0")
+    assert main._validate_wg_config(both) == []
+
+
+def test_telegram_save_never_validates_without_tunnel(client, tmp_path, monkeypatch):
+    """No tunnel2 config -> creds are format-checked and saved, but Telegram
+    is never contacted (it would be a direct connection from the host)."""
+    called = []
+    async def fake_validate(*a, **k):
+        called.append(k.get("proxy")); return True, ""
+    monkeypatch.setattr(main, "validate_telegram_credentials_async", fake_validate)
+    monkeypatch.setattr(main, "TUNNEL2_CONF", tmp_path / "missing.conf")
+    monkeypatch.setattr(main, "ENV_FILE", tmp_path / "env")
+    (tmp_path / "env").write_text("SETUP_AUTH_TOKEN=" + TOKEN + "\n")
+    monkeypatch.setattr(main, "_recreate_darkwatch", lambda: (True, "darkwatch"))
+    r = client.post("/api/telegram", data={"api_id": "123456", "api_hash": "a" * 32},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200, r.text
+    assert called == []
+
+
+def test_telegram_validation_uses_authenticated_proxy(client, tmp_path, monkeypatch):
+    called = []
+    async def fake_validate(*a, **k):
+        called.append(k.get("proxy")); return True, ""
+    conf = tmp_path / "wg0.conf"; conf.write_text(VALID_WG)
+    monkeypatch.setattr(main, "validate_telegram_credentials_async", fake_validate)
+    monkeypatch.setattr(main, "TUNNEL2_CONF", conf)
+    monkeypatch.setattr(main, "ENV_FILE", tmp_path / "env")
+    (tmp_path / "env").write_text(f"SETUP_AUTH_TOKEN={TOKEN}\nTG_SOCKS_PASSWORD=pw123\n")
+    monkeypatch.setattr(main, "_recreate_darkwatch", lambda: (True, "darkwatch"))
+    r = client.post("/api/telegram", data={"api_id": "123456", "api_hash": "a" * 32},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200, r.text
+    assert called == [("socks5", "tunnel2", 1080, True, "darkwatch", "pw123")]
