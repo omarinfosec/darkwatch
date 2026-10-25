@@ -5,13 +5,13 @@
 requests==2.33.0
 PySocks==1.7.1
 beautifulsoup4==4.12.3
-lxml==5.3.0
+lxml==6.1.3
 yara-python==4.5.1
 
 # ── Web framework + screenshotting ────────────────────────────────────────
 flask==3.1.3
-playwright==1.47.0
-Pillow==10.4.0
+playwright==1.64.1
+Pillow==13.0.0
 
 # ── Tor control + Telegram ────────────────────────────────────────────────
 stem==1.8.2

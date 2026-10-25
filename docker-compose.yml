@@ -9,9 +9,11 @@
 # Nothing is published on 0.0.0.0; all host bindings respect ${DARKWATCH_BIND_IP}.
 #
 # Image pinning:
-#   Third-party images SHOULD be pinned by SHA256 digest in production. Tags are
-#   used here for readability of the initial scaffold. Run `ops/pin-images.sh`
-#   before first production deploy to swap tags for digests and commit the result.
+#   Third-party images are pinned by SHA256 digest, so they only get OS security
+#   updates when re-pinned. Refresh periodically: look up the current digest
+#   with `docker buildx imagetools inspect <image>:<tag>` and replace it here
+#   (and in the Dockerfiles' FROM lines). ops/pin-images.sh pins any image
+#   that is still referenced by tag only.
 
 name: darkwatch
 
@@ -32,7 +34,7 @@ services:
   tunnel1:
     <<: *restart-policy
     profiles: ["tor"]
-    image: linuxserver/wireguard@sha256:0291ea6379ffb2eed1296676853e24b2774a6b2dc820771b350249d6fe95c6ca    # PIN: replace with @sha256:... before prod
+    image: linuxserver/wireguard@sha256:e2f655e1956a6db476bc879bf721f3f8bfed49c6d8fbcf39495d7ecb991d8228    # pinned by digest
     container_name: tunnel1
     cap_add:
       - NET_ADMIN
@@ -97,7 +99,7 @@ services:
   tunnel2:
     <<: *restart-policy
     profiles: ["tg"]
-    image: linuxserver/wireguard@sha256:0291ea6379ffb2eed1296676853e24b2774a6b2dc820771b350249d6fe95c6ca    # PIN: replace with @sha256:... before prod
+    image: linuxserver/wireguard@sha256:e2f655e1956a6db476bc879bf721f3f8bfed49c6d8fbcf39495d7ecb991d8228    # pinned by digest
     container_name: tunnel2
     cap_add:
       - NET_ADMIN
@@ -130,7 +132,7 @@ services:
   tg-socks:
     <<: *restart-policy
     profiles: ["tg"]
-    image: serjs/go-socks5-proxy@sha256:0af522996f402c03ecd985a87997158eabeb28935365e3a384df37eafcf740ea    # PIN: replace with @sha256:... before prod
+    image: serjs/go-socks5-proxy@sha256:0af522996f402c03ecd985a87997158eabeb28935365e3a384df37eafcf740ea    # pinned by digest
     container_name: tg-socks
     network_mode: "service:tunnel2"
     security_opt:
