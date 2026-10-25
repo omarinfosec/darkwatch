@@ -1,8 +1,8 @@
-FROM docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
+FROM docker:29-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb AS dockercli
 
-FROM python:3.11-slim-bookworm@sha256:ee710afcfb733f4a750d9be683cf054b5cd247b6c5f5237a6849ea568b90ab15
+FROM python:3.11-slim-bookworm@sha256:f06d01d4ba3f8ad5af45a3ec87df19c1d317d8e8961edc0fabda61811af6f7cf
 
-# Compose v2.29.0 is checksum-verified against the release checksums.txt.
+# Compose v2.40.3 is checksum-verified against the release checksums.txt.
 # docker compose is needed to create profile-gated tunnel containers after the
 # operator saves a WG config (restart alone is a no-op if they were never up).
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
@@ -11,11 +11,11 @@ RUN apt-get update \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
     && arch="$(uname -m)" \
     && case "$arch" in \
-         x86_64)  sum=fb3f6c317056ec54e8756851663ca788521f7a9c60afb8a595bc7a05ffaa8951 ;; \
-         aarch64) sum=49941418051846d72c74dd8df1f8b4ff753ca74d29986361d937384fbfb63569 ;; \
+         x86_64)  sum=dba9d98e1ba5bfe11d88c99b9bd32fc4a0624a30fafe68eea34d61a3e42fd372 ;; \
+         aarch64) sum=d26373b19e89160546d15407516cc59f453030d9bc5b43ba7faf16f7b4980137 ;; \
          *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
        esac \
-    && curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.0/docker-compose-linux-${arch}" \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-${arch}" \
          -o /usr/local/lib/docker/cli-plugins/docker-compose \
     && echo "${sum}  /usr/local/lib/docker/cli-plugins/docker-compose" | sha256sum -c - \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose \

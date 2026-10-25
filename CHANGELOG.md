@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-10-25
+
+Leak-hardening release: nothing can reach the internet from the host's IP
+any more, even if a tunnel drops.
 
 ### Upgrade notes
 - `deploy.sh` generates a new `TG_SOCKS_PASSWORD` and recreates the Docker
@@ -32,6 +35,15 @@
   no longer restarts on its own; container logs are size-capped.
 - Dependency updates: requests 2.33.0, Flask 3.1.3, Jinja2 3.1.6,
   python-multipart 0.0.31.
+
+### Upgrades
+- Playwright 1.47 → 1.64.1 (its bundled Firefox renders hostile pages);
+  FastAPI 0.115 → 0.162 / Starlette 1.10 (fixes unauthenticated DoS bugs in
+  the Setup UI); Pillow 10.4 → 13.0; lxml 5.3 → 6.1; uvicorn 0.54.
+- Docker Compose (Setup UI) 2.29 → 2.40.3, checksum-verified; Docker CLI
+  base 27 → 29.
+- Base images re-pinned to current digests (python:3.11-slim-bookworm,
+  debian:bookworm-slim, linuxserver/wireguard) for a month of OS patches.
 
 ### Fixes
 - A malformed `Content-Length` no longer aborts a site crawl (second copy of

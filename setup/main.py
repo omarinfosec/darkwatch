@@ -174,8 +174,9 @@ templates = Jinja2Templates(directory=_BASE / "templates")
 async def index(request: Request):
     if not _is_authenticated(request):
         return templates.TemplateResponse(
+            request,
             "no_token.html",
-            {"request": request, "auth_error": None},
+            {"auth_error": None},
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
     if request.query_params.get("token"):
@@ -186,8 +187,9 @@ async def index(request: Request):
         return response
     state = _current_state(include_values=True)
     response = templates.TemplateResponse(
+        request,
         "index.html",
-        {"request": request, "state": state, "token_present": True},
+        {"state": state, "token_present": True},
     )
     if not request.cookies.get(SESSION_COOKIE):
         _set_session_cookie(response)
@@ -199,8 +201,9 @@ async def auth_login(request: Request, token: str = Form(...)):
     provided = token.strip()
     if not provided or not _token_eq(provided, _expected_token()):
         return templates.TemplateResponse(
+            request,
             "no_token.html",
-            {"request": request, "auth_error": "Invalid token — check /var/lib/darkwebapp/env"},
+            {"auth_error": "Invalid token — check /var/lib/darkwebapp/env"},
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
     response = RedirectResponse(url="/", status_code=303)
