@@ -27,7 +27,6 @@ import logging
 import os
 import re
 import secrets
-import stat
 import subprocess
 import threading
 import time
@@ -649,30 +648,6 @@ def _compose_up_tunnel(n: int) -> tuple[bool, str]:
 def _recreate_darkwatch() -> tuple[bool, str]:
     """Recreate darkwatch so env_file changes (e.g. Telegram creds) take effect."""
     return _compose_run(["darkwatch"], force_recreate=True, no_deps=True)
-
-
-# ── Helpers: docker restart via socket (legacy) ──────────────────────────────
-def _restart_services(names: list[str]) -> list[str]:
-    """Restart named containers via the mounted docker socket. Returns the
-    list of names that were actually restarted (silently skips ones that
-    aren't running, e.g., tunnel1 if the user is configuring it for the
-    very first time)."""
-    try:
-        client = docker.from_env()
-    except Exception as e:
-        log.error("docker client init failed: %s", e)
-        return []
-    out = []
-    for name in names:
-        try:
-            ctr = client.containers.get(name)
-            ctr.restart(timeout=10)
-            out.append(name)
-        except docker.errors.NotFound:
-            log.info("skip restart: container '%s' not running", name)
-        except Exception as e:
-            log.warning("restart '%s' failed: %s", name, e)
-    return out
 
 
 # ── Helpers: current state for the UI ────────────────────────────────────────

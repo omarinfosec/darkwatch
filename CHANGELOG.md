@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-11-04
+
+Feature and hardening release: Telegram ingestion no longer skips or drops
+messages, CI builds and smoke-tests the images, dependencies are hash-locked,
+database retention, optional dashboard login, Python 3.13 / Debian trixie
+images. Read the upgrade notes and take a backup first (RUNBOOK).
 
 ### Upgrade notes
 - Telethon 1.45 upgrades the Telegram login file
@@ -77,6 +82,37 @@
   characters; if you set a shorter one by hand, replace it with
   `openssl rand -hex 32` (no restart needed).
 
+- **Unused settings removed.** `crawler.max_threads`,
+  `telegram.scrape_delay_s` and `telegram.persistent_client` are gone from
+  `config.json` and the built-in defaults. None of them was ever read, so
+  nothing changes; a copy left in `config.local.json` is still ignored and
+  can be deleted.
+- **`import web` no longer starts the monitor schedulers.** The health
+  refresh, both monitor schedulers and the live Telegram listener now start
+  in `web.start_background_services()`, which `python web.py` (the image's
+  command) calls before serving. Nothing changes for the shipped image. If
+  you run the dashboard under a WSGI server that imports `web:app`, call
+  `web.start_background_services()` once, from a single process.
+- **Tor image on Debian trixie.** The tor sidecar is now built on
+  `debian:trixie-slim` (pinned by digest) instead of bookworm, which is
+  LTS-only; Tor still comes from the Debian package. The tor package picks
+  the `debian-tor` uid when the image is built, and Tor refuses a data
+  directory it doesn't own, so `ops/deploy.sh` now checks the owner of the
+  `tor-data` volume (guard state) against the new image's `debian-tor` and,
+  when they differ, stops tor and re-owns the volume before starting the
+  stack. After deploying, check `docker compose ps tor` reports healthy,
+  `sudo ./ops/verify-egress.sh` passes, and `docker compose logs darkwatch |
+  grep 'Tor circuit rotated'` shows a rotation after a scan. Rolling back to
+  a release before this one needs the volume re-owned back by hand (see
+  `ops/RUNBOOK.md`, "Roll back a release").
+- **darkwatch and Setup UI images on Python 3.13 and Debian trixie.** Both
+  are now built on `python:3.13-slim-trixie` (pinned by digest) instead of
+  `python:3.11-slim-bookworm`; `ops/deploy.sh` rebuilds both. Nothing in
+  `/var/lib/darkwebapp` changes. CI's Python test jobs now run on 3.13
+  only and keep their names (`Tests (darkwatch)`, `Tests (setup)`): if
+  branch protection requires `Tests (darkwatch, Python 3.13)` or
+  `Tests (setup, Python 3.13)`, remove those, since they no longer report.
+
 ### Security
 - The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
   holds the issue time and an HMAC of it keyed by the token, is valid for
@@ -136,6 +172,25 @@
   (`pip install --only-binary=cryptg,yara-python`): a pin with no wheel for
   the build platform fails the build instead of trying a source build
   (cryptg's needs Rust, which the image does not have).
+- tor image and the darkwatch image's asset build stage (esbuild,
+  Tailwind): `debian:bookworm-slim` → `debian:trixie-slim`, pinned by
+  digest; Dependabot keeps refreshing the digest within trixie.
+- stem (no release since 2020) is no longer installed. NEWNYM circuit
+  rotation between scan targets now uses the same small ControlPort client
+  as the dashboard's Tor circuit check (`darkwatch/dw_tor.py`): it resolves
+  `tor_control_host` first, as before, authenticates with
+  `tor_control_password` and checks every reply for `250`. Rotation is
+  still best effort and never fails a scan, but a request now gives up
+  after 5 seconds (stem's had no timeout, so an unanswering ControlPort
+  could hold a scan), and a refusal such as a wrong password (`515`) is
+  logged as a warning instead of at debug level, as are bad control
+  settings in `config.json` (a port that isn't a number, a null host).
+- darkwatch and Setup UI images: `python:3.11-slim-bookworm` →
+  `python:3.13-slim-trixie`, pinned by digest. Playwright 1.64's
+  `install --with-deps` has package lists for trixie, so the comment that
+  tied the image to bookworm is gone. Both `requirements.lock` files are
+  resolved for CPython 3.13, at the same versions as before; cryptg and
+  yara-python have cp313 wheels for x86_64 and aarch64.
 
 ### Fixed
 - Forum-topic labels on Telegram messages keep working on Telethon 1.45,
@@ -290,8 +345,42 @@
 - `darkwatch.py --config` now defaults to `$DARKWATCH_CONFIG` (else
   `config.json`), as `web.py` already did, so the CLI and `--retention`
   read the same config as the dashboard.
+- `web.py` (scan thread, monitor, live Telegram consumer) and
+  `darkwatch.py --url` looked up url and page ids on the shared database
+  connection without the database lock, racing the other threads that use
+  it. They now go through locked `Database` helpers (`get_url_id`,
+  `get_url_source`, `latest_page_id`, `get_url_by_tg_channel_id`).
+- Tracked Telegram channel lists share one limit, `TG_CHANNEL_LIST_LIMIT`
+  (1000) in `darkwatch/web.py`. "Search all channels", smart discovery and
+  the deep search used 500 and the live listener 1000, and channels past
+  the limit were left out without a word. Each of these now logs a warning
+  naming how many tracked channels it skipped (the least recently
+  scanned); the Telegram tab lists up to the same 1000 channels (it listed
+  500).
 
 ### Internal
+- `ops/lock-deps.sh` resolves the locks for CPython 3.13 (`PYTHON_VERSION`)
+  on x86_64 Linux, then again for aarch64 Linux from a copy of each new
+  lock, and fails, showing the difference, if aarch64 resolves to another
+  lock. CI runs the Python tests, pyflakes and pip-audit on 3.13; the 3.11
+  legs are gone, since no image runs 3.11 and a 3.13 lock need not install
+  there. `tests/workflows/check.py` fails when the Dockerfiles' Python,
+  `PYTHON_VERSION` and the CI and audit jobs' Python differ;
+  `tests/lock-deps/check.sh` covers the aarch64 run.
+- New `darkwatch/tests/test_tor_control.py` tests the ControlPort client
+  against a fake ControlPort: NEWNYM success, a wrong password (`515`), a
+  refused signal, a ControlPort that never answers, quotes and backslashes
+  in the password escaped, a password with a line break never sent, the
+  control host resolved before connecting, and bad control settings
+  skipping rotation without failing the scan. The fake ControlPort moved
+  to `darkwatch/tests/conftest.py`; the image smoke test also imports
+  `dw_tor`.
+- `tests/images/smoke.sh` also checks that the tor image runs as
+  `debian-tor`, owns its `/var/lib/tor` (a fresh `tor-data` volume copies
+  that owner), has an executable `healthcheck.sh` (and the bash, timeout
+  and grep it needs) wired as its `HEALTHCHECK`, and that the entrypoint
+  writes a torrc `tor --verify-config` accepts. `tests/ops/check.sh` covers
+  the `tor-data` re-own step in `ops/deploy.sh`.
 - New `darkwatch/tests/test_sanitizer.py` covers the saved-page sanitizer,
   including a headless-Chromium check that a sanitized page opened from
   `file://` makes no request (skipped without a Playwright Chromium;
@@ -353,8 +442,8 @@
   lock), and `tests/lock-deps/check.sh` tests the script with uv stubbed.
   The locks are resolved for x86_64 Linux; they carry the hashes of every
   file of each version, but building the images on arm64 is untested.
-  stem and pyaes ship only source archives: those archives are
-  hash-checked, the setuptools pip fetches to build them is not. Dependabot
+  pyaes ships only a source archive: that archive is hash-checked, the
+  setuptools pip fetches to build it is not. Dependabot
   updates `requirements.in` only; run `./ops/lock-deps.sh` on its PR branch
   (RUNBOOK, "Update Python dependencies").
 - New weekly workflow `Dependency audit` runs pip-audit 2.10.1 separately on
@@ -390,6 +479,27 @@
   The dashboard test fixture moved to `darkwatch/tests/conftest.py` and is
   session-scoped, so test modules share the one import of `web`; it still
   sets its environment only around that import.
+- Removed dead code: `PersistentTelethonLoop`, `ClientProfile.reset`,
+  `DarkMTProto._with_client`, Setup's unused `_restart_services` (the
+  Setup UI restarts services with `docker compose`), an unreachable `raise`
+  in `telegram_validate.validate_telegram_credentials`, and the unused
+  imports, variables and placeholder-less f-strings pyflakes reported.
+  The `ScreenshotEngine` docstring, which described offline rendering
+  only, now describes the `tor_render` default and the `offline` mode.
+- CI runs a pinned pyflakes (4.1.0) over the application code (`*/*.py`,
+  tests excluded). New `darkwatch/tests/test_web_startup.py` checks that
+  importing `web` starts no background thread and `python web.py` starts
+  them before serving; the image smoke test checks the latter in the built
+  image.
+- `darkwatch/darkwatch.py` is split: the `Database` class (and `utcnow`)
+  moved to `darkwatch/dw_db.py`, the Telegram engine (`DarkMTProto` alias
+  `TelegramScraper`, `RateLimiter`, `EntityCache`, `CallPressure`,
+  `ClientProfile`, `TelegramLiveListener`) to `darkwatch/dw_telegram.py`.
+  No behaviour change: `darkwatch.py` re-exports these names, so
+  `from darkwatch import Database` and `darkwatch.DarkMTProto` keep working,
+  and the moved code still logs as `darkwatch`. The Dockerfile already
+  copies every top-level module; the image smoke test now also imports
+  `dw_db` and `dw_telegram`, and a new smoke test checks the re-exports.
 
 ## v0.3.1 — 2026-11-04
 

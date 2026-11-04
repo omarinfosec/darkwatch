@@ -35,8 +35,28 @@ run() {
 
 # A module missing from the image (the Dockerfile COPY line) or an import
 # that blocks on the network fails here.
-run "darkwatch: import darkwatch, threat_intel, web" \
-    "$DARKWATCH_IMAGE" python -c 'import darkwatch, threat_intel, web'
+run "darkwatch: import darkwatch, dw_db, dw_telegram, dw_tor, threat_intel, web" \
+    "$DARKWATCH_IMAGE" python -c 'import darkwatch, dw_db, dw_telegram, dw_tor, threat_intel, web'
+
+# Importing web starts no background thread (darkwatch/tests/
+# test_web_startup.py); `python web.py`, the image's CMD, must start the
+# health refresh and both monitor schedulers before it serves. Flask.run is
+# stubbed, so nothing listens; os._exit skips the daemon threads' shutdown.
+run "darkwatch: python web.py starts the background services" \
+    -w /app "$DARKWATCH_IMAGE" python -c '
+import os, runpy, sys, threading, flask
+def check(self, *a, **kw):
+    names = {t.name for t in threading.enumerate()}
+    missing = {"health-refresh", "MonitorScheduler", "TelegramMonitor"} - names
+    print("threads:", ", ".join(sorted(names)), flush=True)
+    if missing:
+        print("missing:", ", ".join(sorted(missing)), file=sys.stderr, flush=True)
+    os._exit(1 if missing else 0)
+flask.Flask.run = check
+sys.argv = ["web.py"]
+runpy.run_path("web.py", run_name="__main__")
+sys.exit("web.py returned without calling app.run()")
+'
 
 # The two wheel-only native packages (Dockerfile --only-binary). Telethon
 # silently falls back to pure-Python AES without cryptg, so check that it
@@ -89,6 +109,36 @@ run "setup: docker compose plugin" \
 
 run "tor: tor --version" \
     --entrypoint tor "$TOR_IMAGE" --version
+
+# The image runs as debian-tor and the healthcheck needs bash, timeout and
+# grep. `id` lands in the log: ops/deploy.sh re-owns the tor-data volume when
+# the uid changes with the base image. A fresh tor-data volume is copied from
+# the image's /var/lib/tor, owner included, so the tor package must ship it
+# owned by debian-tor. One `command -v` per name: dash's exit status only
+# reflects the first of several.
+run "tor: debian-tor user and healthcheck.sh" \
+    --entrypoint /bin/sh "$TOR_IMAGE" -c '
+set -e
+id
+[ "$(id -un)" = debian-tor ]
+test -x /usr/local/bin/healthcheck.sh
+for c in bash timeout grep; do command -v "$c" >/dev/null; done
+test -w /etc/tor/run
+[ -d /var/lib/tor ] && [ -O /var/lib/tor ]
+'
+echo "── tor: HEALTHCHECK runs healthcheck.sh"
+if docker image inspect -f '{{json .Config.Healthcheck.Test}}' "$TOR_IMAGE" \
+        | grep -q '/usr/local/bin/healthcheck.sh'; then
+    echo "   ok"
+else
+    echo "   FAIL: the tor image's HEALTHCHECK does not run healthcheck.sh" >&2
+    fail=1
+fi
+
+# The entrypoint templates torrc (tor --hash-password) and tor accepts it,
+# without touching the network.
+run "tor: entrypoint writes a torrc tor accepts" \
+    -e TOR_CONTROL_PASSWORD=smoke "$TOR_IMAGE" tor -f /etc/tor/run/torrc --verify-config
 
 if [ "$fail" -ne 0 ]; then
     echo "image smoke tests FAILED" >&2

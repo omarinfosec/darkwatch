@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.1-blue.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.0-blue.svg">
   <img alt="Status: public release" src="https://img.shields.io/badge/status-public%20release-brightgreen.svg">
   <img alt="Platform: Linux + Docker" src="https://img.shields.io/badge/platform-linux%20%2B%20docker-informational">
   <img alt="OPSEC: first" src="https://img.shields.io/badge/OPSEC-first-critical">
@@ -18,7 +18,7 @@
 
 ---
 
-**Status:** Public release — **v0.3.1**
+**Status:** Public release — **v0.4.0**
 
 <p align="center">
   <img src="assets/dashboard.png" alt="DarkWatch dashboard — scan panel with security gate, targets, and live log" width="900">
@@ -276,7 +276,7 @@ DarkWatch stands on free-software shoulders. The list is intentionally explicit 
 
 #### Egress + isolation
 
-- **[Tor Project](https://www.torproject.org/)** — anonymous communication network and software. The `tor` sidecar we build on is the upstream Tor daemon from the Debian package, with a custom torrc generated at container start. Without Tor, none of this works.
+- **[Tor Project](https://www.torproject.org/)** — anonymous communication network and software. The `tor` sidecar we build on is the upstream Tor daemon from the Debian package, with a custom torrc generated at container start. NEWNYM circuit rotation between investigations and the dashboard's circuit check speak the Tor [control protocol](https://spec.torproject.org/control-spec/) directly (`darkwatch/dw_tor.py`); earlier versions used [stem](https://stem.torproject.org/) for this. Without Tor, none of this works.
 - **[WireGuard](https://www.wireguard.com/)** — modern, audited VPN protocol that makes two-tunnel egress isolation tractable to deploy. Container is built on [linuxserver/wireguard](https://hub.docker.com/r/linuxserver/wireguard). The two-tunnel design (separate Tor egress + separate Telegram egress) is the entire OPSEC backbone of this project.
 - **[serjs/go-socks5-proxy](https://github.com/serjs/go-socks5-server)** — the small SOCKS5 proxy we drop alongside the Telegram WG container so darkwatch can reach Telegram via that tunnel.
 
@@ -298,7 +298,6 @@ DarkWatch stands on free-software shoulders. The list is intentionally explicit 
 
 - **[SQLite](https://www.sqlite.org/)** — local-first persistence. Two local files (the darkwatch findings database and the Telegram session); no server to operate.
 - **[Docker Compose](https://docs.docker.com/compose/)** — service orchestration on a single VM.
-- **[stem](https://stem.torproject.org/)** — Tor controller library (used for NEWNYM circuit rotation between investigations).
 - **[Prometheus client](https://github.com/prometheus/client_python)** — `/metrics` endpoint for Prometheus scraping.
 
 ### Inspirations and influences

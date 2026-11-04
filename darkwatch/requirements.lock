@@ -808,9 +808,6 @@ soupsieve==2.10 \
     --hash=sha256:49e9380d7d2905463583bafe285e818c7366a9ed7b3aee221c1ac79c905d8bc0 \
     --hash=sha256:8596eb8967d744174820280fa62b4542a2e955bfaccca73ed8a13c6eb8e9b502
     # via beautifulsoup4
-stem==1.8.2 \
-    --hash=sha256:83fb19ffd4c9f82207c006051480389f80af221a7e4783000aedec4e384eb582
-    # via -r darkwatch/requirements.in
 telethon==1.45.0 \
     --hash=sha256:339e24c83aedc9f12cbe389264627edc49779e4289c535aa90aafc4ce62f7972 \
     --hash=sha256:4cb7ae269b8ab9dad9fc490b859f0bc2f885121e990f5b20407b1faa0db2a1d9

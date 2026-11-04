@@ -122,3 +122,23 @@ def test_validate_without_proxy_never_invents_one(fake_client):
     assert "Configure Tunnel 2 first" in err
     (client,) = fake_client.instances
     assert client.proxy is None
+
+
+def test_sync_wrapper_refuses_a_running_loop(monkeypatch):
+    """Inside an event loop the sync wrapper must not start a second one
+    (asyncio.run would fail there); it points at the async version."""
+    called = []
+
+    async def never(*_a, **_k):
+        called.append(1)
+        return True, ""
+
+    monkeypatch.setattr(tv, "_validate_async", never)
+
+    async def inside():
+        with pytest.raises(RuntimeError, match="validate_telegram_credentials_async"):
+            tv.validate_telegram_credentials("123456", "a" * 32)
+        return await tv.validate_telegram_credentials_async("123456", "a" * 32)
+
+    assert asyncio.run(inside()) == (True, "")
+    assert called == [1]

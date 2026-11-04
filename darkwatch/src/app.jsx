@@ -4928,11 +4928,14 @@ function App() {
     }, []);
 
     const fetchTgChannels = useCallback(async () => {
-        // Reuse /api/urls with the source filter on the server side.
-        const { ok, body } = await api("/api/urls?source=telegram&limit=500");
+        // Reuse /api/urls with the source filter on the server side. The
+        // limit is TG_CHANNEL_LIST_LIMIT in web.py.
+        const { ok, body } = await api("/api/urls?source=telegram&limit=1000");
         if (!ok) return;
         const list = Array.isArray(body) ? body
                    : Array.isArray(body?.urls) ? body.urls : [];
+        if (body?.has_more)
+            console.warn(`Telegram tab: showing ${list.length} of ${body.total} channels`);
         setTgChannels(list);
     }, []);
 

@@ -78,7 +78,7 @@ sudo docker compose restart darkwatch
 Don't edit `darkwatch/config.json` on the VM: it is tracked, so `deploy.sh` refuses the dirty checkout. Put the settings you change in `/var/lib/darkwebapp/config.d/config.local.json` instead. darkwatch merges it over `config.json` at start (mounted read-only at `/app/config.local.d`), key by key: a nested key the file doesn't name keeps its `config.json` value, and a list replaces the whole list. Like `config.json`, a value that is exactly `"${VAR}"` is read from `/var/lib/darkwebapp/env`, so secrets can stay in the env file.
 ```bash
 sudoedit /var/lib/darkwebapp/config.d/config.local.json
-#   {"crawler": {"max_threads": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
+#   {"crawler": {"max_depth": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
 sudo chown root:999 /var/lib/darkwebapp/config.d/config.local.json
 sudo chmod 0640 /var/lib/darkwebapp/config.d/config.local.json
 sudo docker compose restart darkwatch
@@ -94,7 +94,8 @@ sudo docker compose logs darkwatch | grep 'local overrides'   # "config: applied
 sudo ./ops/deploy.sh   # builds darkwatch, tor and setup (skip with --skip-build)
 ```
 To check the built images without touching the running stack (offline
-imports, an offline screenshot, `tor --version`; the same tests CI runs):
+imports, an offline screenshot, `tor --version` and the tor healthcheck and
+torrc; the same tests CI runs):
 ```bash
 sudo bash tests/images/smoke.sh
 ```
@@ -115,8 +116,10 @@ git add darkwatch/requirements.in darkwatch/requirements.lock
 ```
 CI fails while a lock is behind its `requirements.in` (`./ops/lock-deps.sh
 --check`); on a Dependabot pip PR, run `./ops/lock-deps.sh` on its branch
-and push the locks. The locks are resolved for CPython 3.11 on x86_64
-Linux, which the images use; arm64 hosts are untested.
+and push the locks. The locks are resolved for CPython 3.13 on x86_64
+Linux, which the images use (`python:3.13-slim-trixie`), and the script
+fails if aarch64 Linux resolves to a different lock; arm64 hosts are
+otherwise untested.
 
 ### Stop everything
 ```bash
@@ -193,6 +196,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 - Dashboard login: releases before v0.4.0 ignore `DARKWATCH_AUTH_TOKEN` and `ops/deploy.sh` there does not warn, so a dashboard bound to a non-loopback `DARKWATCH_BIND_IP` comes back with no login. Before rolling back past v0.4.0, set `DARKWATCH_BIND_IP=127.0.0.1` in `/var/lib/darkwebapp/env` (and use an SSH tunnel), or put a reverse proxy with its own auth in front.
 - Config: releases before v0.4.0 read `darkwatch/config.json` alone and ignore `/var/lib/darkwebapp/config.d/config.local.json`, so settings you moved there quietly fall back to the defaults in `config.json`. After the checkout, copy those keys back into `darkwatch/config.json` and commit the change (`git commit -m 'local config' darkwatch/config.json`), since the older `deploy.sh` refuses uncommitted changes. Before the next upgrade, drop that commit (`git checkout main` leaves it behind) and keep the keys in `config.local.json`.
 - The retention cron job (`/etc/cron.d/darkwatch-retention`) stays installed and keeps running the checked-out `ops/retention.sh` nightly. Before v0.4.0 that script only prunes `loot/` files, so it is harmless; remove the file if you don't want it.
+- Tor data volume: v0.4.0 builds the tor image on Debian trixie, and its `deploy.sh` re-owns the `tor-data` volume to that image's `debian-tor` uid. Older releases build tor on bookworm and don't re-own it, so if the uid differs, tor exits with an error that `/var/lib/tor` is not owned by it (`docker compose logs tor`). After the rollback deploy, re-own the volume with the old image and start tor again: `docker compose stop tor`, `docker run --rm --network none --user 0:0 --entrypoint chown -v darkwatch_tor-data:/var/lib/tor darkwatch-tor:local -R debian-tor:debian-tor /var/lib/tor`, `docker compose --profile tor up -d tor`.
 - Telegram login: v0.3.1 and earlier (Telethon 1.36) can't open a `telegram.session` that Telethon 1.45 (the release after v0.3.1) has opened; every Telegram call fails with `too many values to unpack (expected 5)`. Before `./ops/deploy.sh --skip-pull`, with darkwatch stopped (`docker compose stop darkwatch`), copy the pre-upgrade file back: `cp -p /root/telegram.session.pre-upgrade /var/lib/darkwebapp/darkwatch/data/telegram.session`. Otherwise take it from the full backup made before that upgrade, or log in to Telegram again with the QR code after the rollback.
 
 ---

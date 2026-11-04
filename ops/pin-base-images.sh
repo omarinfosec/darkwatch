@@ -82,7 +82,7 @@ for df in "${DOCKERFILES[@]}"; do
                 continue
             fi
             # digest looks like: python@sha256:...
-            # We want: python:3.11-slim-bookworm@sha256:...  (keep the human-readable tag)
+            # We want: python:3.13-slim-trixie@sha256:...  (keep the human-readable tag)
             # If $ref has a tag, append @sha256 to it. If not, replace.
             sha_only=$(printf '%s' "$digest" | sed 's|^[^@]*||')   # @sha256:...
             new_ref="${ref}${sha_only}"

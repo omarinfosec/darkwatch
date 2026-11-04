@@ -12,27 +12,23 @@ permissions:
 
 jobs:
   python-tests:
-    # The 3.11 legs keep their old check names ("Tests (darkwatch)"), so
-    # branch protection that requires them still matches.
-    name: Tests (${{ matrix.suite }}${{ matrix.python != '3.11' && format(', Python {0}', matrix.python) || '' }})
+    # One leg per image, on the images' interpreter (python:3.13-slim-trixie;
+    # tests/workflows/check.py keeps the versions in step). The locks are
+    # resolved for that version only, so an older interpreter is not tested.
+    # The check names stay "Tests (darkwatch)" and "Tests (setup)".
+    name: Tests (${{ matrix.suite }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         suite: [darkwatch, setup]
-        python: ["3.11"]   # matches the Docker images
-        include:
-          # A newer interpreter, so moving the images off 3.11 holds no
-          # surprises.
-          - { suite: darkwatch, python: "3.13" }
-          - { suite: setup, python: "3.13" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"   # matches the Docker images
           cache: pip
           cache-dependency-path: |
             ${{ matrix.suite }}/requirements.lock
@@ -62,7 +58,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.11"
+          python-version: "3.13"   # pyflakes parses with the images' Python
       - name: Install shellcheck (pinned)
         run: pip install shellcheck-py==0.11.0.1 && shellcheck --version
       - name: requirements.lock files cover requirements.in
@@ -71,6 +67,11 @@ jobs:
         run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
       - name: shellcheck (warnings and errors)
         run: shellcheck -S warning ops/*.sh ops/lib/*.sh tor/*.sh tunnels/killswitch/*.sh tests/*/*.sh darkwatch/scan.sh
+      # Unused imports and variables, f-strings without placeholders,
+      # undefined names. */*.py is the application code; the tests are
+      # left out.
+      - name: pyflakes (pinned)
+        run: pip install pyflakes==4.1.0 && python -m pyflakes */*.py
       - name: WireGuard kill switch (network namespace test)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null

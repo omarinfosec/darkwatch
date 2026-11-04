@@ -38,6 +38,9 @@ case "$1" in
     compose) [[ -n "${STUB_SETUP_UP_FAILS:-}" && "$*" == *"up -d --no-deps setup"* ]] && exit 1 ;;
     # The direct-egress probe: blocked (curl's timeout) unless STUB_DW_EGRESS.
     exec)    [[ -n "${STUB_DW_EGRESS:-}" ]] || exit 28 ;;
+    # The tor-data volume exists when STUB_TOR_OWNER ("volume-owner image-owner") is set.
+    volume)  [[ -n "${STUB_TOR_OWNER:-}" ]] || exit 1 ;;
+    run)     [[ "$*" != *"stat -c"* ]] || echo "$STUB_TOR_OWNER" ;;
 esac
 exit 0
 EOF
@@ -69,7 +72,7 @@ new_tree() {
     D="$T/data"
     : > "$DOCKER_LOG"
     unset STUB_SETUP_STATE STUB_HAVE_SUBNET STUB_SETUP_UP_FAILS STUB_NET_LABEL \
-          STUB_DW_EGRESS STUB_HOST_OFFLINE STUB_NO_FORWARD_JUMP DARKWATCH_EGRESS_LOCKDOWN DARKWATCH_DNS
+          STUB_DW_EGRESS STUB_HOST_OFFLINE STUB_NO_FORWARD_JUMP STUB_TOR_OWNER DARKWATCH_EGRESS_LOCKDOWN DARKWATCH_DNS
 }
 real_lockdown() { cp -a "$repo/ops/egress-lockdown.sh" "$T/repo/ops/"; }   # iptables stays stubbed
 case_n=0
@@ -319,6 +322,28 @@ grep -q "could not refresh the Setup UI" "$work/out" || die "a failed Setup UI r
 grep -q '^exec darkwatch curl' "$DOCKER_LOG" || die "a failed Setup UI refresh must not skip the egress probe"
 ok "a failed Setup UI refresh only warns; lockdown and probe still run"
 
+# ─── tor-data volume owner (debian-tor uid can change with the base image) ──
+deploy
+expect_ok "no tor-data volume"
+grep -q '^run ' "$DOCKER_LOG" && die "no tor-data volume: nothing to re-own, no container may run"
+STUB_TOR_OWNER="100:101 100:101" deploy
+expect_ok "tor-data owner matches"
+grep -q '^run .*darkwatch_tor-data:/var/lib/tor darkwatch-tor:local .*stat -c' "$DOCKER_LOG" \
+    || die "tor-data owner not checked with the tor image"
+grep -q '^run .*--entrypoint chown\|^stop tor' "$DOCKER_LOG" && die "tor-data re-owned although the owner matches"
+STUB_TOR_OWNER="100:101 999:996" deploy
+expect_ok "tor-data owner differs"
+grep -qF "tor-data is owned by 100:101, the tor image's debian-tor is 999:996" "$work/out" \
+    || die "no log line for re-owning tor-data"
+chown_at="$(line_of '^run .*--entrypoint chown -v darkwatch_tor-data:/var/lib/tor darkwatch-tor:local -R debian-tor:debian-tor /var/lib/tor')"
+stop_at="$(line_of '^stop tor')"
+up_at="$(line_of 'up -d --remove-orphans')"
+[[ -n "$chown_at" && -n "$stop_at" && "$stop_at" -lt "$chown_at" && "$chown_at" -lt "$up_at" ]] \
+    || die "tor-data must be re-owned after stopping the old tor and before compose up"
+grep -q '^run ' "$DOCKER_LOG" && ! grep '^run ' "$DOCKER_LOG" | grep -vq -- '--pull never --network none --user 0:0' \
+    || die "the re-own containers must run offline, as root, without pulling"
+ok "deploy re-owns tor-data to the tor image's debian-tor before up, only when the owner differs"
+
 # ─── egress lockdown flag and the direct-egress probe ───────────────────────
 # The real egress-lockdown.sh (iptables stubbed), so its iptables calls show.
 # No tunnels are configured here: the probe must run anyway.
@@ -506,7 +531,7 @@ mkdir -p "$T/repo/darkwatch"
 cp -a "$repo/darkwatch/config.json" "$T/repo/darkwatch/"
 git -C "$T/repo" init -q && git -C "$T/repo" add -A && git -C "$T/repo" commit -qm v1
 seed
-sed -i 's/"max_threads": [0-9]*/"max_threads": 1/' "$T/repo/darkwatch/config.json"
+sed -i 's/"max_depth": [0-9]*/"max_depth": 1/' "$T/repo/darkwatch/config.json"
 git -C "$T/repo" diff --quiet && die "fixture: config.json not modified"
 deploy
 expect_fail "dirty config.json" "darkwatch/config.json has local edits"; no_compose "dirty config.json"

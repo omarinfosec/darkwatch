@@ -1,5 +1,5 @@
 # ─── Build stage: produce static/ artifacts ───────────────────────────────
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS bundle
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS bundle
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -59,11 +59,10 @@ RUN mkdir -p static && \
 
 
 # ─── Runtime stage: Python + crawler ──────────────────────────────────────
-# Pin to Bookworm explicitly. The plain `python:3.11-slim` tag now resolves
-# to Debian Trixie, where Playwright's --with-deps auto-installer fails on
-# packages it expects (libgdk-pixbuf2.0-0 was renamed, fonts-unifont
-# replaced ttf-unifont, etc). Bookworm is what Playwright targets.
-FROM python:3.11-slim-bookworm@sha256:f06d01d4ba3f8ad5af45a3ec87df19c1d317d8e8961edc0fabda61811af6f7cf
+# Debian trixie, like the bundle stage. The pinned Playwright has trixie
+# (debian13, x64 and arm64) in the package lists --with-deps installs from
+# below; a Playwright without them cannot install Firefox's libraries here.
+FROM python:3.13-slim-trixie@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -80,9 +79,10 @@ WORKDIR /app
 COPY requirements.lock .
 # Wheel policy: cryptg and yara-python must install from wheels. cryptg's
 # sdist needs a Rust toolchain this image does not have, and yara-python's
-# compiles the bundled libyara; a pin with no cp311 wheel for the build
+# compiles the bundled libyara; a pin with no cp313 wheel for the build
 # platform should fail here rather than fall back to an untested source
-# build. Not --only-binary=:all:, because stem ships only an sdist.
+# build. Not --only-binary=:all:, because pyaes (a Telethon dependency)
+# ships only an sdist.
 RUN pip install --no-cache-dir --require-hashes --only-binary=cryptg,yara-python \
         -r requirements.lock
 

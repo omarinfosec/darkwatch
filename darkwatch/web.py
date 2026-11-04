@@ -20,7 +20,6 @@ import os
 import queue
 import random
 import socket
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -32,8 +31,9 @@ from flask import Flask, abort, jsonify, redirect, request, send_file, Response
 
 from darkwatch import (DarkWebCrawler, TelegramScraper, TelegramLiveListener,
                         load_config, setup_logging, onion_url_error,
-                        utcnow, __version__, PLAYWRIGHT_AVAILABLE, TELETHON_AVAILABLE)
+                        utcnow, __version__, PLAYWRIGHT_AVAILABLE)
 from threat_intel import ThreatIntelFeed
+import dw_tor
 
 
 # ─── Boot ────────────────────────────────────────────────────────────────────
@@ -366,6 +366,10 @@ _monitor_stop = threading.Event()
 MONITOR_TICK = 30          # seconds between scheduler wake-ups
 MONITOR_JITTER = 0.25      # fraction (±25% of interval)
 TG_CATCHUP_BATCHES = 5     # max Telegram fetch batches per channel check
+# Most tracked Telegram channels one list holds: the live listener's filter,
+# "search all channels", smart discovery and the deep search. Past it the
+# least recently scanned channels are left out, with a warning.
+TG_CHANNEL_LIST_LIMIT = 1000
 
 # In-process counters for /metrics. Small enough to stay in memory; the
 # DB already records scan_log rows so we don't need to persist these.
@@ -548,40 +552,17 @@ _tor_circuit_lock = threading.Lock()
 
 
 def _tor_circuit_established():
-    """Ask Tor's ControlPort for `status/circuit-established`, the same
-    question as the tor container's healthcheck.
+    """Ask Tor's ControlPort for `status/circuit-established`
+    (dw_tor.circuit_established) with the crawler's control settings.
 
     Returns True for "1" and False for "0". Raises OSError when the
     ControlPort can't be reached or doesn't answer within
-    TOR_CONTROL_TIMEOUT, ValueError on any other answer (a wrong password).
-    A plain socket rather than stem: stem's Controller has no connect or
-    read timeout, and this runs on every quick health poll."""
+    TOR_CONTROL_TIMEOUT, ValueError (dw_tor.ControlPortError) on any other
+    answer (a wrong password)."""
     c = _crawler
-    pw = (c.tor_control_password or "").replace("\\", "\\\\").replace('"', '\\"')
-    deadline = time.monotonic() + TOR_CONTROL_TIMEOUT
-    buf = b""
-    with socket.create_connection((c.tor_control_host, int(c.tor_control_port)),
-                                  timeout=TOR_CONTROL_TIMEOUT) as sock:
-        sock.sendall(f'AUTHENTICATE "{pw}"\r\n'
-                     'GETINFO status/circuit-established\r\nQUIT\r\n'.encode())
-        # Tor closes the connection after QUIT (or a failed AUTHENTICATE).
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise socket.timeout("ControlPort answer timed out")
-            sock.settimeout(left)
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-    lines = buf.decode("utf-8", "replace").splitlines()
-    if not lines or not lines[0].startswith("250"):
-        raise ValueError("ControlPort refused: "
-                         + (lines[0] if lines else "no answer"))
-    for line in lines[1:]:
-        if line.startswith("250-status/circuit-established="):
-            return line.split("=", 1)[1].strip() == "1"
-    raise ValueError("ControlPort answer has no circuit-established")
+    return dw_tor.circuit_established(
+        c.tor_control_host, c.tor_control_port, c.tor_control_password,
+        timeout=TOR_CONTROL_TIMEOUT)
 
 
 def _tor_circuit_state(max_age=None):
@@ -872,14 +853,11 @@ def _run_scan(urls, depth):
                 url = f"http://{url}"
             try:
                 _crawler.db.add_url(url, source="web-ui")
-                row = _crawler.db.conn.execute(
-                    "SELECT id FROM urls WHERE url = ?", (url,)
-                ).fetchone()
-                if not row:
+                url_id = _crawler.db.get_url_id(url)
+                if url_id is None:
                     log.error(f"Could not add {url} to DB")
                     total_errors += 1
                     continue
-                url_id = row[0]
                 # NEWNYM between targets (best-effort)
                 if i > 0:
                     _crawler.rotate_tor_circuit()
@@ -1032,10 +1010,7 @@ def _monitor_one(url_id, url):
     crawl for .onion rows, Telegram fetch for tg:// rows."""
     try:
         # Look up the source once so the monitor loop doesn't have to.
-        row = _crawler.db.conn.execute(
-            "SELECT source FROM urls WHERE id = ?", (url_id,)
-        ).fetchone()
-        source = row[0] if row else None
+        source = _crawler.db.get_url_source(url_id)
 
         if source == "telegram":
             # Separate path — scraper uses its own SOCKS tunnel; crawl_site
@@ -1054,11 +1029,7 @@ def _monitor_one(url_id, url):
                 ev_status, note = 200, None
             else:
                 ev_status, note = 204, "no new messages"
-            row = _crawler.db.conn.execute(
-                "SELECT id FROM pages WHERE url_id = ? "
-                "ORDER BY scanned_at DESC LIMIT 1", (url_id,)
-            ).fetchone()
-            page_id = row[0] if row else None
+            page_id = _crawler.db.latest_page_id(url_id)
             _crawler.db.add_monitor_event(
                 url_id, status=ev_status, pages=pages,
                 findings=findings, page_id=page_id, note=note)
@@ -1075,11 +1046,7 @@ def _monitor_one(url_id, url):
         _crawler.db.update_scan(url_id, status)
         # Pick the most recent page row for THIS url_id — that's what the
         # screenshot belongs to.
-        row = _crawler.db.conn.execute(
-            "SELECT id FROM pages WHERE url_id = ? "
-            "ORDER BY scanned_at DESC LIMIT 1", (url_id,)
-        ).fetchone()
-        page_id = row[0] if row else None
+        page_id = _crawler.db.latest_page_id(url_id)
         _crawler.db.add_monitor_event(
             url_id, status=status, pages=pages,
             findings=findings, page_id=page_id)
@@ -1262,18 +1229,31 @@ def _tg_live_consumer():
             continue
         try:
             # Map channel_id → url_id via the DB.
-            row = _crawler.db.conn.execute(
-                "SELECT id, tg_username FROM urls "
-                "WHERE tg_channel_id = ? LIMIT 1",
-                (ev["channel_id"],)).fetchone()
+            row = _crawler.db.get_url_by_tg_channel_id(ev["channel_id"])
             if not row:
                 continue
-            url_id, uname = row[0], row[1]
+            url_id, uname = row
             with _tg_lock:
                 _crawler.scan_tg_message(url_id, uname, ev["msg"])
             log.info(f"[tg-live] scanned @{uname} #{ev['msg']['msg_id']}")
         except Exception as e:
             log.error(f"[tg-live] consumer error: {e}")
+
+
+def _tracked_tg_channels(purpose):
+    """The tracked Telegram channel rows, at most TG_CHANNEL_LIST_LIMIT,
+    most recently scanned first. Logs a warning naming `purpose` when the
+    limit leaves channels out."""
+    channels = _crawler.db.get_url_rows(
+        limit=TG_CHANNEL_LIST_LIMIT, source="telegram") or []
+    if len(channels) >= TG_CHANNEL_LIST_LIMIT:
+        total = _crawler.db.count_url_rows(source="telegram")
+        if total > len(channels):
+            log.warning(f"{purpose}: using {len(channels)} of {total} "
+                        f"tracked Telegram channels (TG_CHANNEL_LIST_LIMIT); "
+                        f"the {total - len(channels)} least recently scanned "
+                        f"are skipped")
+    return channels
 
 
 def _start_tg_live():
@@ -1287,7 +1267,7 @@ def _start_tg_live():
         return
     if _tg_live:
         return
-    channels = _crawler.db.get_url_rows(limit=1000, source="telegram") or []
+    channels = _tracked_tg_channels("live listener")
     ids = [c["tg_channel_id"] for c in channels if c.get("tg_channel_id")]
     _tg_live_stop.clear()
     _tg_live_consumer_thread = threading.Thread(
@@ -1303,7 +1283,7 @@ def _refresh_tg_live_channels():
     """Call after add/delete of a TG channel so the live listener's
     filter set stays in sync with the DB."""
     if _tg_live is None: return
-    channels = _crawler.db.get_url_rows(limit=1000, source="telegram") or []
+    channels = _tracked_tg_channels("live listener")
     ids = [c["tg_channel_id"] for c in channels if c.get("tg_channel_id")]
     _tg_live.set_channels(ids)
 
@@ -1324,7 +1304,7 @@ def route_metrics():
     misconfigured scraper sees a helpful body instead of a 500."""
     try:
         from prometheus_client import (
-            Gauge, Counter, CollectorRegistry, generate_latest,
+            Gauge, CollectorRegistry, generate_latest,
             CONTENT_TYPE_LATEST)
     except ImportError:
         return Response("prometheus_client not installed\n",
@@ -2306,7 +2286,7 @@ def route_tg_discover_smart():
     mode = (request.args.get("mode") or "safe").lower()
     mode = "thorough" if mode == "thorough" else "safe"
 
-    tracked = _crawler.db.get_url_rows(limit=500, source="telegram") or []
+    tracked = _tracked_tg_channels("smart discovery")
     tracked_slim = [{"channel_id": t.get("tg_channel_id"),
                      "username":   t.get("tg_username")}
                     for t in tracked if t.get("tg_channel_id")]
@@ -2421,7 +2401,7 @@ def route_tg_search():
         return jsonify(out)
 
     if scope == "all":
-        channels = _crawler.db.get_url_rows(limit=500, source="telegram")
+        channels = _tracked_tg_channels("search all channels")
         out = []
         errors = []
         with _tg_lock:
@@ -2572,7 +2552,7 @@ def route_tg_search_deep():
         # Stage 2: known channels via Telethon
         yield emit("stage", {"n": 2, "name": "Known channels (live)",
                              "message": "Live-searching every tracked TG channel…"})
-        channels = db.get_url_rows(limit=500, source="telegram")
+        channels = _tracked_tg_channels("deep search")
         s2_hits = 0
         for ch in channels:
             if _tg.budget_remaining() <= 0:
@@ -3123,18 +3103,27 @@ def route_thumbnail(page_id):
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
-# Stagger already-due monitored URLs on boot so the first scheduler tick
-# doesn't fire N scans back-to-back after a container restart.
-_staggered = _crawler.db.stagger_due_monitors(utcnow())
-if _staggered:
-    log.info(f"Staggering {_staggered} due monitors on boot")
-
-_start_health_refresh_thread()
-_start_monitor_thread()
-_start_tg_live()
+def start_background_services():
+    """Start the health-refresh thread, both monitor schedulers and (when
+    enabled) the live Telegram listener. Importing this module starts
+    none of them, so tests and tools can import it without a scheduler
+    crawling or polling Telegram in the background; `python web.py` (the
+    image's CMD) calls this before serving. A WSGI server that imports
+    `web:app` instead must call web.start_background_services() once, in
+    a single process: every worker that calls it runs its own
+    schedulers."""
+    # Stagger already-due monitored URLs on boot so the first scheduler
+    # tick doesn't fire N scans back-to-back after a container restart.
+    staggered = _crawler.db.stagger_due_monitors(utcnow())
+    if staggered:
+        log.info(f"Staggering {staggered} due monitors on boot")
+    _start_health_refresh_thread()
+    _start_monitor_thread()
+    _start_tg_live()
 
 
 if __name__ == "__main__":
+    start_background_services()
     # Threaded Flask so health checks and status polls don't block each other
     # while a scan thread is running.
     app.run(host="0.0.0.0", port=8080, threaded=True, debug=False)
