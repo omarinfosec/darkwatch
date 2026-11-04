@@ -187,6 +187,18 @@ services:
     environment:
       - DARKWATCH_CONFIG=/app/config.json
     pids_limit: 1024
+    # DNS isolation. darkwatch only needs Docker's embedded DNS for service
+    # names (tunnel1, tunnel2), which still resolve. Without an explicit
+    # `dns:`, Docker forwards other names to the host's resolvers, and a
+    # loopback one (dnsmasq, unbound, bind on 127.0.0.1) is queried from the
+    # HOST namespace, past the egress lockdown. An explicit entry is dialled
+    # from darkwatch's own namespace, where nothing listens on 127.0.0.1:53,
+    # so clearnet lookups fail in milliseconds. Leave DARKWATCH_DNS unset
+    # unless DARKWATCH_EGRESS_LOCKDOWN=0 or alerts.allow_direct needs a real
+    # resolver. Not set on the tunnels: they need the host's DNS to resolve
+    # hostname Endpoints. ops/verify-egress.sh checks this (check 6).
+    dns:
+      - ${DARKWATCH_DNS:-127.0.0.1}
     networks:
       darknet:
         # Fixed address so ops/egress-lockdown.sh can block this container's

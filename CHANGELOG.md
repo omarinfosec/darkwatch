@@ -39,6 +39,19 @@
   has restarted the containers, so it cannot show the order.
 - The tunnel healthchecks changed, so the first deploy recreates tunnel1 and
   tunnel2, which restarts tor and tg-socks once.
+- darkwatch now runs with `dns: 127.0.0.1`, so the first deploy recreates it.
+  Afterwards, on Docker 26 or later, `sudo docker exec darkwatch cat
+  /etc/resolv.conf` contains the line `# ExtServers: [127.0.0.1]` and no
+  `host(`. Leave the new `DARKWATCH_DNS` unset. darkwatch can no longer
+  resolve clearnet names itself, so if you run with
+  `DARKWATCH_EGRESS_LOCKDOWN=0` (which `alerts.allow_direct` also needs to
+  send directly), set `DARKWATCH_DNS` to a real resolver in the env file, or
+  direct alerts and the in-app IP-leak check fail. Set a real resolver only
+  with the lockdown off: while it is on, `verify-egress.sh` and `deploy.sh`
+  fail on any other `DARKWATCH_DNS`.
+- The Setup UI rejects a WireGuard config without a `DNS =` line. Check that
+  a hand-placed tunnel2 `wg0.conf` has one; `verify-egress.sh` warns when
+  tunnel2 still resolves through Docker's embedded DNS.
 
 ### Security
 - The tunnel kill switch also drops new connections that arrive through
@@ -46,8 +59,38 @@
   longer reach Tor's SOCKS and control ports. Replies to the tunnel's own
   connections still get in. The tunnel healthchecks and `verify-egress.sh`
   require it.
+- darkwatch's DNS lookups can no longer be answered by the host. Without a
+  `dns:` setting, Docker sent darkwatch's non-service lookups to the host's
+  resolvers, and a loopback one (dnsmasq, unbound, bind on 127.0.0.1) was
+  queried from the host's namespace, past the egress lockdown. darkwatch now
+  has `dns: ["${DARKWATCH_DNS:-127.0.0.1}"]`: Docker dials that from
+  darkwatch's own namespace, where nothing answers, so clearnet lookups fail
+  in milliseconds while `tunnel1` and `tunnel2` still resolve. The tunnels
+  keep the host's DNS, which hostname Endpoints need.
+- The Setup UI requires a `DNS =` line in WireGuard configs, so tg-socks
+  resolves Telegram's names through the VPN instead of Docker's embedded DNS.
 
 ### Fixed
+- `verify-egress.sh` checks that are real:
+  - The direct-egress check (5b) requires the lockdown rule for the address
+    darkwatch actually has (from `docker inspect`) and probes the IP literal
+    `http://1.1.1.1`, with the host as positive control ("inconclusive" when
+    the host can't connect either). It used to probe `https://api.ipify.org`
+    only; with darkwatch's DNS isolated that name never resolves, so the
+    probe would pass with no lockdown at all. It is skipped when
+    `DARKWATCH_EGRESS_LOCKDOWN=0` (env file or environment), which it read
+    from the env file only.
+  - The DNS check (6) passed on any resolv.conf with `127.0.0.11`, including
+    a leaking one. It now fails, unless `DARKWATCH_EGRESS_LOCKDOWN=0`, when
+    darkwatch's resolv.conf shows a `host(` upstream or an `ExtServers` other
+    than `[127.0.0.1]`, or when `example.com` resolves inside darkwatch. It
+    also fails when `tunnel1` / `tunnel2` don't resolve there, and warns when
+    tunnel2 resolves through Docker's embedded DNS while Telegram is checked.
+    With `DARKWATCH_EGRESS_LOCKDOWN=0` it (and `deploy.sh`) warns when
+    `DARKWATCH_DNS` is unset, since darkwatch then can't resolve clearnet
+    names.
+  - The Telegram exit IP is compared with the host's own IP, only when both
+    answers are IPv4 addresses (an error page only warns).
 - Tunnels with a hostname `Endpoint` (as the Setup UI's example shows) never
   completed a handshake since v0.3.0: once the kill switch was on, the name
   could not be resolved. The kill switch now resolves hostname Endpoints
@@ -116,6 +159,9 @@
   remote, the lockdown order and the direct-egress probe.
 - New `tests/egress-lockdown/check.sh` runs `egress-lockdown.sh` against real
   iptables in a network namespace in CI.
+- New `tests/verify-egress/check.sh` runs `verify-egress.sh` against stubbed
+  docker, iptables and curl in CI; new `tests/compose/check.sh` asserts in CI
+  that darkwatch's `dns` is `127.0.0.1` and that no other service sets one.
 
 ## v0.3.0 — 2026-10-25
 

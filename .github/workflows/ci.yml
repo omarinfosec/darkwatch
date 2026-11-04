@@ -49,8 +49,12 @@ jobs:
         run: UNSHARE="sudo unshare -n" bash tests/egress-lockdown/check.sh
       - name: deploy.sh / bootstrap.sh (stubbed docker)
         run: sudo bash tests/ops/check.sh
+      - name: verify-egress.sh (stubbed docker)
+        run: sudo bash tests/verify-egress/check.sh
       - name: docker compose config
         run: |
           data="$(mktemp -d)" && touch "$data/env"
           DARKWEBAPP_DATA_ROOT="$data" docker compose \
             --profile tor --profile tg --profile setup config -q
+      - name: compose DNS isolation (darkwatch dns 127.0.0.1, no other service)
+        run: bash tests/compose/check.sh

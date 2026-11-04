@@ -19,6 +19,7 @@ TOKEN = main._expected_token()
 VALID_WG = """[Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address    = 10.2.0.2/32
+DNS        = 10.2.0.1
 
 [Peer]
 PublicKey  = WGPubKeyExample0000000000000000000000000000=

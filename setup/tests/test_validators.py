@@ -63,6 +63,26 @@ PersistentKeepalive = 25
     assert main._validate_wg_config(valid) == []
 
 
+@pytest.mark.parametrize("dns_line", [None, "DNS        =", "# DNS = 10.2.0.1"])
+def test_wg_config_validator_requires_dns(dns_line):
+    # Without a DNS line the tunnel keeps Docker's embedded resolver, which
+    # can hand names to the host's own (loopback) resolver.
+    main = _import_main()
+    conf = """[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address    = 10.2.0.2/32
+DNSLINE
+[Peer]
+PublicKey  = WGPubKeyExample0000000000000000000000000000=
+AllowedIPs = 0.0.0.0/0
+Endpoint   = vpn.example.com:51820
+"""
+    errors = main._validate_wg_config(conf.replace("DNSLINE\n", f"{dns_line}\n" if dns_line else ""))
+    assert any("missing DNS" in e for e in errors)
+    # The same config with a DNS line passes.
+    assert main._validate_wg_config(conf.replace("DNSLINE", "dns = 10.2.0.1, 10.2.0.2")) == []
+
+
 def test_wg_config_validator_rejects_missing_sections():
     main = _import_main()
     no_interface = "PrivateKey = AAAA\n[Peer]\nPublicKey = BBBB\nEndpoint = h:1\n"

@@ -2,9 +2,13 @@
 # DarkWatch — egress leak / isolation verifier
 # Confirms that:
 #   1. Tor egress works and is identified as Tor by check.torproject.org.
-#   2. The Tor exit IP and the Telegram-path exit IP are different.
-#   3. darkwatch container has no host network access (its default route
-#      goes via the tunnel1 netns, not the host).
+#   2. The Tor exit IP and the Telegram-path exit IP differ, and the
+#      Telegram-path exit IP is not the host's own IP.
+#   3. darkwatch has no direct internet access: it is on the darknet bridge,
+#      the egress-lockdown rule covers its actual address, and it can't reach
+#      an IP literal that the host can.
+#   4. darkwatch can't resolve clearnet names (its DNS never goes through the
+#      host's resolver) but still resolves the tunnel service names.
 #
 # Run anytime:
 #   sudo ./ops/verify-egress.sh            # auto-detect configured tunnels
@@ -23,6 +27,7 @@ set -euo pipefail
 log()  { printf '\033[1;36m[verify]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 bad()  { printf '\033[1;31m  ✗\033[0m %s\n' "$*"; FAILED=1; }
+warn() { printf '\033[1;33m  !\033[0m %s\n' "$*"; }
 FAILED=0
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (uses docker)" >&2; exit 1; }
@@ -30,6 +35,8 @@ FAILED=0
 DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
 # shellcheck source-path=SCRIPTDIR source=lib/common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+# Same lookup as egress-lockdown.sh and deploy.sh (env file, else environment).
+LOCKDOWN="$(env_val DARKWATCH_EGRESS_LOCKDOWN 1)"
 
 CHECK_TOR=0
 CHECK_TG=0
@@ -37,7 +44,7 @@ for arg in "$@"; do
     case "$arg" in
         --tor) CHECK_TOR=1 ;;
         --tg)  CHECK_TG=1 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
         *) echo "unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
@@ -101,6 +108,21 @@ if (( CHECK_TG )); then
                https://api.ipify.org 2>/dev/null || echo "")"
     if [[ -n "$TG_EXIT" ]]; then
         ok "tg-socks exit IP: $TG_EXIT"
+        # The host's own IP, fetched from the host. Best effort: a host that
+        # can't reach the echo service only skips this comparison.
+        # Both sides must be bare IPv4 addresses: an error or proxy page would
+        # otherwise "differ" without anything being compared.
+        HOST_IP="$(curl -fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
+        ipv4='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+        if [[ ! "$HOST_IP" =~ $ipv4 ]]; then
+            warn "could not fetch the host's own IP; tg-socks exit not compared with it"
+        elif [[ ! "$TG_EXIT" =~ $ipv4 ]]; then
+            warn "could not fetch tg-socks' exit IP as an address (got: ${TG_EXIT:0:80}); not compared with the host's IP"
+        elif [[ "$TG_EXIT" == "$HOST_IP" ]]; then
+            bad "tg-socks exit IP == the host's IP ($HOST_IP): Telegram traffic is NOT leaving through tunnel2"
+        else
+            ok "tg-socks exit IP differs from the host's IP"
+        fi
     else
         bad "tg-socks egress not reachable"
     fi
@@ -135,15 +157,30 @@ else
 fi
 
 # ─── 5b. darkwatch can't reach the internet except via the tunnels ──────────
+# The probe is an IP literal: darkwatch can't resolve clearnet names (check 6),
+# so a hostname would "fail" even with no lockdown at all.
 log "checking darkwatch has no direct internet route (egress lockdown)"
-if docker exec darkwatch curl -s --max-time 8 -o /dev/null https://api.ipify.org 2>/dev/null; then
-    if [[ "$(grep -E '^DARKWATCH_EGRESS_LOCKDOWN=' "${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env" 2>/dev/null | tail -1 | cut -d= -f2-)" == "0" ]]; then
-        log "  direct egress works (lockdown disabled by DARKWATCH_EGRESS_LOCKDOWN=0)"
-    else
-        bad "darkwatch reached the internet DIRECTLY — run: sudo ./ops/egress-lockdown.sh"
-    fi
+if [[ "$LOCKDOWN" == "0" ]]; then
+    warn "skipped: egress lockdown disabled by DARKWATCH_EGRESS_LOCKDOWN=0 (darkwatch can reach the internet directly)"
 else
-    ok "darkwatch has no direct internet route"
+    # The rule must match the address darkwatch actually runs on, not just
+    # DARKWATCH_IP in the env file.
+    DW_IP="$(docker inspect darkwatch -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || true)"
+    LOCKDOWN_RULES="$(iptables -S DOCKER-USER 2>/dev/null | grep -F -- "--comment darkwatch-egress-lockdown" || true)"
+    if [[ -z "$DW_IP" ]]; then
+        bad "could not read darkwatch's IP address from docker inspect"
+    elif [[ "$LOCKDOWN_RULES" == *"-s $DW_IP/32 "* ]]; then
+        ok "DOCKER-USER has the egress-lockdown rule for darkwatch ($DW_IP)"
+    else
+        bad "no egress-lockdown rule in DOCKER-USER for darkwatch's address $DW_IP — run: sudo ./ops/egress-lockdown.sh (and check DARKWATCH_IP in the env file)"
+    fi
+    if docker exec darkwatch curl -s --max-time 5 -o /dev/null http://1.1.1.1 2>/dev/null; then
+        bad "darkwatch reached http://1.1.1.1 DIRECTLY — run: sudo ./ops/egress-lockdown.sh; check: sudo iptables -S FORWARD | grep DOCKER-USER"
+    elif curl -s --max-time 5 -o /dev/null http://1.1.1.1 2>/dev/null; then
+        ok "darkwatch has no direct internet route (the host does)"
+    else
+        warn "direct-egress probe inconclusive: the host can't reach http://1.1.1.1 either"
+    fi
 fi
 
 # ─── 5c. tunnel kill switches in place ──────────────────────────────────────
@@ -160,15 +197,68 @@ for t in $( (( CHECK_TOR )) && echo tunnel1; (( CHECK_TG )) && echo tunnel2 ); d
     fi
 done
 
-# ─── 6. DNS leak: darkwatch resolver should NOT be the host's resolver ──────
+# ─── 6. DNS: darkwatch's lookups must never be resolved by the host ─────────
+# docker-compose.yml gives darkwatch `dns: 127.0.0.1`, so Docker's embedded
+# DNS (127.0.0.11) forwards non-service names to 127.0.0.1 inside darkwatch's
+# own namespace, where nothing answers. Without it, Docker forwards to the
+# host's resolvers, and a loopback one (dnsmasq, unbound, bind) is queried
+# from the HOST namespace, past the lockdown: resolv.conf then shows
+# "ExtServers: [host(...)]". Docker 24/25 write no ExtServers footer; there
+# only the lookup test below applies.
 log "checking DNS resolution path"
-DW_DNS="$(docker exec darkwatch sh -c 'cat /etc/resolv.conf 2>/dev/null | grep nameserver | head -1' || echo "")"
-log "  darkwatch /etc/resolv.conf: $DW_DNS"
-# We expect Docker's embedded DNS (127.0.0.11), not host or public DNS.
-if echo "$DW_DNS" | grep -q "127.0.0.11"; then
-    ok "darkwatch uses docker embedded DNS (no leak path)"
+if [[ "$LOCKDOWN" == "0" ]]; then
+    warn "skipped clearnet DNS checks: DARKWATCH_EGRESS_LOCKDOWN=0 (a real DARKWATCH_DNS resolver is allowed)"
+    [[ "$(env_val DARKWATCH_DNS 127.0.0.1)" != 127.0.0.1 ]] \
+        || warn "DARKWATCH_EGRESS_LOCKDOWN=0 but DARKWATCH_DNS is unset: darkwatch can't resolve clearnet names, so the in-app IP-leak check fails and direct alerts don't send; set DARKWATCH_DNS to a resolver in the env file"
 else
-    bad "darkwatch DNS resolver may be unexpected — review"
+    DW_RESOLV="$(docker exec darkwatch cat /etc/resolv.conf 2>/dev/null || true)"
+    DW_EXT="$(printf '%s\n' "$DW_RESOLV" | sed -n 's/^# ExtServers: *//p' | head -1)"
+    log "  darkwatch resolv.conf ExtServers: ${DW_EXT:-(no footer)}"
+    if [[ -z "$DW_RESOLV" ]]; then
+        bad "could not read darkwatch's /etc/resolv.conf"
+    elif [[ "$DW_RESOLV" == *"host("* ]]; then
+        bad "darkwatch's DNS is resolved from the HOST namespace ($DW_EXT): lookups bypass the lockdown. Leave DARKWATCH_DNS unset and recreate darkwatch: sudo ./ops/deploy.sh"
+    elif [[ -n "$DW_EXT" && "$DW_EXT" != "[127.0.0.1]" ]]; then
+        bad "darkwatch's DNS upstream is $DW_EXT, expected [127.0.0.1]: leave DARKWATCH_DNS unset and recreate darkwatch"
+    elif [[ -n "$DW_EXT" ]]; then
+        ok "darkwatch's DNS upstream is 127.0.0.1 in its own namespace"
+    fi
+    # getent exits 2 for "not found"; anything else but a success means the
+    # test itself didn't run.
+    t0="$(date +%s%N)"
+    rc=0; docker exec darkwatch timeout 10 getent hosts example.com >/dev/null 2>&1 || rc=$?
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    case "$rc" in
+        0)   bad "darkwatch resolved example.com: clearnet lookups get answered (DNS leak)" ;;
+        2)   ok "darkwatch can't resolve clearnet names (example.com failed in ${ms} ms)"
+             # 127.0.0.1 is refused at once; a slow failure means lookups wait
+             # on an unreachable resolver, which stalls the workers.
+             (( ms < 3000 )) || warn "the failed lookup took ${ms} ms: check DARKWATCH_DNS is unset" ;;
+        124) warn "the example.com lookup in darkwatch timed out after 10 s (no leak, but lookups stall the workers): check DARKWATCH_DNS is unset" ;;
+        *)   bad "could not run the DNS lookup test in darkwatch (exit $rc)" ;;
+    esac
+fi
+# Service names come from Docker's embedded DNS and must keep working.
+for t in $( (( CHECK_TOR )) && echo tunnel1; (( CHECK_TG )) && echo tunnel2 ); do
+    if docker exec darkwatch timeout 10 getent hosts "$t" >/dev/null 2>&1; then
+        ok "darkwatch resolves $t"
+    else
+        bad "darkwatch can't resolve $t: the proxies are unreachable by name"
+    fi
+done
+# tg-socks resolves Telegram's names in tunnel2's namespace. wg-quick points
+# resolv.conf at the VPN's resolver only when wg0.conf has a DNS line; with
+# Docker's embedded DNS left in place, a loopback resolver on the host can
+# answer those lookups from the host.
+if (( CHECK_TG )); then
+    T2_RESOLV="$(docker exec tunnel2 cat /etc/resolv.conf 2>/dev/null || true)"
+    if [[ -z "$T2_RESOLV" ]]; then
+        warn "could not read tunnel2's /etc/resolv.conf"
+    elif grep -q '^nameserver 127\.0\.0\.11' <<<"$T2_RESOLV"; then
+        warn "tunnel2 resolves names through Docker's embedded DNS (127.0.0.11): add the VPN provider's DNS = line to tunnel2's wg0.conf, then recreate tunnel2 and tg-socks"
+    else
+        ok "tunnel2 resolves names through the VPN's resolver"
+    fi
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

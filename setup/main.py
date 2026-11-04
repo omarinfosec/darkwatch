@@ -220,6 +220,11 @@ _WG_PEER = re.compile(r"^\s*\[Peer\]\s*$", re.MULTILINE)
 _WG_PRIVKEY = re.compile(r"^\s*PrivateKey\s*=\s*[A-Za-z0-9+/]{43}=\s*$", re.MULTILINE)
 _WG_PUBKEY = re.compile(r"^\s*PublicKey\s*=\s*[A-Za-z0-9+/]{43}=\s*$", re.MULTILINE)
 _WG_ENDPOINT = re.compile(r"^\s*Endpoint\s*=\s*\S+:\d+\s*$", re.MULTILINE)
+# Required: with no DNS line the tunnel keeps Docker's embedded resolver, which
+# hands names to the host's resolvers; on a host with a loopback resolver
+# (dnsmasq, unbound, bind on 127.0.0.1) tg-socks lookups then leave from the
+# host instead of the VPN.
+_WG_DNS = re.compile(r"^[ \t]*DNS[ \t]*=[ \t]*\S", re.MULTILINE | re.IGNORECASE)
 # Plain client keys only. wg-quick runs PreUp/PostUp/PreDown/PostDown as root
 # inside the tunnel container (NET_ADMIN + SYS_MODULE), so a pasted config
 # must never be able to carry shell hooks. Table and FwMark are excluded too:
@@ -251,6 +256,9 @@ def _validate_wg_config(text: str) -> list[str]:
         errors.append("missing or malformed PublicKey (expected 44-char base64 in [Peer])")
     if not _WG_ENDPOINT.search(text):
         errors.append("missing Endpoint (expected host:port in [Peer])")
+    if not _WG_DNS.search(text):
+        errors.append("missing DNS (expected DNS = <the provider's resolver> in "
+                      "[Interface]; without it names are resolved by the host)")
     for line in text.splitlines():
         s = line.strip()
         if not s or s.startswith(("#", ";", "[")):

@@ -66,7 +66,7 @@ new_tree() {
     D="$T/data"
     : > "$DOCKER_LOG"
     unset STUB_SETUP_STATE STUB_HAVE_SUBNET STUB_SETUP_UP_FAILS STUB_NET_LABEL \
-          STUB_DW_EGRESS STUB_HOST_OFFLINE STUB_NO_FORWARD_JUMP DARKWATCH_EGRESS_LOCKDOWN
+          STUB_DW_EGRESS STUB_HOST_OFFLINE STUB_NO_FORWARD_JUMP DARKWATCH_EGRESS_LOCKDOWN DARKWATCH_DNS
 }
 real_lockdown() { cp -a "$repo/ops/egress-lockdown.sh" "$T/repo/ops/"; }   # iptables stays stubbed
 case_n=0
@@ -229,6 +229,16 @@ expect_ok "LOCKDOWN=0 in process env, darkwatch connects"
 grep -q 'iptables -I DOCKER-USER' "$DOCKER_LOG" && die "LOCKDOWN=0 (process env) must not insert the rule"
 grep -q "egress lockdown is DISABLED" "$work/out" || die "LOCKDOWN=0 (process env) must warn"
 ok "LOCKDOWN=0 in the process environment only: same"
+
+# With the lockdown off, darkwatch needs a real DARKWATCH_DNS to resolve
+# clearnet names (direct alerts, the in-app IP-leak check).
+grep -qF "DARKWATCH_DNS is unset" "$work/out" || die "LOCKDOWN=0 without DARKWATCH_DNS must warn"
+new_tree; seed; real_lockdown
+printf 'DARKWATCH_EGRESS_LOCKDOWN=0\nDARKWATCH_DNS=192.0.2.53\n' >> "$D/env"
+STUB_DW_EGRESS=1 deploy
+expect_ok "LOCKDOWN=0 with DARKWATCH_DNS"
+grep -qF "DARKWATCH_DNS is unset" "$work/out" && die "LOCKDOWN=0 with DARKWATCH_DNS set must not warn about it"
+ok "LOCKDOWN=0 warns about an unset DARKWATCH_DNS, and only then"
 
 new_tree; seed; real_lockdown
 STUB_DW_EGRESS=1 deploy

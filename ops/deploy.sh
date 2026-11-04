@@ -320,6 +320,8 @@ done
 lockdown="$(env_val DARKWATCH_EGRESS_LOCKDOWN 1)"
 if [[ "$lockdown" == "0" ]]; then
     warn "egress lockdown is DISABLED (DARKWATCH_EGRESS_LOCKDOWN=0): darkwatch can reach the internet directly"
+    [[ "$(env_val DARKWATCH_DNS 127.0.0.1)" != 127.0.0.1 ]] \
+        || warn "DARKWATCH_EGRESS_LOCKDOWN=0 but DARKWATCH_DNS is unset: darkwatch can't resolve clearnet names, so the in-app IP-leak check fails and direct alerts don't send; set DARKWATCH_DNS to a resolver in the env file"
 else
     # Docker adds this jump when it starts; without it DOCKER-USER is never
     # consulted (e.g. Docker running with "iptables": false).
