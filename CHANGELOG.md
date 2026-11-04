@@ -2,7 +2,43 @@
 
 ## Unreleased
 
+### Upgrade notes
+- Telethon 1.45 upgrades the Telegram login file
+  (`/var/lib/darkwebapp/darkwatch/data/telegram.session`) to its version 8
+  format the first time it opens it. An older image (Telethon 1.36, v0.3.1
+  and earlier) cannot open the file after that: every Telegram call fails
+  with `ValueError: too many values to unpack (expected 5)`. Before you
+  deploy, stop darkwatch and copy the file, keeping its owner and mode (it is
+  the account login, readable only by its owner; keep the copy root-only):
+  `sudo docker compose stop darkwatch && sudo cp -p
+  /var/lib/darkwebapp/darkwatch/data/telegram.session
+  /root/telegram.session.pre-upgrade` (from `/opt/darkwebapp`). The full
+  backup in `ops/RUNBOOK.md` includes it; the database-only hot backup does
+  not. If you roll back, stop darkwatch, copy the file back with `cp -p`
+  before starting the old image, or log in to Telegram again with the QR
+  code.
+
+### Upgrades
+- Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
+  `async-timeout` is no longer installed (python-socks only needs it on
+  Python older than 3.11). cryptg 0.4 → 0.6.0, yara-python 4.5.1 → 4.5.4,
+  requests 2.34.2, beautifulsoup4 4.15.0, qrcode 8.2, prometheus-client
+  0.26.0; Setup UI: python-multipart 0.0.33, docker 7.2.0.
+- `/metrics` now advertises the Prometheus text format as
+  `text/plain; version=1.0.0; charset=utf-8` (it was `version=0.0.4`).
+  Prometheus accepts both; check any other scraper that matches on the
+  header. The header also no longer carries `charset=utf-8` twice.
+- The darkwatch image installs cryptg and yara-python from wheels only
+  (`pip install --only-binary=cryptg,yara-python`): a pin with no wheel for
+  the build platform fails the build instead of trying a source build
+  (cryptg's needs Rust, which the image does not have).
+
 ### Fixed
+- Forum-topic labels on Telegram messages keep working on Telethon 1.45,
+  where `GetForumTopicsRequest` lives in `messages` and takes `peer=` (it
+  was in `channels` with `channel=`). A failed topic fetch is now logged as
+  a warning instead of at debug level; the messages are still stored,
+  without topic labels.
 - The crawler only follows links whose host ends in `.onion` over http or
   https. It used to accept any link containing `.onion` in the host part,
   such as `<x>.onion.evil.com` or `<x>.onion@evil.com`; those were already
@@ -11,6 +47,10 @@
   page is now skipped; it used to end that site's crawl with an error.
 
 ### Internal
+- The image smoke test (`tests/images/smoke.sh`) also checks the two native
+  wheels: Telethon must pick up cryptg (it silently falls back to slow
+  pure-Python AES without it), an AES-IGE round trip must succeed, and a
+  YARA rule must compile and match.
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new
   `tests/images/smoke.sh`, every container under `--network none` and a

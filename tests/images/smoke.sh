@@ -38,6 +38,21 @@ run() {
 run "darkwatch: import darkwatch, threat_intel, web" \
     "$DARKWATCH_IMAGE" python -c 'import darkwatch, threat_intel, web'
 
+# The two wheel-only native packages (Dockerfile --only-binary). Telethon
+# silently falls back to pure-Python AES without cryptg, so check that it
+# picked cryptg up, round-trip one block, and run one YARA match.
+run "darkwatch: cryptg and yara-python" \
+    "$DARKWATCH_IMAGE" python -c '
+import os, yara
+from telethon.crypto import aes
+assert aes.cryptg is not None, "Telethon is not using cryptg"
+key, iv, block = os.urandom(32), os.urandom(32), os.urandom(32)
+assert aes.AES.decrypt_ige(aes.AES.encrypt_ige(block, key, iv), key, iv) == block
+rules = yara.compile(source="rule smoke { strings: $a = \"darkwatch\" condition: $a }")
+assert [m.rule for m in rules.match(data=b"xx darkwatch xx")] == ["smoke"]
+print("cryptg", aes.cryptg.__name__, "yara", yara.__version__)
+'
+
 # ScreenshotEngine logs a failed Firefox launch and returns (None, None)
 # instead of raising, so only the files themselves prove the browser works.
 # The thumbnail also proves Pillow can read the PNG.

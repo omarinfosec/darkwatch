@@ -314,6 +314,25 @@ def test_bad_int_params_are_400_not_500(web):
     assert r.status_code == 400
 
 
+def test_metrics_scrape(web):
+    pytest.importorskip("prometheus_client")
+    r = web.app.test_client().get("/metrics", base_url=BASE)
+    assert r.status_code == 200
+    # prometheus-client 0.26 advertises text format version 1.0.0
+    # (0.20 sent 0.0.4); Prometheus accepts both.
+    assert r.headers["Content-Type"] == \
+        "text/plain; version=1.0.0; charset=utf-8"
+    body = r.get_data(as_text=True)
+    assert "# TYPE darkwatch_urls_total gauge" in body
+    assert "darkwatch_scan_running 0.0" in body
+
+
+def test_qr_login_svg_renders(web):
+    pytest.importorskip("qrcode")
+    svg = web._render_qr_svg("tg://login?token=AbC-123_x")
+    assert svg is not None and "<svg" in svg and "<path" in svg
+
+
 def test_csv_safe(web):
     assert web._csv_safe('=HYPERLINK("http://x")') == '\'=HYPERLINK("http://x")'
     assert web._csv_safe("+1") == "'+1"

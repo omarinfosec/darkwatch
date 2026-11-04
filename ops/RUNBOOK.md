@@ -155,6 +155,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 - If the two image IDs differ, darkwatch is still running the newer image: run `docker compose up -d darkwatch` and compare again.
 - Run `git checkout main` before the next upgrade. The checkout leaves a detached HEAD, and `git pull --ff-only` (and so `deploy.sh`) fails on it.
 - Database: v0.3.0 runs on a v0.3.1 database as is (the indexes v0.3.1 adds are not UNIQUE), so no restore is needed. Going back past v0.4.0's retention, which removes data, is only possible by restoring the backup taken before v0.4.0.
+- Telegram login: v0.3.1 and earlier (Telethon 1.36) can't open a `telegram.session` that Telethon 1.45 (the release after v0.3.1) has opened; every Telegram call fails with `too many values to unpack (expected 5)`. Before `./ops/deploy.sh --skip-pull`, with darkwatch stopped (`docker compose stop darkwatch`), copy the pre-upgrade file back: `cp -p /root/telegram.session.pre-upgrade /var/lib/darkwebapp/darkwatch/data/telegram.session`. Otherwise take it from the full backup made before that upgrade, or log in to Telegram again with the QR code after the rollback.
 
 ---
 

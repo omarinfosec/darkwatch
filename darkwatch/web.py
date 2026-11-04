@@ -1009,7 +1009,9 @@ def route_metrics():
     except Exception:
         pass
 
-    return Response(generate_latest(reg), mimetype=CONTENT_TYPE_LATEST)
+    # content_type, not mimetype: Flask appends a second "; charset=utf-8"
+    # to a text/* mimetype, and CONTENT_TYPE_LATEST already carries one.
+    return Response(generate_latest(reg), content_type=CONTENT_TYPE_LATEST)
 
 
 @app.route("/api/ui-config")

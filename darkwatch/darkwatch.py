@@ -3712,19 +3712,22 @@ class DarkMTProto:
         entity = self._entity_ref(channel_id, username)
 
         async def _go():
-            # GetForumTopicsRequest moved between Telethon versions:
-            #   * ≤1.32 or so: telethon.tl.functions.channels
-            #   * ≥1.33 (current 1.43): telethon.tl.functions.messages
+            # GetForumTopicsRequest moved between Telethon versions, and
+            # its entity argument was renamed with it:
+            #   * pinned 1.45: telethon.tl.functions.messages, peer=
+            #   * 1.36 and older: telethon.tl.functions.channels, channel=
             # Both paths tried; if neither works we degrade gracefully
             # and just don't label messages with their forum topic.
-            GetForumTopicsRequest = None
+            GetForumTopicsRequest, topic_peer_kw = None, None
             try:
                 from telethon.tl.functions.messages \
                     import GetForumTopicsRequest
+                topic_peer_kw = "peer"
             except ImportError:
                 try:
                     from telethon.tl.functions.channels \
                         import GetForumTopicsRequest
+                    topic_peer_kw = "channel"
                 except ImportError:
                     pass
             c = self._build_client()
@@ -3737,18 +3740,30 @@ class DarkMTProto:
                     return []
                 # Detect forum and fetch topic map (once per fetch call).
                 topic_map = {}     # topic_id → title
+                ent = None
                 if GetForumTopicsRequest is not None:
                     try:
                         ent = await c.get_entity(entity)
-                        if bool(getattr(ent, "forum", False)):
-                            resp = await c(GetForumTopicsRequest(
-                                channel=ent, offset_date=None, offset_id=0,
-                                offset_topic=0, limit=100))
-                            for t in getattr(resp, "topics", []) or []:
-                                topic_map[getattr(t, "id", None)] = \
-                                    getattr(t, "title", None)
                     except Exception as e:
+                        # iter_messages below fails on the same entity and
+                        # logs it, so debug is enough here.
                         log.debug(f"forum topic fetch skipped for {entity}: {e}")
+                if ent is not None and bool(getattr(ent, "forum", False)):
+                    try:
+                        resp = await c(GetForumTopicsRequest(
+                            offset_date=None, offset_id=0,
+                            offset_topic=0, limit=100,
+                            **{topic_peer_kw: ent}))
+                        for t in getattr(resp, "topics", []) or []:
+                            topic_map[getattr(t, "id", None)] = \
+                                getattr(t, "title", None)
+                    except Exception as e:
+                        # Warning, not debug: a failure here drops every
+                        # topic label of the fetch (a channel= / peer= mixup
+                        # does it on every call), and nothing else shows it.
+                        log.warning(f"[tg] forum topic fetch failed for {entity}, "
+                                    f"messages stored without topic labels: "
+                                    f"{type(e).__name__}: {e}")
 
                 kwargs = {"entity": entity, "limit": limit}
                 if since_msg_id:

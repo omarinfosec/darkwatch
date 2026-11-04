@@ -76,7 +76,13 @@ RUN groupadd -r -g 999 darkwatch && \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Wheel policy: cryptg and yara-python must install from wheels. cryptg's
+# sdist needs a Rust toolchain this image does not have, and yara-python's
+# compiles the bundled libyara; a pin with no cp311 wheel for the build
+# platform should fail here rather than fall back to an untested source
+# build. Not --only-binary=:all:, because stem ships only an sdist.
+RUN pip install --no-cache-dir --only-binary=cryptg,yara-python \
+        -r requirements.txt
 
 # Headless Firefox for offline screenshot rendering.
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/.browsers

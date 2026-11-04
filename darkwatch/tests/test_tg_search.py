@@ -107,3 +107,79 @@ def test_smart_discover_ranks_scam_and_fake_last(monkeypatch):
                         lambda q, limit=20: {"channels": rows, "users": []})
     out = eng.smart_discover("lockbit", max_variants=1, mine_forwards=False)
     assert [c["id"] for c in out["channels"]][0] == 3
+
+
+class _TopicMsg(_Msg):
+    """A forum message: reply_to.reply_to_top_id names its topic."""
+    def __init__(self, mid, text, top_id):
+        super().__init__(mid, 20, text)
+        self.sender = None
+        self.reply_to = type("R", (), {"reply_to_top_id": top_id,
+                                       "reply_to_msg_id": top_id})()
+
+
+class _ForumClient(_FakeClient):
+    """A forum channel: get_entity reports forum=True and the client
+    answers GetForumTopicsRequest with the topics, or raises `fail`."""
+    def __init__(self, msgs, fail=None):
+        super().__init__(msgs)
+        self.fail = fail
+        self.requests = []
+    async def get_entity(self, ref):
+        return type("Channel", (), {"forum": True, "id": 123})()
+    async def __call__(self, req):
+        self.requests.append(req)
+        if self.fail:
+            raise self.fail
+        topic = lambda i, t: type("T", (), {"id": i, "title": t})()
+        return type("Topics", (), {"topics": [topic(10, "Leaks"),
+                                              topic(20, "Chat")]})()
+
+
+def test_forum_messages_get_topic_labels(monkeypatch):
+    from telethon.tl.functions.messages import GetForumTopicsRequest
+    eng = _engine()
+    fake = _ForumClient([_TopicMsg(7, "dump posted", 10),
+                         _TopicMsg(6, "hello", 20),
+                         _TopicMsg(5, "stray reply", 99)])
+    monkeypatch.setattr(eng, "_build_client", lambda: fake)
+    out = eng.fetch_new_messages(123, username="@forum")
+    assert eng.last_fetch_error is None
+    # The pinned Telethon has the request in `messages`, taking peer=.
+    [req] = fake.requests
+    assert isinstance(req, GetForumTopicsRequest)
+    assert req.peer.forum is True
+    assert [(m["topic_id"], m["topic_title"]) for m in out] == \
+        [(10, "Leaks"), (20, "Chat"), (None, None)]
+
+
+def test_forum_topic_failure_is_a_warning_and_keeps_messages(monkeypatch, caplog):
+    eng = _engine()
+    fake = _ForumClient([_TopicMsg(7, "dump posted", 10)],
+                        fail=RuntimeError("CHANNEL_FORUM_MISSING"))
+    monkeypatch.setattr(eng, "_build_client", lambda: fake)
+    with caplog.at_level("WARNING", logger="darkwatch"):
+        out = eng.fetch_new_messages(123, username="@forum")
+    assert [(m["msg_id"], m["topic_id"]) for m in out] == [(7, None)]
+    assert any("forum topic fetch failed" in r.getMessage()
+               and r.levelname == "WARNING" for r in caplog.records)
+
+
+class _UnresolvableClient(_ForumClient):
+    """get_entity fails (renamed or private channel)."""
+    async def get_entity(self, ref):
+        raise ValueError("No user has \"gone\" as username")
+
+
+def test_unresolvable_entity_is_not_a_forum_topic_warning(monkeypatch, caplog):
+    # A channel that fails to resolve is not a forum-topic problem: no
+    # topic request is sent and no "forum topic fetch failed" warning.
+    eng = _engine()
+    fake = _UnresolvableClient([_TopicMsg(7, "dump posted", 10)])
+    monkeypatch.setattr(eng, "_build_client", lambda: fake)
+    with caplog.at_level("DEBUG", logger="darkwatch"):
+        out = eng.fetch_new_messages(123, username="@gone")
+    assert fake.requests == []
+    assert not any("forum topic fetch failed" in r.getMessage()
+                   for r in caplog.records)
+    assert [(m["msg_id"], m["topic_id"]) for m in out] == [(7, None)]
