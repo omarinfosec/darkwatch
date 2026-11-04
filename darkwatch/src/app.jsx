@@ -5362,7 +5362,7 @@ function App() {
         const { ok, body } = await api(
             `/api/telegram/channels/${urlId}/rescan`, { method: "POST" });
         if (ok) {
-            setToast(`Rescanned ${body.scanned} msg, ${body.findings} finding(s)`);
+            setToast(`Rescanned ${body.scanned} msg, ${body.findings} new finding(s)`);
             fetchFindings();
         } else {
             setToast(body.error || "Rescan failed");

@@ -966,6 +966,16 @@ class Database:
                  msg.get("topic_id"), msg.get("topic_title")))
             self.conn.commit()
 
+    def tg_message_seen(self, url_id, msg_id):
+        """True if this channel's message is already stored. Telegram
+        message ids are per channel, so (url_id, msg_id) names one message
+        whichever path fetched it (poll, live listener, scrape)."""
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT 1 FROM tg_messages WHERE url_id = ? AND msg_id = ? "
+                "LIMIT 1", (url_id, int(msg_id)))
+            return cur.fetchone() is not None
+
     def search_tg_messages_local(self, query, limit=100, min_date_iso=None,
                                    url_ids=None):
         """Case-insensitive substring search across all already-scraped TG
@@ -1173,9 +1183,13 @@ class Database:
             self.conn.commit()
 
     def update_tg_last_msg_id(self, url_id, last_msg_id):
+        """Raise the channel's high-water mark (the highest message id
+        read, service messages included). Never lowers it, so a historical
+        scrape or a late batch cannot move the polling cursor back."""
         with self.lock:
             self.conn.execute(
-                "UPDATE urls SET tg_last_msg_id = ? WHERE id = ?",
+                "UPDATE urls SET tg_last_msg_id = "
+                "  MAX(COALESCE(tg_last_msg_id, 0), ?) WHERE id = ?",
                 (last_msg_id, url_id))
             self.conn.commit()
 
@@ -2847,6 +2861,12 @@ class DarkMTProto:
         # response so the UI can show WHY nothing came back, instead of
         # the generic "no messages" warning.
         self.last_fetch_error = None
+        # How far the last fetch_new_messages read, counting the service
+        # messages it drops (joins, pins, title changes): they use up the
+        # `limit` too, so a caller walking a cursor forward needs these,
+        # not the returned list. Both 0 when the fetch failed.
+        self.last_fetch_count = 0
+        self.last_fetch_max_id = 0
 
     # ── Engine glue (thin delegations to support classes) ──────────────
     def _record_call(self, channel_id):
@@ -3681,8 +3701,12 @@ class DarkMTProto:
 
     def fetch_new_messages(self, channel_id, since_msg_id=None, limit=None,
                             username=None, before_msg_id=None):
-        """Return up to `limit` messages newer than `since_msg_id`. Each
-        entry is a rich dict suitable for storage in tg_messages:
+        """Return up to `limit` messages newer than `since_msg_id`. With
+        `since_msg_id` they are the OLDEST `limit` messages above it,
+        oldest first, so a caller that saves the highest id after each
+        batch walks forward without gaps. Without it they are the newest
+        `limit` messages, newest first. Each entry is a rich dict suitable
+        for storage in tg_messages:
 
             {msg_id, date_iso, sender_id, sender_username, sender_name,
              text, views, forwards, reactions_total, has_media, media_type,
@@ -3697,6 +3721,9 @@ class DarkMTProto:
              silently return [] in older Telethon versions.
 
         Skips empty messages (pure reactions / stickers — nothing to scan).
+        Skipped messages still count toward `limit`; `last_fetch_count`
+        and `last_fetch_max_id` say how many messages were read and the
+        highest id among them, skipped or not.
         Best-effort: returns [] on any Telethon error so the monitor loop
         never crashes. Writes a warning to the log on auth failure or
         resolution errors so the operator can see WHY it returned empty.
@@ -3707,6 +3734,8 @@ class DarkMTProto:
         limit = limit or self.scrape_limit
         self._record_call(channel_id)
         self.last_fetch_error = None
+        self.last_fetch_count = 0
+        self.last_fetch_max_id = 0
         # Prefer the @handle when we have it — resolve-by-username is far
         # more reliable than resolve-by-numeric-id across session resets.
         entity = self._entity_ref(channel_id, username)
@@ -3768,14 +3797,23 @@ class DarkMTProto:
                 kwargs = {"entity": entity, "limit": limit}
                 if since_msg_id:
                     kwargs["min_id"] = int(since_msg_id)
+                    # Oldest first: newest first would return the newest
+                    # `limit` messages above min_id and skip everything
+                    # between min_id and them once the caller saves the
+                    # highest id. Only with min_id: without it, reverse
+                    # starts at the channel's first message.
+                    kwargs["reverse"] = True
                 if before_msg_id:
                     # max_id is exclusive — returns messages with id < max_id.
                     # Used by multi-batch historical scrapes to walk backward
                     # through history.
                     kwargs["max_id"] = int(before_msg_id)
                 out = []
+                read, max_id = 0, 0
                 async for msg in c.iter_messages(**kwargs):
                     if msg is None: continue
+                    read += 1
+                    max_id = max(max_id, msg.id)
                     text = msg.message or ""
                     has_media = bool(getattr(msg, "media", None))
                     # KEEP media-only messages (photos/docs with no caption).
@@ -3821,6 +3859,9 @@ class DarkMTProto:
                         "fwd_from_msg_id": fwd_msg,
                         "reply_to_msg_id": reply_to,
                     })
+                # Set only once the whole batch was read: after an error
+                # nothing was stored, so the cursor must not move.
+                self.last_fetch_count, self.last_fetch_max_id = read, max_id
                 return out
             finally:
                 try: await c.disconnect()
@@ -4820,51 +4861,7 @@ class TelegramLiveListener:
 
                 @self._client.on(events.NewMessage)
                 async def _handler(event):
-                    try:
-                        # event.chat_id is the "marked" id (-100<id> for
-                        # channels); abs() of that is 100<id>, which never
-                        # matched the raw ids we store. resolve_id() strips
-                        # the marker and returns the raw positive id.
-                        cid = event.chat_id
-                        cid_norm = (tg_resolve_id(int(cid))[0]
-                                    if cid is not None else None)
-                        if cid_norm and cid_norm not in {abs(int(c))
-                                                         for c in self._channel_ids}:
-                            return
-                        msg = event.message
-                        text = msg.message or ""
-                        if not text: return
-                        sender = await event.get_sender()
-                        fwd_user, fwd_msg = DarkMTProto._fwd_info(msg)
-                        reply_to = getattr(msg.reply_to, "reply_to_msg_id", None) \
-                                   if getattr(msg, "reply_to", None) else None
-                        msg_dict = {
-                            "msg_id": msg.id,
-                            "date_iso": msg.date.isoformat() if msg.date else None,
-                            "sender_id": getattr(sender, "id", None) if sender else None,
-                            "sender_username": getattr(sender, "username", None) if sender else None,
-                            "sender_name": (getattr(sender, "first_name", None)
-                                            or getattr(sender, "title", None)
-                                            if sender else None),
-                            "text": text,
-                            "views": getattr(msg, "views", None),
-                            "forwards": getattr(msg, "forwards", None),
-                            "reactions_total": DarkMTProto._reactions_total(msg),
-                            "reactions_detail": DarkMTProto._reactions_detail(msg),
-                            "has_media": bool(getattr(msg, "media", None)),
-                            "media_type": DarkMTProto._media_type(msg),
-                            "fwd_from_username": fwd_user,
-                            "fwd_from_msg_id": fwd_msg,
-                            "reply_to_msg_id": reply_to,
-                        }
-                        username = (getattr(event.chat, "username", None)
-                                    if event.chat else None)
-                        # Dispatch synchronously into caller-land. Caller
-                        # is responsible for thread safety + not blocking
-                        # here for long (use a queue if heavy work).
-                        self.on_message(cid_norm, username, msg_dict)
-                    except Exception as e:
-                        log.warning(f"[tg-live] handler error: {e}")
+                    await self._on_event(event)
 
                 log.info("[tg-live] listener connected + subscribed")
                 # run_until_disconnected blocks forever. We exit when the
@@ -4885,6 +4882,60 @@ class TelegramLiveListener:
                     if self._client: await self._client.disconnect()
                 except Exception: pass
                 self._client = None
+
+    async def _on_event(self, event):
+        """NewMessage handler: filter to the watched channels, convert the
+        message to the fetch_new_messages dict and hand it to on_message.
+        Keeps media-only posts (no caption), like the polling path."""
+        try:
+            # event.chat_id is the "marked" id (-100<id> for channels);
+            # abs() of that is 100<id>, which never matched the raw ids we
+            # store. resolve_id() strips the marker and returns the raw
+            # positive id.
+            cid = event.chat_id
+            cid_norm = (tg_resolve_id(int(cid))[0]
+                        if cid is not None else None)
+            if cid_norm and cid_norm not in {abs(int(c))
+                                             for c in self._channel_ids}:
+                return
+            msg = event.message
+            text = msg.message or ""
+            has_media = bool(getattr(msg, "media", None))
+            # Skip only messages with neither text nor media (service
+            # messages); an uncaptioned photo is a post like any other.
+            if not text and not has_media:
+                return
+            sender = await event.get_sender()
+            fwd_user, fwd_msg = DarkMTProto._fwd_info(msg)
+            reply_to = getattr(msg.reply_to, "reply_to_msg_id", None) \
+                       if getattr(msg, "reply_to", None) else None
+            msg_dict = {
+                "msg_id": msg.id,
+                "date_iso": msg.date.isoformat() if msg.date else None,
+                "sender_id": getattr(sender, "id", None) if sender else None,
+                "sender_username": getattr(sender, "username", None) if sender else None,
+                "sender_name": (getattr(sender, "first_name", None)
+                                or getattr(sender, "title", None)
+                                if sender else None),
+                "text": text,
+                "views": getattr(msg, "views", None),
+                "forwards": getattr(msg, "forwards", None),
+                "reactions_total": DarkMTProto._reactions_total(msg),
+                "reactions_detail": DarkMTProto._reactions_detail(msg),
+                "has_media": has_media,
+                "media_type": DarkMTProto._media_type(msg),
+                "fwd_from_username": fwd_user,
+                "fwd_from_msg_id": fwd_msg,
+                "reply_to_msg_id": reply_to,
+            }
+            username = (getattr(event.chat, "username", None)
+                        if event.chat else None)
+            # Dispatch synchronously into caller-land. Caller is
+            # responsible for thread safety + not blocking here for long
+            # (use a queue if heavy work).
+            self.on_message(cid_norm, username, msg_dict)
+        except Exception as e:
+            log.warning(f"[tg-live] handler error: {e}")
 
     async def _sleep(self, s):
         """Interruptable sleep — wakes on stop event."""
@@ -5425,12 +5476,17 @@ class DarkWebCrawler:
         except Exception as e:
             log.error(f"Failed to save page: {e}")
 
-    def _yara_match_text(self, url_id, page_url, text):
+    def _yara_match_text(self, url_id, page_url, text, suppress_alert=False,
+                         bump=True):
         """Run YARA rules against a piece of plain text and write findings.
         Runs text + lower-cased text in parallel, then de-dupes by rule
         name — keywords.yar isn't always `nocase` but auto-generated user
         rules are, so an all-caps leak message needs both views.
-        Returns the number of findings written."""
+        `suppress_alert` records findings without alerting (a repost of
+        text already seen, which alerted the first time). `bump=False` is
+        the rescan mode of add_finding: a match that is already recorded
+        is neither counted nor alerted again.
+        Returns the number of findings written (new ones when bump=False)."""
         raw_hits, lower_hits = self.scanner.scan_parallel(text, text.lower())
         seen_rules = set()
         finding_count = 0
@@ -5448,15 +5504,20 @@ class DarkWebCrawler:
                     snippet = self.extract_snippet(text, matched_list[0])
                 ioc_h = _ioc_hash(matched_list)
                 fp = compute_fp_score(matched_list, snippet, None)
-                self.db.add_finding(
+                fresh = self.db.add_finding(
                     url_id, page_url, kw["rule"], "keyword:text",
                     score, matched, snippet, severity,
-                    ioc_hash=ioc_h, fp_score=fp)
+                    ioc_hash=ioc_h, fp_score=fp, bump=bump)
+                if not bump and not fresh:
+                    continue
                 finding_count += 1
                 if severity in ("critical", "high"):
                     log.warning(f"  ALERT {severity.upper()} | {kw['rule']} "
                                 f"(score:{score} fp:{fp}) | {page_url}")
-                    if fp < 60:
+                    if suppress_alert:
+                        log.info("  Alert suppressed (repost of text "
+                                 "already seen)")
+                    elif fp < 60:
                         self.alerter.send({
                             "rule_name": kw["rule"], "score": score,
                             "severity": severity, "page_url": page_url,
@@ -5476,10 +5537,12 @@ class DarkWebCrawler:
 
     def scan_tg_message(self, url_id, channel_username, msg):
         """Route a single Telegram message through the same pipeline as a
-        web page: dedup by content-hash, YARA scan, IOC extract, findings
-        write. Also persists rich message metadata (sender, views,
-        reactions, fwd/reply, media flag) in tg_messages so the UI can
-        render a proper channel timeline.
+        web page: YARA scan, IOC extract, findings write. A message already
+        stored for this channel is skipped; one whose text was seen before
+        (a repost) is stored and scanned without alerting again. Also
+        persists rich message metadata (sender, views, reactions,
+        fwd/reply, media flag) in tg_messages so the UI can render a
+        proper channel timeline.
 
         `msg` is the dict returned by DarkMTProto.fetch_new_messages().
         Returns the number of findings produced.
@@ -5498,15 +5561,19 @@ class DarkWebCrawler:
         page_url = f"https://t.me/{channel_username}/{msg['msg_id']}"
         date_iso = msg.get("date_iso") or ""
         title = f"[{channel_username}] {date_iso}".strip()
-        # Dedup key: real text when present (so two channels reposting
-        # the same leak collapse), otherwise msg_id-based to keep every
-        # media-only post unique (same "[photo]" marker would otherwise
-        # collide across the entire channel).
+        # A message is stored once per channel: polling, the live listener
+        # and a historical scrape can all fetch the same one.
+        if self.db.tg_message_seen(url_id, msg["msg_id"]):
+            return 0
+        # Content hash: real text when present, so a repost of the same
+        # text (another channel, or the same channel again) is recognised;
+        # otherwise msg_id-based, since every media-only post would share
+        # the same "[photo]" marker.
         hash_basis = text if text else f"{page_url}|media"
         content_hash = hashlib.sha256(hash_basis.encode("utf-8")).hexdigest()
-
-        if self.db.page_seen(content_hash):
-            return 0
+        # A repost is still stored and scanned, so this channel gets its
+        # own message row and findings; only the alert is not repeated.
+        repost = self.db.page_seen(content_hash)
 
         extracted = self.data_extractor.extract(text) if text else {}
 
@@ -5531,7 +5598,9 @@ class DarkWebCrawler:
         # YARA only meaningful on real text. For media-only messages
         # (where text is the synthetic marker) we skip scanning to avoid
         # a burst of false "[photo]"-substring matches.
-        finding_count = self._yara_match_text(url_id, page_url, text) if text else 0
+        finding_count = (self._yara_match_text(url_id, page_url, text,
+                                               suppress_alert=repost)
+                         if text else 0)
         if extracted:
             for ioc_type, iocs in extracted.items():
                 log.info(f"  Extracted {ioc_type}: {len(iocs)} item(s)")
@@ -5540,31 +5609,28 @@ class DarkWebCrawler:
     def rescan_tg_channel(self, url_id):
         """Re-run YARA rules against every stored message for a channel.
         Use when the operator has added new user keywords AFTER historical
-        scraping — the old messages are already in `pages` (page_seen
-        dedup would skip them on a re-scrape) so fresh rule evaluation
-        needs this dedicated path.
+        scraping — the old messages are already stored (a re-scrape skips
+        them) so fresh rule evaluation needs this dedicated path.
 
-        Returns {scanned, findings}."""
-        rows = self.db.conn.execute(
-            "SELECT m.url_id, m.msg_id, m.text, u.tg_username "
-            "FROM tg_messages m JOIN urls u ON u.id = m.url_id "
-            "WHERE m.url_id = ? AND m.text IS NOT NULL AND m.text != ''",
-            (url_id,)).fetchall()
+        Like rescan_pages it only adds findings: rows it matches again keep
+        their occurrence_count and last_seen_at, and findings of rules
+        that no longer match or were deleted stay. Only new rows alert.
+
+        Returns {scanned, findings}; `findings` counts new rows."""
+        with self.db.lock:
+            rows = self.db.conn.execute(
+                "SELECT m.url_id, m.msg_id, m.text, u.tg_username "
+                "FROM tg_messages m JOIN urls u ON u.id = m.url_id "
+                "WHERE m.url_id = ? AND m.text IS NOT NULL AND m.text != ''",
+                (url_id,)).fetchall()
         targets = [(url_id_, f"https://t.me/{username}/{msg_id}", text)
                    for url_id_, msg_id, text, username in rows]
-        # Purge prior findings first so the rescan is idempotent. Done in one
-        # transaction under db.lock: the connection is shared with the crawler
-        # thread, and an unlocked DELETE could be committed (or interleaved)
-        # by another thread's commit. _yara_match_text takes db.lock itself
-        # (non-reentrant), so it runs after the lock is released.
-        with self.db.lock:
-            self.db.conn.executemany(
-                "DELETE FROM findings WHERE url_id = ? AND page_url = ?",
-                [(u, page_url) for u, page_url, _ in targets])
-            self.db.conn.commit()
+        # _yara_match_text takes db.lock itself (non-reentrant), so it runs
+        # after the lock is released.
         found = 0
         for url_id_, page_url, text in targets:
-            found += self._yara_match_text(url_id_, page_url, text)
+            found += self._yara_match_text(url_id_, page_url, text,
+                                           bump=False)
         return {"scanned": len(targets), "findings": found}
 
     # Severity ordering used for the selective-screenshot threshold.

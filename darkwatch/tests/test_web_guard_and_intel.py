@@ -11,24 +11,14 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-@pytest.fixture(scope="module")
-def web(tmp_path_factory):
-    d = tmp_path_factory.mktemp("dw")
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(here, "config.json")) as f:
-        cfg = json.load(f)
-    cfg["output"].update(loot_dir=str(d / "loot"), reports_dir=str(d / "loot/reports"),
-                         thumbnails_dir=str(d / "loot/thumbs"))
-    cfg["database"]["path"] = str(d / "dw.db")
-    (d / "config.json").write_text(json.dumps(cfg))
-    pytest.importorskip("flask")
-    # Module-scoped, so the function-scoped monkeypatch fixture is not
-    # available; the context restores the environment after this module.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("DARKWATCH_CONFIG", str(d / "config.json"))
-        mp.setenv("DARKWATCH_BIND_IP", "10.8.0.5")
-        import web as web_mod
-        yield web_mod
+# The `web` fixture (the imported dashboard module) is in conftest.py.
+
+
+def test_web_fixture_does_not_leak_its_environment(web):
+    # Set only around the import: later modules (setup/tests too) must
+    # not inherit the throwaway config or bind address.
+    assert os.environ.get("DARKWATCH_CONFIG") != web.CONFIG_PATH
+    assert os.environ.get("DARKWATCH_BIND_IP") != "10.8.0.5"
 
 
 def test_host_header_must_name_the_dashboard(web):

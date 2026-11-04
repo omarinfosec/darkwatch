@@ -201,6 +201,7 @@ _monitor_thread = None
 _monitor_stop = threading.Event()
 MONITOR_TICK = 30          # seconds between scheduler wake-ups
 MONITOR_JITTER = 0.25      # fraction (±25% of interval)
+TG_CATCHUP_BATCHES = 5     # max Telegram fetch batches per channel check
 
 # In-process counters for /metrics. Small enough to stay in memory; the
 # DB already records scan_log rows so we don't need to persist these.
@@ -673,6 +674,11 @@ def _monitor_tg_channel(url_id):
     tg_last_msg_id, scan each, record a monitor event. Runs under
     _tg_lock (caller).
 
+    Catches up in batches of scrape_limit, oldest first, saving the
+    high-water mark after each batch, so a channel that posted more than
+    one batch since the last check loses nothing. At most
+    TG_CATCHUP_BATCHES per check; the rest follows on the next check.
+
     Adds a randomized 0-15 s pre-fetch delay on top of the scheduler's
     existing ±25% next_check_at jitter, so the scheduler wake-up time and
     the actual Telegram round-trip aren't perfectly correlated (harder to
@@ -688,22 +694,43 @@ def _monitor_tg_channel(url_id):
     if _monitor_stop.wait(jitter_s):
         return 0, 0  # operator stopped during jitter
     log.info(f"[monitor] telegram @{username}")
-    msgs = _tg.fetch_new_messages(
-        info["tg_channel_id"],
-        since_msg_id=info.get("tg_last_msg_id"),
-        limit=_tg.scrape_limit,
-        username=username)
-    findings = 0
-    latest = info.get("tg_last_msg_id") or 0
-    for m in msgs:
-        findings += _crawler.scan_tg_message(url_id, username, m)
-        if m["msg_id"] > latest:
-            latest = m["msg_id"]
-    if msgs:
-        _crawler.db.update_tg_last_msg_id(url_id, latest)
-    log.info(f"[monitor] telegram @{username}: {len(msgs)} new, "
+    limit = _tg.scrape_limit
+    saved = latest = info.get("tg_last_msg_id") or 0
+    fetched = findings = 0
+    for batch in range(1, TG_CATCHUP_BATCHES + 1):
+        msgs = _tg.fetch_new_messages(
+            info["tg_channel_id"],
+            since_msg_id=latest or None,
+            limit=limit,
+            username=username)
+        for m in msgs:
+            findings += _crawler.scan_tg_message(url_id, username, m)
+            if m["msg_id"] > latest:
+                latest = m["msg_id"]
+        # The fetch drops service messages (joins, pins) after they used
+        # up the limit, so the cursor and the caught-up test go by what it
+        # read: a run of `limit` service messages would otherwise return
+        # [] and stall the channel on them for good.
+        read = getattr(_tg, "last_fetch_count", len(msgs))
+        latest = max(latest, getattr(_tg, "last_fetch_max_id", 0) or 0)
+        if latest > saved:
+            _crawler.db.update_tg_last_msg_id(url_id, latest)
+            saved = latest
+        fetched += len(msgs)
+        # A short batch means caught up. Without a mark (first check) the
+        # fetch is the newest batch, not a walk: older history is the
+        # scrape endpoint's job.
+        if read < limit or (batch == 1 and not info.get("tg_last_msg_id")):
+            break
+        if _monitor_stop.is_set():
+            break
+    else:
+        log.warning(f"[monitor] telegram @{username}: catch-up stopped at "
+                    f"{TG_CATCHUP_BATCHES} batches ({fetched} messages, up "
+                    f"to #{latest}); newer messages follow on the next check")
+    log.info(f"[monitor] telegram @{username}: {fetched} new, "
              f"{findings} finding(s)")
-    return len(msgs), findings
+    return fetched, findings
 
 
 def _monitor_one(url_id, url):
@@ -855,7 +882,11 @@ def _tg_live_on_message(channel_id, username, msg):
 
 def _tg_live_consumer():
     """Drain the live-event queue, scan each message under _tg_lock.
-    Same scan path as _monitor_tg_channel but one message at a time."""
+    Same scan path as _monitor_tg_channel but one message at a time.
+
+    Does not move tg_last_msg_id: polling is the only cursor, so messages
+    the listener missed (a disconnect, a full queue) below a live one are
+    still fetched by the next poll, which skips those already stored."""
     while not _tg_live_stop.is_set():
         try:
             ev = _tg_live_queue.get(timeout=1.0)
@@ -872,11 +903,6 @@ def _tg_live_consumer():
             url_id, uname = row[0], row[1]
             with _tg_lock:
                 _crawler.scan_tg_message(url_id, uname, ev["msg"])
-                # Advance the high-water mark so the polling scheduler
-                # doesn't re-fetch this message.
-                info = _crawler.db.get_tg_channel(url_id)
-                if info and (info.get("tg_last_msg_id") or 0) < ev["msg"]["msg_id"]:
-                    _crawler.db.update_tg_last_msg_id(url_id, ev["msg"]["msg_id"])
             log.info(f"[tg-live] scanned @{uname} #{ev['msg']['msg_id']}")
         except Exception as e:
             log.error(f"[tg-live] consumer error: {e}")
@@ -1722,11 +1748,17 @@ def route_tg_scrape(url_id):
             fetched_total += len(msgs)
             if len(msgs) < this_batch:
                 break   # channel history exhausted
-        if latest_id:
+        # The scrape fetches the newest messages, so it may not reach down
+        # to the polling cursor. Raise the cursor only when it did (or
+        # there is none yet); otherwise polling still has to walk the gap
+        # between the old cursor and the oldest message scraped.
+        old_mark = info.get("tg_last_msg_id") or 0
+        if latest_id and (not old_mark or (earliest_seen is not None
+                                           and earliest_seen <= old_mark + 1)):
             _crawler.db.update_tg_last_msg_id(url_id, latest_id)
         # Deep mode ALSO re-runs rules over everything we've stored so
-        # newly-added keywords catch up. Idempotent — purges prior
-        # findings on each message before re-evaluating.
+        # newly-added keywords catch up. It only adds findings, so it is
+        # safe to repeat.
         rescan_findings = 0
         if deep:
             r = _crawler.rescan_tg_channel(url_id)
@@ -1799,8 +1831,8 @@ def route_tg_leave(url_id):
 def route_tg_rescan(url_id):
     """Re-run YARA rules over every stored message for this channel.
     Use after adding new keywords — without this, old messages stay
-    unevaluated because `pages.content_hash` dedup skips them on
-    re-scrape."""
+    unevaluated because a re-scrape skips messages already stored. Only
+    adds findings; existing ones, including those of deleted rules, stay."""
     if not _crawler.db.url_exists(url_id):
         abort(404)
     info = _crawler.db.get_tg_channel(url_id)
