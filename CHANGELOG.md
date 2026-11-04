@@ -56,6 +56,13 @@
   (`content_hash`, `(url_id, scanned_at)`, `(url_id, page_url)`); this takes
   about a second per 150k pages. They are not UNIQUE, so a rolled-back
   release still runs against the database.
+- Every `docker compose` command now needs `TOR_CONTROL_PASSWORD` (tor gets
+  it by variable substitution instead of the whole env file) and fails with
+  "TOR_CONTROL_PASSWORD unset: is the repo .env linked to the operator env
+  file?" without it. `install.sh` generates it and `deploy.sh` already
+  requires it; run plain `docker compose` from `/opt/darkwebapp` with the
+  `.env` link in place, or pass `--env-file /var/lib/darkwebapp/env`. The
+  first deploy recreates tor and darkwatch.
 
 ### Security
 - The tunnel kill switch also drops new connections that arrive through
@@ -109,6 +116,23 @@
   `/api/*` responses (findings, Telegram data, exports, screenshots) and all
   Setup UI responses except `/static/` are `Cache-Control: no-store`.
   Downloaded Telegram media keeps its own sandbox CSP.
+- Failed alerts no longer log the Telegram bot token or webhook secrets.
+  requests/urllib3 quote the target URL or its path in their errors ("Max
+  retries exceeded with url: /bot<token>/sendMessage"), and those went to the
+  container log at ERROR, percent-encoded when the token or webhook held a
+  space, a newline or non-ASCII. Alert errors now keep only the scheme and
+  host and name the exception type (`ConnectionError`, `InvalidURL`...);
+  errors other than connection failures (an invalid or scheme-less URL, a
+  read timeout) are scrubbed too and are not retried on the next route. If alerts ever
+  failed and the logs left the VM, rotate the bot token (BotFather
+  `/revoke`) and the Slack/Discord webhooks.
+- tor gets only `TOR_CONTROL_PASSWORD`, not the whole env file (alert tokens,
+  Telegram credentials, `SETUP_AUTH_TOKEN`), and darkwatch gets
+  `SETUP_AUTH_TOKEN` blanked; only the Setup UI has the Setup UI's token.
+- The Telegram session file (a full login to the account) is set to 0600
+  whenever a client is built and after every login, including the QR login
+  with a 2FA password, which left it at the umask's 0644. Existing 0644 files
+  are fixed on the next Telegram call.
 
 ### Fixed
 - `verify-egress.sh` checks that are real:
@@ -229,6 +253,13 @@
   returns instead of re-selecting it by content hash outside the database
   lock. New `darkwatch/tests/test_db_integrity.py` checks the query plans
   of the hot `pages` queries and the rescan behaviour.
+- New `darkwatch/tests/test_secret_handling.py` drives failed alerts through
+  refusing proxies and an invalid URL and checks that no log record at any
+  level holds the token or webhook path, and checks the session file mode
+  for every login path. `tests/compose/check.sh` checks that only setup has
+  a non-empty `SETUP_AUTH_TOKEN`, that tor's environment is exactly
+  `TOR_CONTROL_PASSWORD`, and that `config` fails without it; CI's compose
+  config step passes an env file with both.
 
 ## v0.3.0 — 2026-10-25
 

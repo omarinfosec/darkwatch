@@ -240,7 +240,7 @@ You'll need console access via the VM provider.
 | `TELEGRAM_ALERT_CHAT_ID` | alerting                         | optional |
 | `SLACK_WEBHOOK_URL`      | alerting                         | optional |
 
-All live in `/var/lib/darkwebapp/env` (root:root, 0600). Compose reads them via `env_file:`.
+All live in `/var/lib/darkwebapp/env` (root:root, 0600). darkwatch and the Setup UI get the whole file via `env_file:` (darkwatch with `SETUP_AUTH_TOKEN` blanked); tor gets only `TOR_CONTROL_PASSWORD`, through compose variable substitution. Every `docker compose` command therefore needs `TOR_CONTROL_PASSWORD` from the repo's `.env` link or `--env-file`, and fails with "TOR_CONTROL_PASSWORD unset" without it.
 
 ---
 

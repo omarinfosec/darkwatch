@@ -83,8 +83,13 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    env_file:
-      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env
+    # Only the one variable tor needs, not the whole env file (which holds
+    # SETUP_AUTH_TOKEN, alert tokens and Telegram credentials). `:?` makes
+    # every compose command fail when it is unset (a missing or wrong .env
+    # link) instead of starting tor with an empty password, which it
+    # refuses.
+    environment:
+      - "TOR_CONTROL_PASSWORD=${TOR_CONTROL_PASSWORD:?TOR_CONTROL_PASSWORD unset: is the repo .env linked to the operator env file?}"
     volumes:
       # Persist Tor state (guard nodes, consensus cache) across recreates.
       # Re-picking guards on every deploy is slower and worse for anonymity.
@@ -186,6 +191,9 @@ services:
       - ./darkwatch/config.json:/app/config.json:ro
     environment:
       - DARKWATCH_CONFIG=/app/config.json
+      # The env file holds the Setup UI's bearer token; darkwatch has no use
+      # for it, so blank it here (environment: overrides env_file).
+      - SETUP_AUTH_TOKEN=
     pids_limit: 1024
     # DNS isolation. darkwatch only needs Docker's embedded DNS for service
     # names (tunnel1, tunnel2), which still resolve. Without an explicit

@@ -53,8 +53,9 @@ jobs:
         run: sudo bash tests/verify-egress/check.sh
       - name: docker compose config
         run: |
-          data="$(mktemp -d)" && touch "$data/env"
-          DARKWEBAPP_DATA_ROOT="$data" docker compose \
+          data="$(mktemp -d)"
+          printf 'TOR_CONTROL_PASSWORD=ci\nSETUP_AUTH_TOKEN=ci-sentinel\n' > "$data/env"
+          DARKWEBAPP_DATA_ROOT="$data" docker compose --env-file "$data/env" \
             --profile tor --profile tg --profile setup config -q
-      - name: compose DNS isolation (darkwatch dns 127.0.0.1, no other service)
+      - name: compose checks (DNS isolation, env scoping, TOR_CONTROL_PASSWORD required)
         run: bash tests/compose/check.sh

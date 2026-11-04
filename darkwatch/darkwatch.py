@@ -1840,10 +1840,45 @@ class Alerter:
         self.config = config
         self.routes = routes if routes is not None else []
 
+    # Any URL in a message: keep scheme://host, drop credentials, path, query.
+    _URL_IN_ERR = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)"   # scheme
+                             r"(?:[^/\s'\"@]*@)?"              # user:pass@
+                             r"([^/\s'\"?#]*)"                 # host[:port]
+                             r"([^\s'\"]*)")                   # path?query
+
+    @staticmethod
+    def _scrub(err, url):
+        """Error text with the alert URL's secret parts removed. The bot
+        token sits in the Telegram URL path and webhook tokens in the path or
+        query, and requests/urllib3 quote the URL or its path in their
+        messages ("Max retries exceeded with url: /bot<token>/sendMessage",
+        "Invalid URL '...'"), which then went to the logs and the dashboard."""
+        text = str(err)
+        parts = set()
+        try:
+            u = urlparse(url)
+            parts.update({url, requests.utils.requote_uri(url), u.path,
+                          u.query, u.fragment, u.path + "?" + u.query})
+        except Exception:
+            parts.add(url)
+        try:
+            # urllib3 quotes the prepared, percent-encoded path, which differs
+            # when the token or webhook has spaces, newlines or non-ASCII.
+            pu = urlparse(requests.Request("POST", url).prepare().url)
+            parts.update({pu.path, pu.query, pu.path + "?" + pu.query})
+        except Exception:
+            pass
+        for p in sorted((p for p in parts if p and len(p) > 1), key=len, reverse=True):
+            text = text.replace(p, "[redacted]")
+        text = re.sub(r"(with url: )\S+", r"\1[redacted]", text)
+        return Alerter._URL_IN_ERR.sub(
+            lambda m: m[1] + m[2] + ("/[redacted]" if m[3] else ""), text)
+
     def _post(self, url, payload):
         """POST through the first route that connects. Only connection-level
         failures fall through to the next route, so an alert that reached
-        the receiver is never sent twice."""
+        the receiver is never sent twice. Raised errors never carry the URL
+        (it holds the token)."""
         if not self.routes:
             raise RuntimeError("no tunnel available for alerts "
                                "(set alerts.allow_direct to send directly)")
@@ -1854,8 +1889,14 @@ class Alerter:
             except (requests.exceptions.ProxyError,
                     requests.exceptions.ConnectionError,
                     requests.exceptions.ConnectTimeout) as e:
-                last = e
-                log.debug(f"alert route '{name}' unavailable: {e}")
+                last = f"{type(e).__name__}: {self._scrub(e, url)}"
+                log.debug(f"alert route '{name}' unavailable: {last}")
+            except Exception as e:
+                # InvalidURL, MissingSchema, ReadTimeout...: another route
+                # would not help (or could send twice). `from None`: the
+                # original exception and its message stay out of tracebacks.
+                raise RuntimeError(f"alert failed: {type(e).__name__}: "
+                                   f"{self._scrub(e, url)}") from None
         raise RuntimeError(f"all alert routes failed: {last}")
 
     def send(self, finding):
@@ -2959,7 +3000,20 @@ class DarkMTProto:
             raise RuntimeError(
                 "telegram proxy not configured (telegram.proxy_host / use_tor) — "
                 "refusing a direct connection; set telegram.allow_direct=true to override")
-        return TelegramClient(**kwargs)
+        client = TelegramClient(**kwargs)
+        # Telethon creates the session file with the process umask (0644).
+        # Also fixes files left that way by earlier versions.
+        self._lock_down_session()
+        return client
+
+    def _lock_down_session(self):
+        """chmod 0600 the session file: it holds the account's auth key,
+        which is a full login to the Telegram account."""
+        for p in (self.session_path, self.session_path + ".session"):
+            if os.path.exists(p):
+                try: os.chmod(p, 0o600)
+                except Exception as e:
+                    log.warning(f"TG session: couldn't chmod {p}: {e}")
 
     def status(self):
         """Cheap status probe. Doesn't connect to Telegram."""
@@ -3066,13 +3120,7 @@ class DarkMTProto:
             result = self._run_coro(_go, "auth_confirm")
             if result.get("ok"):
                 self._pending_auth.pop(phone, None)
-                # Tighten permissions on the session file — it IS a
-                # credential.
-                for p in (self.session_path,
-                          self.session_path + ".session"):
-                    if os.path.exists(p):
-                        try: os.chmod(p, 0o600)
-                        except Exception: pass
+                self._lock_down_session()
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -3129,11 +3177,7 @@ class DarkMTProto:
                         state["error"] = "2fa_password_required"
                         return
                     state["authenticated"] = True
-                    for p in (self.session_path,
-                              self.session_path + ".session"):
-                        if os.path.exists(p):
-                            try: os.chmod(p, 0o600)
-                            except Exception: pass
+                    self._lock_down_session()
                 finally:
                     try: await c.disconnect()
                     except Exception: pass
@@ -3189,6 +3233,7 @@ class DarkMTProto:
         try:
             r = self._run_coro(_go, "qr_password")
             if r.get("ok"):
+                self._lock_down_session()
                 state = self._qr_sessions_dict().get(token)
                 if state: state["authenticated"] = True
             return r
