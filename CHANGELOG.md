@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Upgrade notes
+- From v0.3.0, pull first and then deploy without pulling:
+  `sudo git -C /opt/darkwebapp pull --ff-only`, then
+  `sudo ./ops/deploy.sh --skip-pull`. A v0.3.0 `deploy.sh` that does the pull
+  itself keeps running its own old code and exits silently after the build.
+  If you already ran it that way, run `deploy.sh` again and check that it
+  prints "deploy complete".
+- `deploy.sh` now refuses to run when the repo's `.env` is not a link to
+  `/var/lib/darkwebapp/env` (a wrong target, a dangling link or a copied
+  file). Fix it with `sudo ln -sfn /var/lib/darkwebapp/env /opt/darkwebapp/.env`.
+  `bootstrap.sh` treats the same case as an error instead of a warning.
+- `deploy.sh` fails on a hand-placed `wg0.conf` with a `Table` other than
+  `auto`, any `FwMark`, or no `AllowedIPs` that includes `0.0.0.0/0`. Pre/Post
+  hooks only produce a warning.
+- The first deploy after upgrading builds the tor and Setup UI images too, so
+  it takes longer; later builds come from the cache.
+
+### Fixed
+- `deploy.sh` exited silently after the build when the env file had no
+  `DARKNET_SUBNET=` line (the default), so the stack never started and the
+  egress lockdown and its systemd unit were never installed.
+- `deploy.sh` builds every locally built image (darkwatch, tor, setup), not
+  only the enabled profiles'. Upgraded VMs no longer keep running an old Setup
+  UI, and saving Tunnel 1 in the Setup UI no longer fails on a fresh install
+  for want of the tor image. A running Setup UI is refreshed onto the new
+  image; a stopped one stays stopped.
+- Every compose call in `deploy.sh` passes `--env-file /var/lib/darkwebapp/env`,
+  so a wrong `.env` link can no longer put darkwatch on a different address
+  from the one the egress lockdown restricts.
+- `install.sh` no longer exits when the env file lacks `SETUP_AUTH_TOKEN` or
+  `DARKWATCH_BIND_IP`.
+- The Setup UI rejects a WireGuard config with no `AllowedIPs` line, as
+  `deploy.sh` already did, instead of saving it and having the next deploy
+  refuse it.
+- A failed refresh of a running Setup UI only warns; it no longer stops
+  `deploy.sh` before the health wait and the egress lockdown.
+- `deploy.sh` checks that the tunnel kill switch is executable, and its
+  "compose up failed" hint points at the `custom-init` / `killswitch` logs.
+- The documented Setup UI command is now
+  `docker compose --profile setup up -d --build setup`, so it never starts a
+  stale image.
+
+### Internal
+- `ops/lib/common.sh` holds the `env_val` helper shared by `deploy.sh`,
+  `egress-lockdown.sh` and `verify-egress.sh`.
+- New `tests/ops/check.sh` runs `deploy.sh` and `bootstrap.sh` against
+  stubbed docker/systemctl in CI.
+
 ## v0.3.0 — 2026-10-25
 
 Leak-hardening release: nothing can reach the internet from the host's IP

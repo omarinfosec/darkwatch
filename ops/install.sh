@@ -92,7 +92,7 @@ fi
 "$SCRIPT_DIR/bootstrap.sh"
 
 # Extract the auto-generated SETUP_AUTH_TOKEN for printing at the end
-SETUP_TOKEN="$(grep -E '^SETUP_AUTH_TOKEN=' "$DATA_ROOT/env" 2>/dev/null | head -1 | cut -d= -f2-)"
+SETUP_TOKEN="$(grep -E '^SETUP_AUTH_TOKEN=' "$DATA_ROOT/env" 2>/dev/null | head -1 | cut -d= -f2-)" || true
 
 # ═══════════════════════════════════════════════════════════════════════════
 hdr "3. Configure env file"
@@ -101,7 +101,7 @@ hdr "3. Configure env file"
 # Detect host private IP, optionally bind dashboards to it
 PRIV_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
-current_bind=$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | head -1 | cut -d= -f2-)
+current_bind=$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | head -1 | cut -d= -f2-) || true
 if [[ "$current_bind" == "127.0.0.1" || -z "$current_bind" ]]; then
     if [[ -n "$PRIV_IP" && "$PRIV_IP" != "127.0.0.1" ]]; then
         log "Host private IP detected: $PRIV_IP"
@@ -186,7 +186,7 @@ fi
 hdr "7. Done"
 # ═══════════════════════════════════════════════════════════════════════════
 
-BIND_IP=$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | cut -d= -f2-)
+BIND_IP=$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | head -1 | cut -d= -f2-) || true
 BIND_IP="${BIND_IP:-127.0.0.1}"
 
 ok "Dashboard:"
@@ -194,7 +194,7 @@ echo "      DarkWatch:       http://$BIND_IP:8080/"
 echo
 ok "Bring up the Setup UI to configure tunnels + Telegram from your browser:"
 echo "      cd $REPO_ROOT"
-echo "      sudo docker compose --profile setup up -d setup"
+echo "      sudo docker compose --profile setup up -d --build setup"
 echo "      open http://$BIND_IP:8082/?token=$SETUP_TOKEN"
 echo "      sudo docker compose --profile setup stop setup    # bring it down when done"
 echo

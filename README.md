@@ -169,7 +169,7 @@ cd /opt/darkwebapp && sudo ./ops/deploy.sh
 DarkWatch:       http://<bind-ip>:8080/
 
 Bring up the Setup UI to configure tunnels + Telegram from your browser:
-    docker compose --profile setup up -d setup
+    docker compose --profile setup up -d --build setup
     open http://<bind-ip>:8082/?token=<SETUP_AUTH_TOKEN>
     docker compose --profile setup stop setup
 ```
@@ -195,8 +195,8 @@ If neither tunnel is configured, `darkwatch` still starts — it just can't craw
 A profile-gated, bearer-token-protected web UI for placing your Telegram credentials and WireGuard tunnel configs without editing files on the VM. It's off by default (the privileges to write secrets and restart containers should not always be available), and lives at port 8082.
 
 ```bash
-# Enable
-sudo docker compose --profile setup up -d setup
+# Enable (--build picks up Setup UI code changes after a git pull)
+sudo docker compose --profile setup up -d --build setup
 
 # Use (token is in /var/lib/darkwebapp/env as SETUP_AUTH_TOKEN)
 open http://$DARKWATCH_BIND_IP:8082/?token=<SETUP_AUTH_TOKEN>

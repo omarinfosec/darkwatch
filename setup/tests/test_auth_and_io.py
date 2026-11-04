@@ -114,6 +114,15 @@ def test_wg_config_requires_full_tunnel():
     assert main._validate_wg_config(both) == []
 
 
+def test_wg_config_requires_allowedips_line():
+    # No AllowedIPs routes nothing through the tunnel; deploy.sh's
+    # check_wg_conf rejects it too, so the Setup UI must not accept it.
+    missing = VALID_WG.replace("AllowedIPs = 0.0.0.0/0\n", "")
+    assert "AllowedIPs" not in missing
+    assert any("AllowedIPs must include 0.0.0.0/0" in e
+               for e in main._validate_wg_config(missing))
+
+
 def test_telegram_save_never_validates_without_tunnel(client, tmp_path, monkeypatch):
     """No tunnel2 config -> creds are format-checked and saved, but Telegram
     is never contacted (it would be a direct connection from the host)."""

@@ -33,6 +33,8 @@ done
 log()  { printf '\033[1;36m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[deploy WARN]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31m[deploy ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
 
 # ─── Must run as root (docker socket + /var/lib/darkwebapp/env) ─────────────
 if [[ $EUID -ne 0 ]]; then
@@ -41,12 +43,35 @@ fi
 
 DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
 
+# Every compose call reads the operator env explicitly, so variable
+# substitution (DARKWATCH_IP, DARKNET_SUBNET, passwords) can't come from
+# somewhere else. Plain `docker compose` (RUNBOOK, harden-phase2's sudoers,
+# the hints below) reads the repo's .env link instead, which pre-flight checks.
+dc() { docker compose --env-file "$DATA_ROOT/env" "$@"; }
+
 # ─── Pre-flight checks ──────────────────────────────────────────────────────
 log "pre-flight: verifying operator state at $DATA_ROOT"
 
 [[ -d "$DATA_ROOT" ]] || fail "$DATA_ROOT does not exist. Run ops/bootstrap.sh first."
 [[ -f "$DATA_ROOT/env" ]] || fail "$DATA_ROOT/env is missing. Copy .env.example and fill it in."
 [[ "$(stat -c %a "$DATA_ROOT/env")" == "600" ]] || fail "$DATA_ROOT/env permissions must be 0600 (got $(stat -c %a "$DATA_ROOT/env"))"
+
+# The repo's .env must be a link to the operator env. If it points elsewhere,
+# plain `docker compose` puts darkwatch on a different address from the one
+# the egress lockdown restricts (and starts tg-socks without its password).
+# Catches a wrong target, a dangling link and a copied file.
+ENV_LINK="$REPO_ROOT/.env"
+if [[ ! -e "$ENV_LINK" && ! -L "$ENV_LINK" ]]; then
+    ln -s "$(readlink -f "$DATA_ROOT/env")" "$ENV_LINK"
+    log "  linked $ENV_LINK -> $DATA_ROOT/env"
+elif [[ "$(readlink -f "$ENV_LINK" 2>/dev/null || true)" != "$(readlink -f "$DATA_ROOT/env")" ]]; then
+    fail "$ENV_LINK is not a link to $DATA_ROOT/env (it resolves to '$(readlink -f "$ENV_LINK" 2>/dev/null || true)'). Fix: sudo ln -sfn $DATA_ROOT/env $ENV_LINK"
+fi
+
+# tunnel1/2 run the kill switch from /custom-cont-init.d at start; without
+# the exec bit it doesn't load and the tunnels never turn healthy.
+KILLSWITCH="$REPO_ROOT/tunnels/killswitch/10-killswitch.sh"
+[[ -x "$KILLSWITCH" ]] || fail "$KILLSWITCH is not executable. Fix: sudo chmod 755 $KILLSWITCH (and check 'git config core.fileMode')"
 
 # Secrets that newer versions need. Generated once, kept in the env file.
 ensure_secret() {
@@ -78,6 +103,41 @@ done
 if (( ${#missing[@]} > 0 )); then
     fail "missing required env vars in $DATA_ROOT/env: ${missing[*]}"
 fi
+
+# WireGuard configs placed by hand skip the Setup UI's validation. The kill
+# switch assumes a full-tunnel config, so check the same rules here that
+# setup/main.py:_validate_wg_config enforces (keep the two in sync).
+check_wg_conf() {   # $1 = wg0.conf; prints "FAIL ..." / "WARN ..." lines
+    awk '
+        { sub(/#.*/, "") }
+        !/=/ { next }
+        {
+            key = $0; sub(/=.*/, "", key); gsub(/[ \t\r]/, "", key)
+            val = $0; sub(/^[^=]*=/, "", val); gsub(/[ \t\r]/, "", val)
+            k = tolower(key)
+        }
+        k == "table" && tolower(val) != "auto" {
+            print "FAIL " key " = " val " (traffic would bypass the tunnel; remove the line)"
+        }
+        k == "fwmark" { print "FAIL " key " = " val " (breaks the kill switch; remove the line)" }
+        k ~ /^(pre|post)(up|down)$/ {
+            print "WARN " key " hook runs as root inside the tunnel container (the Setup UI refuses hooks)"
+        }
+        k == "allowedips" && ("," val ",") ~ /,0\.0\.0\.0\/0,/ { full = 1 }
+        END { if (!full) print "FAIL no AllowedIPs includes 0.0.0.0/0 (split-tunnel configs are not supported)" }
+    ' "$1"
+}
+wg_problems=0
+for conf in "$DATA_ROOT"/secrets/tunnel{1,2}/wg_confs/wg0.conf; do
+    [[ -f "$conf" ]] || continue
+    while IFS= read -r line; do
+        case "$line" in
+            FAIL*) warn "  $conf: ${line#FAIL }"; wg_problems=1 ;;
+            WARN*) warn "  $conf: ${line#WARN }" ;;
+        esac
+    done < <(check_wg_conf "$conf")
+done
+(( ! wg_problems )) || fail "WireGuard config check failed (see above). Fix the file or paste it into the Setup UI."
 
 # WG configs: detect which tunnels are configured. Tunnels are profile-gated
 # in compose; we only enable a profile when its WG config file is actually
@@ -140,40 +200,51 @@ fi
 
 # ─── Pull / build images ─────────────────────────────────────────────────────
 log "docker compose pull (third-party images only)"
-docker compose $COMPOSE_PROFILES_ARGS pull --ignore-buildable --quiet \
+dc $COMPOSE_PROFILES_ARGS pull --ignore-buildable --quiet \
     || warn "image pull failed — continuing with locally cached images"
 
+# Build every locally built image, not only the enabled profiles': the Setup
+# UI starts tor itself after Tunnel 1 is saved (and can't build it), and a
+# setup image that is never rebuilt keeps running old code.
 if (( ! SKIP_BUILD )); then
-    log "docker compose build"
-    docker compose $COMPOSE_PROFILES_ARGS build
+    log "docker compose build (darkwatch, tor, setup)"
+    dc $COMPOSE_PROFILES_ARGS --profile tor --profile setup build
 fi
 
 # ─── Network migration ───────────────────────────────────────────────────────
 # v0.3 pins the darknet subnet (egress lockdown needs a fixed address for
 # darkwatch). Compose refuses to reuse a network whose config changed, so
 # recreate it once: `down` stops the containers and removes the network.
-want_subnet="$(grep -E '^DARKNET_SUBNET=' "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)"
-want_subnet="${want_subnet:-172.31.250.0/24}"
+want_subnet="$(env_val DARKNET_SUBNET 172.31.250.0/24)"
 have_subnet="$(docker network inspect darkwatch_darknet \
     -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
 if [[ -n "$have_subnet" && "$have_subnet" != "$want_subnet" ]]; then
     log "darknet subnet changes ($have_subnet -> $want_subnet): recreating the network"
-    docker compose --profile tor --profile tg --profile setup down
+    dc --profile tor --profile tg --profile setup down
 fi
 
 # ─── Bring stack up ──────────────────────────────────────────────────────────
 # Tunnel sidecars wait for their WireGuard container to report a handshake;
 # if that never happens `up` fails. Show why instead of dying silently.
 log "docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans"
-if ! docker compose $COMPOSE_PROFILES_ARGS up -d --remove-orphans; then
-    docker compose $COMPOSE_PROFILES_ARGS ps -a >&2 || true
+if ! dc $COMPOSE_PROFILES_ARGS up -d --remove-orphans; then
+    dc $COMPOSE_PROFILES_ARGS ps -a >&2 || true
     for svc in tunnel1 tunnel2; do
         if docker ps -a --format '{{.Names}}' | grep -qx "$svc"; then
             warn "last $svc logs:"
             docker logs --tail=20 "$svc" >&2 || true
         fi
     done
-    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong, the VPN endpoint is unreachable (no handshake), or the kill switch didn't load (check 'docker logs tunnelN' for [killswitch]; tunnels/killswitch must be owned by root)."
+    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong, the VPN endpoint is unreachable (no handshake), or the kill switch didn't load: check 'docker logs tunnelN 2>&1 | grep -E \"custom-init|killswitch\"', and that tunnels/killswitch/10-killswitch.sh is owned by root and executable."
+fi
+
+# A running Setup UI keeps its old container (and code) until recreated.
+# Refresh it onto the image just built; never start one that is stopped.
+if [[ "$(docker inspect -f '{{.State.Running}}' setup 2>/dev/null || true)" == "true" ]]; then
+    log "Setup UI is running: refreshing it"
+    # Optional: a failure here must not stop the health wait and the lockdown.
+    dc --profile setup up -d --no-deps setup \
+        || warn "could not refresh the Setup UI; run: docker compose --profile setup up -d --build setup"
 fi
 
 # ─── Health verification ────────────────────────────────────────────────────
@@ -186,7 +257,7 @@ for i in $(seq 1 60); do
     fi
     if (( i == 60 )); then
         log "darkwatch did not report healthy in time (status: $status). Recent logs:"
-        docker compose logs --tail=40 darkwatch
+        dc logs --tail=40 darkwatch
         fail "darkwatch healthcheck timeout"
     fi
     sleep 2
@@ -195,7 +266,7 @@ done
 # ─── Block darkwatch's direct internet access (host firewall) ───────────────
 "$SCRIPT_DIR/egress-lockdown.sh" || fail "could not apply egress lockdown"
 # Re-apply after reboots (iptables rules don't persist on their own).
-UNIT=/etc/systemd/system/darkwatch-egress-lockdown.service
+UNIT="${DW_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/darkwatch-egress-lockdown.service"
 if command -v systemctl >/dev/null 2>&1; then
     unit_body="[Unit]
 Description=DarkWatch: block the darkwatch container's direct internet access
@@ -229,8 +300,7 @@ if (( ! NO_EGRESS_CHECK )); then
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────────
-BIND_IP="$(grep -E '^DARKWATCH_BIND_IP=' "$DATA_ROOT/env" | head -1 | cut -d= -f2-)"
-BIND_IP="${BIND_IP:-127.0.0.1}"
+BIND_IP="$(env_val DARKWATCH_BIND_IP 127.0.0.1)"
 log "deploy complete."
 log "  darkwatch:       http://${BIND_IP}:8080"
 log ""

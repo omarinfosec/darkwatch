@@ -27,6 +27,10 @@ FAILED=0
 
 [[ $EUID -eq 0 ]] || { echo "must run as root (uses docker)" >&2; exit 1; }
 
+DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
+
 CHECK_TOR=0
 CHECK_TG=0
 for arg in "$@"; do
@@ -38,7 +42,6 @@ for arg in "$@"; do
     esac
 done
 if (( ! CHECK_TOR && ! CHECK_TG )); then
-    DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
     [[ -f "$DATA_ROOT/secrets/tunnel1/wg_confs/wg0.conf" ]] && CHECK_TOR=1
     [[ -f "$DATA_ROOT/secrets/tunnel2/wg_confs/wg0.conf" ]] && CHECK_TG=1
 fi
@@ -92,7 +95,7 @@ TG_EXIT=""
 if (( CHECK_TG )); then
     log "checking Telegram-path exit IP"
     # tg-socks requires a login (TG_SOCKS_PASSWORD, same value darkwatch uses).
-    TG_PASS="$(grep -E '^TG_SOCKS_PASSWORD=' "${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/env" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    TG_PASS="$(env_val TG_SOCKS_PASSWORD "")"
     TG_EXIT="$(docker exec darkwatch curl -s --socks5-hostname tunnel2:1080 \
                --proxy-user "darkwatch:${TG_PASS}" --max-time 30 \
                https://api.ipify.org 2>/dev/null || echo "")"

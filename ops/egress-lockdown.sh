@@ -24,11 +24,9 @@ DATA_ROOT="${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}"
 
 [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 
-env_val() {   # read KEY from the operator env file, else the environment, else $2
-    local v=""
-    [[ -r "$DATA_ROOT/env" ]] && v="$(grep -E "^$1=" "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)"
-    echo "${v:-${!1:-$2}}"
-}
+# env_val: the operator env file, else the environment, else the default.
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 SUBNET="$(env_val DARKNET_SUBNET 172.31.250.0/24)"
 DW_IP="$(env_val DARKWATCH_IP 172.31.250.250)"

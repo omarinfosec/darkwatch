@@ -21,7 +21,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 log()  { printf '\033[1;36m[bootstrap]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[bootstrap WARN]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31m[bootstrap ERROR]\033[0m %s\n' "$*" >&2; }
 
 log "creating $DATA_ROOT"
 # Top of tree + secrets stay root-owned: WG containers run privileged.
@@ -59,12 +59,15 @@ fi
 
 # Compose variable substitution (${DARKWATCH_BIND_IP}, etc.) reads the project-root
 # .env file — symlink it to operator state so port bindings match /var/lib/darkwebapp/env.
+# A wrong link is an error: compose would put darkwatch on a different address
+# from the one the egress lockdown restricts. deploy.sh checks the same.
 ENV_LINK="$REPO_ROOT/.env"
-if [[ ! -e "$ENV_LINK" ]]; then
-    ln -sf "$DATA_ROOT/env" "$ENV_LINK"
+if [[ ! -e "$ENV_LINK" && ! -L "$ENV_LINK" ]]; then
+    ln -s "$(readlink -f "$DATA_ROOT/env")" "$ENV_LINK"
     log "linked $ENV_LINK -> $DATA_ROOT/env"
 elif [[ "$(readlink -f "$ENV_LINK" 2>/dev/null || true)" != "$(readlink -f "$DATA_ROOT/env")" ]]; then
-    warn "$ENV_LINK exists but does not point at $DATA_ROOT/env — fix manually"
+    err "$ENV_LINK exists but is not a link to $DATA_ROOT/env. Fix: sudo ln -sfn $DATA_ROOT/env $ENV_LINK"
+    exit 1
 fi
 
 # Setup UI runs `docker compose` through the host Docker socket — bind-mount
@@ -84,7 +87,7 @@ log "host paths for Setup UI: repo=$REPO_ROOT data=$DATA_ROOT"
 
 # SETUP_AUTH_TOKEN — generate on first bootstrap if missing/empty.
 # This token gates the Setup UI (port 8082) when the operator brings up
-# `docker compose --profile setup up -d setup`. Print it once so the
+# `docker compose --profile setup up -d --build setup`. Print it once so the
 # operator can record it; rotate later with openssl rand -hex 32.
 if grep -qE '^SETUP_AUTH_TOKEN=$' "$DATA_ROOT/env" 2>/dev/null || \
    ! grep -qE '^SETUP_AUTH_TOKEN=' "$DATA_ROOT/env" 2>/dev/null; then
@@ -138,7 +141,7 @@ log "       — Telegram + WireGuard tunnels can be set via the Setup UI instead
 log "  2. Place WireGuard configs OR use the Setup UI (step 5):"
 log "       Manual:  $DATA_ROOT/secrets/tunnel1/wg_confs/wg0.conf"
 log "                $DATA_ROOT/secrets/tunnel2/wg_confs/wg0.conf"
-log "       UI:      docker compose --profile setup up -d setup"
+log "       UI:      docker compose --profile setup up -d --build setup"
 log "                http://\$DARKWATCH_BIND_IP:8082/?token=<token printed above>"
 log "  3. (Optional) replace stub at $USER_YAR with real rules"
 log "  4. Apply baseline hardening:  sudo ./ops/harden.sh"

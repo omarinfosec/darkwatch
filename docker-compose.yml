@@ -206,7 +206,7 @@ services:
 
   # ─── Setup UI (profile-gated; off by default) ──────────────────────────────
   # Bring up only when configuring credentials/tunnels:
-  #   docker compose --profile setup up -d setup
+  #   docker compose --profile setup up -d --build setup
   # Take down when done:
   #   docker compose --profile setup stop setup
   #

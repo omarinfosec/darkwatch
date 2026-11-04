@@ -17,7 +17,16 @@ cd /opt/darkwebapp
 sudo ./ops/deploy.sh
 ```
 
-`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes, if required env vars are missing, or if the env file isn't 0600. Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off.
+**Upgrading from v0.3.0:** pull first, then deploy without pulling. After it pulls, the v0.3.0 `deploy.sh` keeps running its own old code and exits silently after the build, without starting the stack or applying the egress lockdown:
+```bash
+sudo git -C /opt/darkwebapp pull --ff-only
+sudo ./ops/deploy.sh --skip-pull
+```
+If you already ran the old `deploy.sh`, run it again and check that it prints "deploy complete".
+
+`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes, if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
+
+The plain `sudo docker compose …` commands below read their settings through that `.env` link.
 
 ### Check the egress isolation
 ```bash
@@ -48,7 +57,7 @@ sudo docker compose restart darkwatch
 
 ### Rebuild after changing the Dockerfile
 ```bash
-sudo ./ops/deploy.sh   # the deploy script always runs `compose build`
+sudo ./ops/deploy.sh   # builds darkwatch, tor and setup (skip with --skip-build)
 ```
 
 ### Stop everything

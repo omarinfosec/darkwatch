@@ -14,7 +14,7 @@ Auth: bearer token from $SETUP_AUTH_TOKEN. First visit via ?token=... or the
 login form sets an HttpOnly session cookie (7 days) so Settings ↗ from the
 main dashboard opens without pasting the token each time.
 
-Bring up:    docker compose --profile setup up -d setup
+Bring up:    docker compose --profile setup up -d --build setup
 Bring down:  docker compose --profile setup stop setup
 """
 
@@ -234,7 +234,10 @@ _WG_ALLOWEDIPS = re.compile(r"^\s*AllowedIPs\s*=\s*(.+)$", re.MULTILINE | re.IGN
 
 
 def _validate_wg_config(text: str) -> list[str]:
-    """Return list of validation errors; empty list = ok."""
+    """Return list of validation errors; empty list = ok.
+
+    ops/deploy.sh:check_wg_conf re-checks hand-placed configs against the
+    Table / FwMark / AllowedIPs rules below; keep the two in sync."""
     errors = []
     if len(text) > 32 * 1024:
         errors.append("config is suspiciously large (>32 KiB)")
@@ -259,7 +262,7 @@ def _validate_wg_config(text: str) -> list[str]:
     # Full tunnel only: all IPv4 traffic must go through the VPN.
     allowed = [ip.strip() for m in _WG_ALLOWEDIPS.finditer(text)
                for ip in m.group(1).split(",")]
-    if allowed and "0.0.0.0/0" not in allowed:
+    if "0.0.0.0/0" not in allowed:
         errors.append("AllowedIPs must include 0.0.0.0/0 (route all traffic "
                       "through the tunnel; split-tunnel configs are not supported)")
     return errors
