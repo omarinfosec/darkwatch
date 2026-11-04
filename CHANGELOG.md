@@ -100,6 +100,13 @@
   grep 'Tor circuit rotated'` shows a rotation after a scan. Rolling back to
   a release before this one needs the volume re-owned back by hand (see
   `ops/RUNBOOK.md`, "Roll back a release").
+- **darkwatch and Setup UI images on Python 3.13 and Debian trixie.** Both
+  are now built on `python:3.13-slim-trixie` (pinned by digest) instead of
+  `python:3.11-slim-bookworm`; `ops/deploy.sh` rebuilds both. Nothing in
+  `/var/lib/darkwebapp` changes. CI's Python test jobs now run on 3.13
+  only and keep their names (`Tests (darkwatch)`, `Tests (setup)`): if
+  branch protection requires `Tests (darkwatch, Python 3.13)` or
+  `Tests (setup, Python 3.13)`, remove those, since they no longer report.
 
 ### Security
 - The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
@@ -173,6 +180,12 @@
   could hold a scan), and a refusal such as a wrong password (`515`) is
   logged as a warning instead of at debug level, as are bad control
   settings in `config.json` (a port that isn't a number, a null host).
+- darkwatch and Setup UI images: `python:3.11-slim-bookworm` →
+  `python:3.13-slim-trixie`, pinned by digest. Playwright 1.64's
+  `install --with-deps` has package lists for trixie, so the comment that
+  tied the image to bookworm is gone. Both `requirements.lock` files are
+  resolved for CPython 3.13, at the same versions as before; cryptg and
+  yara-python have cp313 wheels for x86_64 and aarch64.
 
 ### Fixed
 - Forum-topic labels on Telegram messages keep working on Telethon 1.45,
@@ -341,6 +354,14 @@
   500).
 
 ### Internal
+- `ops/lock-deps.sh` resolves the locks for CPython 3.13 (`PYTHON_VERSION`)
+  on x86_64 Linux, then again for aarch64 Linux from a copy of each new
+  lock, and fails, showing the difference, if aarch64 resolves to another
+  lock. CI runs the Python tests, pyflakes and pip-audit on 3.13; the 3.11
+  legs are gone, since no image runs 3.11 and a 3.13 lock need not install
+  there. `tests/workflows/check.py` fails when the Dockerfiles' Python,
+  `PYTHON_VERSION` and the CI and audit jobs' Python differ;
+  `tests/lock-deps/check.sh` covers the aarch64 run.
 - New `darkwatch/tests/test_tor_control.py` tests the ControlPort client
   against a fake ControlPort: NEWNYM success, a wrong password (`515`), a
   refused signal, a ControlPort that never answers, quotes and backslashes

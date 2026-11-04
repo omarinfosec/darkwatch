@@ -5,8 +5,9 @@
 #     pin), a missing lock or requirements.in and an .in line that is not name==version, and
 #     matches names as pip does (case, -_. and extras);
 #   - a lock run calls the pinned uv with the flags the locks are made with
-#     (CPython 3.11, linux, hashes) for each image, and never uses a uv of
-#     another version.
+#     (CPython 3.13, x86_64 Linux, hashes) for each image, resolves each
+#     again for aarch64 Linux from a copy of the new lock, fails when that
+#     gives a different lock, and never uses a uv of another version.
 #   bash tests/lock-deps/check.sh
 set -euo pipefail
 
@@ -102,7 +103,7 @@ cat > "$stubs/uv" <<EOF
 #!/usr/bin/env bash
 if [[ "\$1" == --version ]]; then echo "uv \${STUB_UV_VERSION:-$uv_version}"; exit 0; fi
 printf '%s\n' "\$*" >> "$work/uv.log"
-out=""; in=""
+args="\$*"; out=""; in=""
 while [[ \$# -gt 0 ]]; do
     case "\$1" in
         -o) out="\$2"; shift ;;
@@ -111,6 +112,9 @@ while [[ \$# -gt 0 ]]; do
     shift
 done
 grep -E '^[A-Za-z]' "\$in" | sed 's/\[[^]]*\]//; s/[[:space:]].*//; s/\$/ \\\\/' > "\$out"
+# A package that only the aarch64 resolution pulls in.
+[[ -z "\${STUB_ARCH_DIFF:-}" || "\$args" != *"--python-platform aarch64-unknown-linux-gnu"* ]] \
+    || echo "arm-only==1.0 \\\\" >> "\$out"
 EOF
 cat > "$stubs/python3" <<EOF
 #!/usr/bin/env bash
@@ -123,19 +127,35 @@ write_good
 : > "$work/uv.log"
 (cd "$work" && PATH="$stubs:$PATH" bash "$tree/ops/lock-deps.sh" >/dev/null) \
     || fail "lock run with the pinned uv failed"
-want="pip compile --quiet --python-version 3.11 --python-platform linux --generate-hashes --custom-compile-command ./ops/lock-deps.sh darkwatch/requirements.in -o darkwatch/requirements.lock
-pip compile --quiet --python-version 3.11 --python-platform linux --generate-hashes --custom-compile-command ./ops/lock-deps.sh setup/requirements.in -o setup/requirements.lock"
+# The aarch64 run writes to a temporary copy of the lock; its path varies.
+sed -i -E 's| -o /[^ ]*/other\.lock$| -o TMP/other.lock|' "$work/uv.log"
+flags="--python-version 3.13 --python-platform"
+rest="--generate-hashes --custom-compile-command ./ops/lock-deps.sh"
+want="pip compile --quiet $flags x86_64-unknown-linux-gnu $rest darkwatch/requirements.in -o darkwatch/requirements.lock
+pip compile --quiet $flags aarch64-unknown-linux-gnu $rest darkwatch/requirements.in -o TMP/other.lock
+pip compile --quiet $flags x86_64-unknown-linux-gnu $rest setup/requirements.in -o setup/requirements.lock
+pip compile --quiet $flags aarch64-unknown-linux-gnu $rest setup/requirements.in -o TMP/other.lock"
 [[ "$(cat "$work/uv.log")" == "$want" ]] || fail "uv calls: $(cat "$work/uv.log")"
 grep -q '^pysocks==1.7.1\|^PySocks==1.7.1' "$tree/darkwatch/requirements.lock" \
     || fail "the lock was not written in the repo root"
-ok "a lock run calls uv $uv_version for each image: Python 3.11, linux, hashes"
+ok "a lock run calls uv $uv_version for each image: Python 3.13, x86_64 then aarch64 Linux, hashes"
 
 write_good
 : > "$work/uv.log"
 PATH="$stubs:$PATH" bash "$tree/ops/lock-deps.sh" --upgrade >/dev/null || fail "--upgrade run failed"
-[[ "$(grep -c '^pip compile --quiet --upgrade --python-version 3.11 ' "$work/uv.log")" == 2 ]] \
+[[ "$(grep -c '^pip compile --quiet --upgrade --python-version 3.13 --python-platform x86_64-' "$work/uv.log")" == 2 ]] \
     || fail "--upgrade not passed to uv: $(cat "$work/uv.log")"
-ok "--upgrade is passed on to uv"
+grep -q -- '--upgrade.*aarch64' "$work/uv.log" && fail "--upgrade passed to the aarch64 run: $(cat "$work/uv.log")"
+ok "--upgrade is passed on to uv for the lock, not for the aarch64 comparison"
+
+write_good
+if out="$(STUB_ARCH_DIFF=1 PATH="$stubs:$PATH" bash "$tree/ops/lock-deps.sh" 2>&1)"; then
+    fail "a lock run passed although aarch64 resolves to another lock"
+fi
+grep -qF "darkwatch/requirements.in resolves differently on aarch64-unknown-linux-gnu" <<<"$out" \
+    || fail "no platform difference reported: $out"
+grep -qF "arm-only==1.0" <<<"$out" || fail "the difference is not shown: $out"
+ok "a lock run fails when aarch64 resolves to another lock, and shows the difference"
 
 write_good
 : > "$work/uv.log"

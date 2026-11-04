@@ -116,8 +116,10 @@ git add darkwatch/requirements.in darkwatch/requirements.lock
 ```
 CI fails while a lock is behind its `requirements.in` (`./ops/lock-deps.sh
 --check`); on a Dependabot pip PR, run `./ops/lock-deps.sh` on its branch
-and push the locks. The locks are resolved for CPython 3.11 on x86_64
-Linux, which the images use; arm64 hosts are untested.
+and push the locks. The locks are resolved for CPython 3.13 on x86_64
+Linux, which the images use (`python:3.13-slim-trixie`), and the script
+fails if aarch64 Linux resolves to a different lock; arm64 hosts are
+otherwise untested.
 
 ### Stop everything
 ```bash

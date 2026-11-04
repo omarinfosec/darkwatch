@@ -3,7 +3,7 @@
 Static: release.yml runs ci.yml through workflow_call, skips manual runs
 off main, and gates the release job on it; ci.yml can be called; Dependabot
 and the gitleaks job are configured as documented; CI runs a pinned
-pyflakes.
+pyflakes; the images, the locks and the CI jobs use one Python version.
 
 Behaviour: the release job's shell steps run in order, as Actions would
 (bash -eo pipefail, $GITHUB_ENV between steps), against throwaway git
@@ -166,6 +166,32 @@ flakes = [r for r in shell_runs if "pyflakes" in r]
  and flakes[0].rstrip().endswith("python -m pyflakes */*.py")) \
     or die(f"CI does not run a pinned pyflakes over */*.py: {flakes}")
 ok("CI runs a pinned pyflakes over the application code")
+
+
+# ─── Static: one Python version ─────────────────────────────────────────────
+# The images' base (FROM python:X.Y-slim-...) decides the interpreter; the
+# locks are resolved for it, and CI tests, audits and lints on it.
+versions = {}
+for img in ("darkwatch", "setup"):
+    with open(os.path.join(REPO, img, "Dockerfile"), encoding="utf-8") as fp:
+        froms = re.findall(r"(?m)^FROM python:(\d+\.\d+)-slim-\w+@sha256:[0-9a-f]{64}\b", fp.read())
+    len(froms) == 1 or die(f"{img}/Dockerfile: expected one digest-pinned FROM python:X.Y-slim-<debian>, got {froms}")
+    versions[f"{img}/Dockerfile"] = froms[0]
+with open(os.path.join(REPO, "ops", "lock-deps.sh"), encoding="utf-8") as fp:
+    m = re.search(r"(?m)^PYTHON_VERSION=(\S+)$", fp.read())
+m or die("ops/lock-deps.sh has no PYTHON_VERSION=")
+versions["ops/lock-deps.sh"] = m.group(1)
+audit_job = audit["jobs"]["deps-audit"]
+for where, wf_job in (("ci.yml python-tests", ci["jobs"]["python-tests"]),
+                   ("ci.yml shell-and-compose", ci["jobs"]["shell-and-compose"]),
+                   ("deps-audit.yml", audit_job)):
+    setups = [st for st in wf_job["steps"] if str(st.get("uses", "")).startswith("actions/setup-python@")]
+    len(setups) == 1 or die(f"{where}: expected one setup-python step, got {len(setups)}")
+    versions[where] = str(setups[0].get("with", {}).get("python-version"))
+"python" in ci["jobs"]["python-tests"]["strategy"]["matrix"] \
+    and die("ci.yml python-tests has a python matrix; the locks only cover the images' version")
+len(set(versions.values())) == 1 or die(f"Python versions differ: {versions}")
+ok(f"images, locks, CI tests, pyflakes and pip-audit all use Python {versions['darkwatch/Dockerfile']}")
 
 
 # ─── Behaviour: run the release job's steps ─────────────────────────────────
