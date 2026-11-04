@@ -192,15 +192,19 @@ def _start_health_refresh_thread():
         target=_health_refresh_loop, name="health-refresh", daemon=True)
     _health_refresh_thread.start()
 
-# Monitoring scheduler — single background thread, ticks every MONITOR_TICK
-# seconds. Per-URL interval is stored on the urls table; the scheduler
+# Monitoring schedulers — one background thread for .onion URLs and one for
+# Telegram channels, each ticking every MONITOR_TICK seconds. Separate so a
+# manual scan or a Tor outage does not hold up Telegram (which has its own
+# tunnel and lock). Per-URL interval is stored on the urls table; the scheduler
 # applies a ±MONITOR_JITTER fraction of randomness when scheduling the
 # next check, so the operator's polling pattern can't be fingerprinted by
 # the target site.
 _monitor_thread = None
+_tg_monitor_thread = None   # Telegram channels: own scheduler, own gate
 _monitor_stop = threading.Event()
 MONITOR_TICK = 30          # seconds between scheduler wake-ups
 MONITOR_JITTER = 0.25      # fraction (±25% of interval)
+TG_CATCHUP_BATCHES = 5     # max Telegram fetch batches per channel check
 
 # In-process counters for /metrics. Small enough to stay in memory; the
 # DB already records scan_log rows so we don't need to persist these.
@@ -670,40 +674,100 @@ def _next_check_at(interval_min):
 
 def _monitor_tg_channel(url_id):
     """Incremental Telegram channel scrape: pull messages newer than
-    tg_last_msg_id, scan each, record a monitor event. Runs under
-    _tg_lock (caller).
+    tg_last_msg_id and scan each. Returns (stored, findings, error):
+    stored counts the messages this check stored, not those it fetched
+    that were stored already (by the live listener or a scrape); error is
+    the reason the check failed or stopped short, None when it ran to the
+    end.
 
     Adds a randomized 0-15 s pre-fetch delay on top of the scheduler's
     existing ±25% next_check_at jitter, so the scheduler wake-up time and
     the actual Telegram round-trip aren't perfectly correlated (harder to
-    fingerprint as an automated poll pattern)."""
+    fingerprint as an automated poll pattern). The delay waits outside
+    _tg_lock, so a login or search is not held up by it; the fetch takes
+    the lock and reads the channel's mark inside it, after the delay, so
+    a scrape that moved the mark meanwhile is seen."""
     info = _crawler.db.get_tg_channel(url_id)
     if not info:
         log.error(f"[monitor] tg channel {url_id} missing TG metadata")
-        return 0, 0
+        return 0, 0, "missing Telegram channel metadata"
     username = info["tg_username"]
     jitter_s = random.uniform(0, 15)
     if jitter_s > 1:
         log.info(f"[monitor] telegram @{username} — pre-fetch jitter {jitter_s:.1f}s")
     if _monitor_stop.wait(jitter_s):
-        return 0, 0  # operator stopped during jitter
+        # Operator stopped during jitter: nothing was fetched, so this
+        # must not read as a quiet channel.
+        return 0, 0, "stopped before the fetch"
+    with _tg_lock:
+        return _tg_catch_up(url_id)
+
+
+def _tg_catch_up(url_id):
+    """The fetch half of _monitor_tg_channel. Runs under _tg_lock
+    (caller), so the scraper's last_fetch_error read here belongs to this
+    fetch and the mark read here is current.
+
+    Catches up in batches of scrape_limit, oldest first, saving the
+    high-water mark after each batch, so a channel that posted more than
+    one batch since the last check loses nothing. At most
+    TG_CATCHUP_BATCHES per check; the rest follows on the next check."""
+    info = _crawler.db.get_tg_channel(url_id)
+    if not info:
+        # Deleted during the pre-fetch delay.
+        return 0, 0, "missing Telegram channel metadata"
+    username = info["tg_username"]
     log.info(f"[monitor] telegram @{username}")
-    msgs = _tg.fetch_new_messages(
-        info["tg_channel_id"],
-        since_msg_id=info.get("tg_last_msg_id"),
-        limit=_tg.scrape_limit,
-        username=username)
-    findings = 0
-    latest = info.get("tg_last_msg_id") or 0
-    for m in msgs:
-        findings += _crawler.scan_tg_message(url_id, username, m)
-        if m["msg_id"] > latest:
-            latest = m["msg_id"]
-    if msgs:
-        _crawler.db.update_tg_last_msg_id(url_id, latest)
-    log.info(f"[monitor] telegram @{username}: {len(msgs)} new, "
+    limit = _tg.scrape_limit
+    saved = latest = info.get("tg_last_msg_id") or 0
+    fetched = findings = 0
+    error = None
+    for batch in range(1, TG_CATCHUP_BATCHES + 1):
+        msgs = _tg.fetch_new_messages(
+            info["tg_channel_id"],
+            since_msg_id=latest or None,
+            limit=limit,
+            username=username)
+        error = getattr(_tg, "last_fetch_error", None)
+        if error:
+            # A failed fetch returns [] and reads nothing; batches stored
+            # before it keep their cursor.
+            log.warning(f"[monitor] telegram @{username}: fetch failed "
+                        f"after {fetched} message(s): {error}")
+            break
+        for m in msgs:
+            if m["msg_id"] > latest:
+                latest = m["msg_id"]
+            # The live listener and a scrape store messages without moving
+            # the cursor, so a poll fetches them again; they are not new.
+            if _crawler.db.tg_message_seen(url_id, m["msg_id"]):
+                continue
+            findings += _crawler.scan_tg_message(url_id, username, m)
+            if _crawler.db.tg_message_seen(url_id, m["msg_id"]):
+                fetched += 1
+        # The fetch drops service messages (joins, pins) after they used
+        # up the limit, so the cursor and the caught-up test go by what it
+        # read: a run of `limit` service messages would otherwise return
+        # [] and stall the channel on them for good.
+        read = getattr(_tg, "last_fetch_count", len(msgs))
+        latest = max(latest, getattr(_tg, "last_fetch_max_id", 0) or 0)
+        if latest > saved:
+            _crawler.db.update_tg_last_msg_id(url_id, latest)
+            saved = latest
+        # A short batch means caught up. Without a mark (first check) the
+        # fetch is the newest batch, not a walk: older history is the
+        # scrape endpoint's job.
+        if read < limit or (batch == 1 and not info.get("tg_last_msg_id")):
+            break
+        if _monitor_stop.is_set():
+            break
+    else:
+        log.warning(f"[monitor] telegram @{username}: catch-up stopped at "
+                    f"{TG_CATCHUP_BATCHES} batches ({fetched} messages, up "
+                    f"to #{latest}); newer messages follow on the next check")
+    log.info(f"[monitor] telegram @{username}: {fetched} new, "
              f"{findings} finding(s)")
-    return len(msgs), findings
+    return fetched, findings, error
 
 
 def _monitor_one(url_id, url):
@@ -718,19 +782,29 @@ def _monitor_one(url_id, url):
 
         if source == "telegram":
             # Separate path — scraper uses its own SOCKS tunnel; crawl_site
-            # (Tor + Playwright) isn't relevant here.
-            with _tg_lock:
-                pages, findings = _monitor_tg_channel(url_id)
-            status = 200 if pages > 0 else 0
-            _crawler.db.update_scan(url_id, status)
+            # (Tor + Playwright) isn't relevant here. Takes _tg_lock
+            # itself, after its pre-fetch delay.
+            pages, findings, error = _monitor_tg_channel(url_id)
+            # urls.status keeps its meaning (200 = stored new messages,
+            # 0 = not). The event tells the two "0" cases apart: a failed
+            # fetch is status 0 with the reason as the note, a quiet
+            # channel (or one whose new messages the live listener already
+            # stored) is 204 "no new messages".
+            _crawler.db.update_scan(url_id, 200 if pages > 0 else 0)
+            if error:
+                ev_status, note = 0, error[:200]
+            elif pages > 0:
+                ev_status, note = 200, None
+            else:
+                ev_status, note = 204, "no new messages"
             row = _crawler.db.conn.execute(
                 "SELECT id FROM pages WHERE url_id = ? "
                 "ORDER BY scanned_at DESC LIMIT 1", (url_id,)
             ).fetchone()
             page_id = row[0] if row else None
             _crawler.db.add_monitor_event(
-                url_id, status=status, pages=pages,
-                findings=findings, page_id=page_id)
+                url_id, status=ev_status, pages=pages,
+                findings=findings, page_id=page_id, note=note)
             return
 
         # Default (legacy) path: .onion crawl via Tor.
@@ -788,8 +862,10 @@ def _maybe_auto_rescan():
 
 
 def _monitor_loop():
-    """Background scheduler. Wakes every MONITOR_TICK seconds, runs any
-    URL whose next_check_at has passed, schedules the next check.
+    """Background scheduler for .onion URLs. Wakes every MONITOR_TICK
+    seconds, runs any URL whose next_check_at has passed, schedules the
+    next check. Telegram channels have their own scheduler
+    (_tg_monitor_loop).
 
     Skips ticks where:
       - A manual scan is running (don't fight for the crawler).
@@ -810,7 +886,8 @@ def _monitor_loop():
             # extra bookkeeping here.
             _maybe_auto_rescan()
 
-            due = _crawler.db.get_monitored_due(utcnow().isoformat())
+            due = _crawler.db.get_monitored_due(
+                utcnow().isoformat(), exclude_source="telegram")
             if due:
                 # Hard security gate — same posture as manual scans.
                 health = _quick_health()
@@ -832,13 +909,74 @@ def _monitor_loop():
     log.info("Monitor scheduler stopped")
 
 
+def _tg_monitor_gate():
+    """The egress the Telegram client dials must be up: Tor's SOCKS port
+    with telegram.use_tor, the tg-socks sidecar (Tunnel 2) otherwise.
+    With no proxy_host and telegram.allow_direct the client connects
+    directly, so there is nothing to probe. Returns (name, check result)."""
+    if _tg.use_tor:
+        return "tor", _check_tor_alive()
+    if (not _tg.proxy_host
+            and _tg.config.get("telegram", {}).get("allow_direct")):
+        return "direct", {"ok": True,
+                          "detail": "direct connection (telegram.allow_direct)"}
+    return "tg_vpn", _check_tg_vpn()
+
+
+def _tg_monitor_tick():
+    """One pass of the Telegram scheduler: check every monitored channel
+    whose next_check_at has passed, then schedule its next check.
+    Returns the number of channels checked.
+
+    Independent of the .onion scheduler: a manual scan or a long site
+    crawl does not hold it up, and Tor being down only matters when
+    Telegram goes through Tor. Skips the tick when Telegram is not
+    configured or its egress is down."""
+    if not _tg.configured():
+        return 0
+    due = _crawler.db.get_monitored_due(
+        utcnow().isoformat(), source="telegram")
+    if not due:
+        return 0
+    name, gate = _tg_monitor_gate()
+    if not gate.get("ok"):
+        log.warning(f"[monitor] {len(due)} Telegram channel(s) due but "
+                    f"{name} is down ({gate.get('detail')}) — skipping")
+        return 0
+    checked = 0
+    for u in due:
+        if _monitor_stop.is_set():
+            break
+        _monitor_one(u["id"], u["url"])
+        _crawler.db.schedule_next_check(
+            u["id"], _next_check_at(u["interval_min"]))
+        checked += 1
+    return checked
+
+
+def _tg_monitor_loop():
+    """Background scheduler for Telegram channels, ticking every
+    MONITOR_TICK seconds like _monitor_loop."""
+    log.info(f"Telegram monitor started (tick={MONITOR_TICK}s)")
+    while not _monitor_stop.is_set():
+        try:
+            _tg_monitor_tick()
+        except Exception as e:
+            log.error(f"[monitor] telegram loop error: {e}")
+        _monitor_stop.wait(MONITOR_TICK)
+    log.info("Telegram monitor stopped")
+
+
 def _start_monitor_thread():
-    global _monitor_thread
-    if _monitor_thread and _monitor_thread.is_alive():
-        return
-    _monitor_thread = threading.Thread(
-        target=_monitor_loop, name="MonitorScheduler", daemon=True)
-    _monitor_thread.start()
+    global _monitor_thread, _tg_monitor_thread
+    if not (_monitor_thread and _monitor_thread.is_alive()):
+        _monitor_thread = threading.Thread(
+            target=_monitor_loop, name="MonitorScheduler", daemon=True)
+        _monitor_thread.start()
+    if not (_tg_monitor_thread and _tg_monitor_thread.is_alive()):
+        _tg_monitor_thread = threading.Thread(
+            target=_tg_monitor_loop, name="TelegramMonitor", daemon=True)
+        _tg_monitor_thread.start()
 
 
 # ── Real-time live-listener wiring ─────────────────────────────────────────
@@ -855,7 +993,11 @@ def _tg_live_on_message(channel_id, username, msg):
 
 def _tg_live_consumer():
     """Drain the live-event queue, scan each message under _tg_lock.
-    Same scan path as _monitor_tg_channel but one message at a time."""
+    Same scan path as _monitor_tg_channel but one message at a time.
+
+    Does not move tg_last_msg_id: polling is the only cursor, so messages
+    the listener missed (a disconnect, a full queue) below a live one are
+    still fetched by the next poll, which skips those already stored."""
     while not _tg_live_stop.is_set():
         try:
             ev = _tg_live_queue.get(timeout=1.0)
@@ -872,11 +1014,6 @@ def _tg_live_consumer():
             url_id, uname = row[0], row[1]
             with _tg_lock:
                 _crawler.scan_tg_message(url_id, uname, ev["msg"])
-                # Advance the high-water mark so the polling scheduler
-                # doesn't re-fetch this message.
-                info = _crawler.db.get_tg_channel(url_id)
-                if info and (info.get("tg_last_msg_id") or 0) < ev["msg"]["msg_id"]:
-                    _crawler.db.update_tg_last_msg_id(url_id, ev["msg"]["msg_id"])
             log.info(f"[tg-live] scanned @{uname} #{ev['msg']['msg_id']}")
         except Exception as e:
             log.error(f"[tg-live] consumer error: {e}")
@@ -1696,6 +1833,7 @@ def route_tg_scrape(url_id):
     fetched_total = 0
     found = 0
     latest_id = info.get("tg_last_msg_id") or 0
+    fetch_error = None
     with _tg_lock:
         # min_id cursor walks BACKWARD through history. On the first
         # batch we fetch the newest N; subsequent batches use max_id
@@ -1703,8 +1841,9 @@ def route_tg_scrape(url_id):
         # expose max_id — simplest multi-batch impl: loop with offset
         # reduction by the last msg_id seen.
         earliest_seen = None
-        while fetched_total < total_cap:
-            remaining = total_cap - fetched_total
+        read_total = 0
+        while read_total < total_cap:
+            remaining = total_cap - read_total
             this_batch = min(batch_size, remaining)
             msgs = _tg.fetch_new_messages(
                 info["tg_channel_id"],
@@ -1712,7 +1851,17 @@ def route_tg_scrape(url_id):
                 limit=this_batch,
                 username=username,
                 before_msg_id=earliest_seen)
-            if not msgs: break
+            # Read inside the lock: the next Telegram call resets it.
+            fetch_error = _tg.last_fetch_error
+            # The fetch drops service messages (joins, pins) after they
+            # used up the limit, so the walk and the exhausted test go by
+            # what it read, as polling does: a short list is not the end
+            # of the history.
+            read = getattr(_tg, "last_fetch_count", len(msgs))
+            if not read: break
+            low = getattr(_tg, "last_fetch_min_id", 0) or 0
+            if low and (earliest_seen is None or low < earliest_seen):
+                earliest_seen = low
             for m in msgs:
                 found += _crawler.scan_tg_message(url_id, username, m)
                 if m["msg_id"] > (latest_id or 0):
@@ -1720,13 +1869,20 @@ def route_tg_scrape(url_id):
                 if earliest_seen is None or m["msg_id"] < earliest_seen:
                     earliest_seen = m["msg_id"]
             fetched_total += len(msgs)
-            if len(msgs) < this_batch:
+            read_total += read
+            if read < this_batch:
                 break   # channel history exhausted
-        if latest_id:
+        # The scrape fetches the newest messages, so it may not reach down
+        # to the polling cursor. Raise the cursor only when it did (or
+        # there is none yet); otherwise polling still has to walk the gap
+        # between the old cursor and the oldest message scraped.
+        old_mark = info.get("tg_last_msg_id") or 0
+        if latest_id and (not old_mark or (earliest_seen is not None
+                                           and earliest_seen <= old_mark + 1)):
             _crawler.db.update_tg_last_msg_id(url_id, latest_id)
         # Deep mode ALSO re-runs rules over everything we've stored so
-        # newly-added keywords catch up. Idempotent — purges prior
-        # findings on each message before re-evaluating.
+        # newly-added keywords catch up. It only adds findings, so it is
+        # safe to repeat.
         rescan_findings = 0
         if deep:
             r = _crawler.rescan_tg_channel(url_id)
@@ -1736,18 +1892,24 @@ def route_tg_scrape(url_id):
     _crawler.db.update_scan(url_id, 200 if fetched_total else 404)
     log.info(f"[tg-scrape] @{username} fetched={fetched_total} findings={found}")
     if not fetched_total:
-        reason = _tg.last_fetch_error or (
+        reason = fetch_error or (
             "Telegram returned an empty result set. "
             "For private channels, make sure your Telegram account is a "
             "member (use the Join button).")
         return jsonify({"fetched": 0, "findings": 0,
                         "last_msg_id": latest_id,
                         "warning": f"no messages returned — {reason}"})
-    return jsonify({"fetched": fetched_total,
-                    "findings": found + rescan_findings,
-                    "rescan_findings": rescan_findings if deep else None,
-                    "last_msg_id": latest_id,
-                    "deep": deep})
+    out = {"fetched": fetched_total,
+           "findings": found + rescan_findings,
+           "rescan_findings": rescan_findings if deep else None,
+           "last_msg_id": latest_id,
+           "deep": deep}
+    if fetch_error:
+        # A later batch failed: what came before is stored, but the
+        # scrape stopped short of the requested size.
+        out["warning"] = (f"partial scrape: {fetched_total} message(s) "
+                          f"fetched, then stopped — {fetch_error}")
+    return jsonify(out)
 
 
 @app.route("/api/telegram/channels/<int:url_id>/join", methods=["POST"])
@@ -1799,8 +1961,8 @@ def route_tg_leave(url_id):
 def route_tg_rescan(url_id):
     """Re-run YARA rules over every stored message for this channel.
     Use after adding new keywords — without this, old messages stay
-    unevaluated because `pages.content_hash` dedup skips them on
-    re-scrape."""
+    unevaluated because a re-scrape skips messages already stored. Only
+    adds findings; existing ones, including those of deleted rules, stay."""
     if not _crawler.db.url_exists(url_id):
         abort(404)
     info = _crawler.db.get_tg_channel(url_id)
@@ -1963,17 +2125,23 @@ def route_tg_search():
             msgs = _tg.search_in_channel(
                 info["tg_channel_id"], q, limit=limit, min_date_iso=since,
                 username=info.get("tg_username"))
+            err = _tg.last_search_error
         # Enrich with channel_username so the UI can build t.me links.
         for m in msgs:
             m["channel_username"] = info["tg_username"]
         # Exact keyword hits first; Telegram's fuzzy matches after.
         msgs.sort(key=lambda m: not m.get("exact_match"))
-        return jsonify({"scope": "channel", "hits": len(msgs),
-                        "results": msgs})
+        out = {"scope": "channel", "hits": len(msgs), "results": msgs}
+        if err:
+            # Without this a failed search reads as "0 matches".
+            out["errors"] = [{"channel": info["tg_username"],
+                              "url_id": url_id, "error": err}]
+        return jsonify(out)
 
     if scope == "all":
         channels = _crawler.db.get_url_rows(limit=500, source="telegram")
         out = []
+        errors = []
         with _tg_lock:
             for ch in channels:
                 if not ch.get("tg_channel_id"):
@@ -1983,14 +2151,21 @@ def route_tg_search():
                     limit=max(5, limit // max(1, len(channels))),
                     min_date_iso=since,
                     username=ch.get("tg_username"))
+                if _tg.last_search_error:
+                    errors.append({"channel": ch.get("tg_username"),
+                                   "url_id": ch["id"],
+                                   "error": _tg.last_search_error})
                 for m in hits:
                     m["channel_username"] = ch["tg_username"]
                     m["url_id"] = ch["id"]
                 out.extend(hits)
         out.sort(key=lambda m: m.get("date_iso") or "", reverse=True)
         out.sort(key=lambda m: not m.get("exact_match"))   # stable: exact first
-        return jsonify({"scope": "all", "channels_searched": len(channels),
-                        "hits": len(out), "results": out[:limit * 3]})
+        resp = {"scope": "all", "channels_searched": len(channels),
+                "hits": len(out), "results": out[:limit * 3]}
+        if errors:
+            resp["errors"] = errors
+        return jsonify(resp)
 
     return jsonify({"error": f"unknown scope: {scope}"}), 400
 
@@ -2029,15 +2204,20 @@ def route_tg_search_deep():
     # Load the selected mode's rate limits + per-search budget onto the
     # shared scraper. Subsequent stages consult _tg.budget_remaining() /
     # _tg._spend() so a single keyword hunt can't nuke Telegram's patience.
-    budget = _tg.set_mode(mode) if _tg.configured() else 0
-
+    # Live stages need a signed-in session, not just API credentials:
+    # without one every channel search fails and the hunt would report
+    # 0 hits instead of saying why.
     tg_configured = _tg.configured()
+    tg_ready = bool(tg_configured and _tg.status().get("authenticated"))
+    budget = _tg.set_mode(mode) if tg_ready else 0
+
     db = _crawler.db
 
     def stream():
         all_results = []
         searched_channels = set()
-        discovered = []   # list of {handle, via, hits, status}
+        discovered = []   # list of {handle, via, hits, status[, error]}
+        errors = []       # {channel, url_id, error} per failed live search
         budget_exhausted_at = None   # stage number when we ran out
 
         def emit(event, data):
@@ -2063,6 +2243,14 @@ def route_tg_search_deep():
                 msgs = _tg.search_in_channel(
                     channel_id, q, limit=50, min_date_iso=since,
                     username=username)
+                err = _tg.last_search_error
+            if err:
+                errors.append({"channel": username, "url_id": url_id,
+                               "error": err})
+                discovered.append({"handle": username, "via": via,
+                                    "hits": 0, "status": "error",
+                                    "error": err})
+                return 0
             for m in msgs:
                 m["channel_username"] = username
                 m["url_id"] = url_id
@@ -2087,10 +2275,16 @@ def route_tg_search_deep():
         yield emit("progress", {"stage": 1, "hits": len(local),
                                  "results": local[:20]})
 
-        if not tg_configured:
+        if not tg_ready:
+            # status()["authenticated"] is cached False for a while after
+            # any failed check, so a proxy blip reads the same as a lost
+            # login; say both rather than send the operator to re-sign-in.
+            why = ("Telegram not configured" if not tg_configured else
+                   "Telegram session not signed in or unreachable "
+                   "(see Telegram tab)")
             yield emit("done", {"total_hits": len(all_results),
                                  "discovered": discovered,
-                                 "note": "skipped live stages — not authenticated"})
+                                 "note": f"skipped live stages — {why}"})
             return
 
         # Stage 2: known channels via Telethon
@@ -2215,11 +2409,14 @@ def route_tg_search_deep():
 
         # Final
         all_results.sort(key=lambda m: m.get("date_iso") or "", reverse=True)
-        yield emit("done", {"total_hits": len(all_results),
-                             "discovered": discovered,
-                             "results": all_results[:200],
-                             "budget_remaining": _tg.budget_remaining(),
-                             "mode": mode})
+        done = {"total_hits": len(all_results),
+                "discovered": discovered,
+                "results": all_results[:200],
+                "budget_remaining": _tg.budget_remaining(),
+                "mode": mode}
+        if errors:
+            done["errors"] = errors
+        yield emit("done", done)
 
     return Response(stream(), mimetype="text/event-stream",
                     headers={"X-Accel-Buffering": "no",

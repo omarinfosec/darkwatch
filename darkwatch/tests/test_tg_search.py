@@ -1,5 +1,6 @@
 """Telegram keyword-search correctness: date filter, exact-match flag,
-LIKE escaping, scam/fake ranking and the no-direct-connection guard."""
+failure reason, LIKE escaping, scam/fake ranking and the
+no-direct-connection guard."""
 
 import os
 import sys
@@ -61,6 +62,23 @@ def test_search_in_channel_since_keeps_newer_and_flags_exact(monkeypatch):
     assert [m["exact_match"] for m in out] == [True, True, False]
     # Must not pass offset_date (that walks OLDER than the date).
     assert "offset_date" not in fake.kwargs
+
+
+class _FloodClient(_FakeClient):
+    def iter_messages(self, **kwargs):
+        from telethon.errors import FloodWaitError
+        raise FloodWaitError(request=None, capture=42)
+
+
+def test_search_in_channel_records_why_it_failed(monkeypatch):
+    eng = _engine()
+    monkeypatch.setattr(eng, "_build_client", lambda: _FloodClient([]))
+    assert eng.search_in_channel(123, "lockbit") == []
+    assert eng.last_search_error == "flood wait: 42s"
+    # A search that runs clears it, even with no hits.
+    monkeypatch.setattr(eng, "_build_client", lambda: _FakeClient([]))
+    assert eng.search_in_channel(123, "lockbit") == []
+    assert eng.last_search_error is None
 
 
 def test_build_client_refuses_direct_connection():

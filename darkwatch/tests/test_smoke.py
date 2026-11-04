@@ -227,8 +227,9 @@ if __name__ == "__main__":
 
 
 def test_rescan_tg_channel_is_idempotent_and_releases_db_lock(tmp_path):
-    """Prior findings are purged under db.lock in one transaction; the YARA
-    pass (which takes the non-reentrant db.lock itself) runs after it."""
+    """A repeated rescan adds nothing (it only adds findings, it no longer
+    purges them), and the YARA pass, which takes the non-reentrant db.lock
+    itself, runs without it held."""
     from types import SimpleNamespace
     from darkwatch import Database, DarkWebCrawler
 
@@ -246,19 +247,22 @@ def test_rescan_tg_channel_is_idempotent_and_releases_db_lock(tmp_path):
             (page_id, url_id, msg_id, f"message {msg_id}"))
     db.conn.commit()
 
-    def fake_match(url_id_, page_url, text):
+    def fake_match(url_id_, page_url, text, bump=True):
         # Would deadlock if rescan still held db.lock here.
         assert db.lock.acquire(timeout=1)
         db.lock.release()
-        db.add_finding(url_id_, page_url, "r", "keyword:text", 50, "m", "s", "medium")
-        return 1
+        assert bump is False
+        return int(db.add_finding(url_id_, page_url, "r", "keyword:text", 50,
+                                  "m", "s", "medium", bump=bump))
 
     fake = SimpleNamespace(db=db, _yara_match_text=fake_match)
-    for _ in range(2):
-        out = DarkWebCrawler.rescan_tg_channel(fake, url_id)
-        assert out == {"scanned": 2, "findings": 2}
-    # Second run purged the first run's findings instead of doubling them.
-    assert db.conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 2
+    assert DarkWebCrawler.rescan_tg_channel(fake, url_id) == \
+        {"scanned": 2, "findings": 2}
+    # The second run finds the same rows: nothing new, nothing doubled.
+    assert DarkWebCrawler.rescan_tg_channel(fake, url_id) == \
+        {"scanned": 2, "findings": 0}
+    assert db.conn.execute(
+        "SELECT COUNT(*), MAX(occurrence_count) FROM findings").fetchone() == (2, 1)
 
 
 def test_utcnow_is_naive_utc():

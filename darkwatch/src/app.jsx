@@ -1169,15 +1169,19 @@ function Timeline({ urlId, onLightbox }) {
             <div className="space-y-1.5">
                 {events.map(e => {
                     const ok = e.status === 200;
+                    // 204: a Telegram check that ran and found no new
+                    // messages. Grey, not red: nothing failed.
+                    const idle = e.status === 204;
+                    const dot = ok ? "bg-emerald-400" : idle ? "bg-gray-500" : "bg-red-400";
+                    const tone = ok ? "text-emerald-400" : idle ? "text-gray-500" : "text-red-400";
                     return (
                         <div key={e.id} className="flex items-center gap-3
                                                    bg-gray-950 border border-gray-800
                                                    rounded px-2 py-1.5 text-xs">
-                            <span className={"inline-block w-2 h-2 rounded-full flex-shrink-0 " +
-                                (ok ? "bg-emerald-400" : "bg-red-400")} />
+                            <span className={"inline-block w-2 h-2 rounded-full flex-shrink-0 " + dot} />
                             <span className="mono text-gray-400 w-44 flex-shrink-0">{e.checked_at}</span>
-                            <span className={"mono w-12 " + (ok ? "text-emerald-400" : "text-red-400")}>
-                                {e.status || "fail"}
+                            <span className={"mono w-12 " + tone}>
+                                {idle ? "idle" : (e.status || "fail")}
                             </span>
                             <span className="text-gray-500 w-32">
                                 {e.pages} page · {e.findings} finding
@@ -2895,6 +2899,22 @@ function DeepSearchStages({ current, stats, budgetExhausted }) {
     );
 }
 
+// Per-channel live-search failures (flood wait, expired session…) from
+// /api/telegram/search and the deep-search "done" event.
+function SearchErrors({ errors }) {
+    if (!errors?.length) return null;
+    return (
+        <div className="mt-1 text-red-400">
+            {errors.length} channel search{errors.length !== 1 ? "es" : ""} failed:
+            {errors.map((e, i) => (
+                <div key={i} className="mono text-[11px]">
+                    @{e.channel}: {e.error}
+                </div>
+            ))}
+        </div>
+    );
+}
+
 function DiscoveryList({ discovered }) {
     if (!discovered.length) return null;
     return (
@@ -2915,7 +2935,9 @@ function DiscoveryList({ discovered }) {
                             <DiscoveryViaPill via={d.via} />
                             {d.hits > 0 && <Pill tone="emerald">{d.hits} hits</Pill>}
                             {!alive && d.status && (
-                                <span className="text-red-400 text-[10px]">{d.status}</span>
+                                <span className="text-red-400 text-[10px]">
+                                    {d.status}{d.error ? `: ${d.error}` : ""}
+                                </span>
                             )}
                         </div>
                     );
@@ -3487,6 +3509,10 @@ function TgSmartSearch({ disabled, channels, onOpenChannel,
     const [deepDone, setDeepDone] = useState(false);
     const [budget, setBudget] = useState(null);             // {total, remaining}
     const [budgetExhausted, setBudgetExhausted] = useState(false);
+    // Channels whose live search failed, and why the live stages were
+    // skipped: shown so a failure does not read as "no results".
+    const [deepErrors, setDeepErrors] = useState([]);
+    const [deepNote, setDeepNote] = useState("");
 
     const esRef = useRef(null);
 
@@ -3512,6 +3538,7 @@ function TgSmartSearch({ disabled, channels, onOpenChannel,
         setCurrentStage(0); setStageStats({});
         setDeepResults([]); setDiscovered([]); setChains([]);
         setDeepDone(false); setBudget(null); setBudgetExhausted(false);
+        setDeepErrors([]); setDeepNote("");
 
         const params = new URLSearchParams({
             q: q.trim(), max_hops: "2", mode: scanMode,
@@ -3553,6 +3580,8 @@ function TgSmartSearch({ disabled, channels, onOpenChannel,
         es.addEventListener("done", (ev) => {
             const d = JSON.parse(ev.data);
             setDiscovered(d.discovered || []);
+            setDeepErrors(d.errors || []);
+            setDeepNote(d.note || "");
             if (d.results) setDeepResults(d.results);
             if (d.budget_remaining != null) {
                 setBudget(b => b ? { ...b, remaining: d.budget_remaining } : b);
@@ -3715,6 +3744,13 @@ function TgSmartSearch({ disabled, channels, onOpenChannel,
                     {result.hits} match{result.hits !== 1 ? "es" : ""}
                     {result.channels_searched != null &&
                         ` across ${result.channels_searched} channel${result.channels_searched !== 1 ? "s" : ""}`}
+                    <SearchErrors errors={result.errors} />
+                </div>
+            )}
+            {mode === "deep" && deepDone && (deepNote || deepErrors.length > 0) && (
+                <div className="text-xs text-gray-400">
+                    {deepNote && <div className="text-yellow-400">{deepNote}</div>}
+                    <SearchErrors errors={deepErrors} />
                 </div>
             )}
 
@@ -5310,7 +5346,9 @@ function App() {
               body: JSON.stringify({ limit: size, deep: !!deep }) });
         if (ok) {
             if (body.warning) {
-                setToast(`⚠ ${body.warning}`);
+                // A partial scrape still stored what it fetched.
+                const got = body.fetched ? `${body.findings} finding(s) — ` : "";
+                setToast(`⚠ ${got}${body.warning}`);
             } else {
                 const extra = body.rescan_findings != null
                     ? ` (rescan: +${body.rescan_findings})` : "";
@@ -5362,7 +5400,7 @@ function App() {
         const { ok, body } = await api(
             `/api/telegram/channels/${urlId}/rescan`, { method: "POST" });
         if (ok) {
-            setToast(`Rescanned ${body.scanned} msg, ${body.findings} finding(s)`);
+            setToast(`Rescanned ${body.scanned} msg, ${body.findings} new finding(s)`);
             fetchFindings();
         } else {
             setToast(body.error || "Rescan failed");

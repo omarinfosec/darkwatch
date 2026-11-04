@@ -45,6 +45,79 @@
   dropped before fetching because a site crawl stays on the seed host, so
   nothing left the target. A malformed link such as `http://[::1` on a
   page is now skipped; it used to end that site's crawl with an error.
+- Telegram monitoring no longer skips messages. When a channel posted more
+  than one batch (`telegram.scrape_limit_per_tick`, 100 by default) between
+  two checks, a check fetched only the newest batch and moved the channel's
+  cursor past everything older. A check now fetches oldest first from the
+  cursor, up to 5 batches, and saves the cursor after each batch; when a
+  channel has more than that, it logs a warning and the next check
+  continues. Service messages (joins, pins, title changes) count toward a
+  batch even though they are not stored, so a run of them no longer stalls
+  a channel's polling or ends a catch-up early, and a manual scrape of 1000
+  or "all" no longer stops after its first 500-message batch when that
+  batch held one. A manual scrape
+  (`/api/telegram/channels/<id>/scrape`) fetches the newest messages and
+  moved the cursor to the newest one, past any messages between the old
+  cursor and the oldest one scraped; it now moves the cursor only when it
+  reached down to it, and otherwise leaves the gap to polling. The cursor
+  (`tg_last_msg_id`) never moves back and is still the id that polling
+  fetches above, so rolling back needs no database restore.
+- The live Telegram listener (`telegram.live_enabled`, off by default) keeps
+  posts with media and no caption; it dropped them. It no longer moves the
+  channel's cursor either: polling is the only cursor, so messages the
+  listener missed (a disconnect, a full queue) are still fetched by the next
+  check.
+- Telegram reposts are no longer dropped. A message whose text had been seen
+  before, in another channel or earlier in the same one (such as a repeated
+  "ok"), was skipped entirely: no message row for that channel and no
+  findings. Each message is now stored and scanned once per channel, so each
+  channel gets its own findings. A repost alerts only for rules that matched
+  no earlier copy, so an alert is not sent twice, but a keyword added after
+  the first copy still alerts on the repost. A message fetched twice (by
+  polling, the live listener or a scrape) is still stored once.
+- The per-channel Telegram rescan (`/api/telegram/channels/<id>/rescan`,
+  the Rescan button and a deep scrape) no longer deletes findings, like
+  `/api/rescan` since v0.3.1: findings of rules that no longer match or were
+  deleted stay, rows it matches again keep their `occurrence_count` and
+  `last_seen_at`, its `findings` count is the number of new rows, and only
+  new rows alert.
+- Telegram failures no longer show as "no results":
+  - A monitor check whose fetch fails (flood wait, expired session, a
+    network error) records a timeline event with status 0 and the reason as
+    its note. A check that ran and stored nothing new records status 204
+    with "no new messages", shown as a grey "idle" in the timeline; messages
+    the live listener or a scrape already stored do not count as new. The
+    URL's own `status` is unchanged (200 when new messages were stored, 0
+    otherwise).
+  - A manual scrape that fails after the first batch returns a `warning`
+    ("partial scrape: N message(s) fetched, then stopped — <reason>"); what
+    it fetched is stored.
+  - `/api/telegram/search` (`channel` and `all` scopes) and the deep search
+    return an `errors` list (`channel`, `url_id`, `error`) when a channel
+    search failed, and leave it out otherwise; the deep search marks such a
+    channel `status: "error"`. The dashboard shows them.
+  - The deep search runs its live stages only when Telegram is configured
+    and signed in; before, a configured but signed-out session searched
+    every channel and reported 0 hits. Its note says which check failed:
+    "Telegram not configured", or "Telegram session not signed in or
+    unreachable" (the sign-in check also fails while the tunnel is down).
+  - The scraper's error fields (`last_fetch_error` and the new
+    `last_search_error`) are read under the Telegram lock, so another
+    Telegram call cannot clear them before the response is built.
+- Telegram monitoring no longer waits for crawls or for Tor. Monitored
+  channels were checked by the `.onion` scheduler, so they were skipped
+  while a manual scan ran, while a site crawl was in progress and whenever
+  Tor or Tunnel 1 was down, even though Telegram goes through Tunnel 2. A
+  separate scheduler thread (`TelegramMonitor`) now checks them every
+  30 seconds like the `.onion` one. It checks only that the route
+  Telegram uses is up: Tor's SOCKS port with `telegram.use_tor`, the
+  `tg-socks` sidecar otherwise, nothing with `telegram.allow_direct` and
+  no `telegram.proxy_host`; it skips the check while Telegram is not
+  configured. The `.onion` scheduler works as before for everything else.
+  A check's 0-15 s random pre-fetch delay no longer holds the Telegram
+  lock, so it does not hold up a sign-in, search or scrape, and the
+  channel's cursor is read after the delay, so a scrape during the delay
+  is taken into account.
 
 ### Internal
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
@@ -128,6 +201,12 @@
   credential check against a fake client (five outcomes, the Tunnel 2 proxy
   passed through). The dashboard test fixture no longer leaks
   `DARKWATCH_CONFIG` and `DARKWATCH_BIND_IP` into later test modules.
+- New `darkwatch/tests/test_tg_ingest.py` covers the Telegram cursor,
+  catch-up cap, service messages, manual scrape, live listener, reposts,
+  per-channel rescan, and how fetch and search failures are reported.
+  The dashboard test fixture moved to `darkwatch/tests/conftest.py` and is
+  session-scoped, so test modules share the one import of `web`; it still
+  sets its environment only around that import.
 
 ## v0.3.1 — 2026-11-04
 
