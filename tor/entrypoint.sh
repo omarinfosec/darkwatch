@@ -8,8 +8,9 @@ TORRC=/etc/tor/run/torrc
 
 if [[ -z "${TOR_CONTROL_PASSWORD:-}" ]]; then
     echo "[tor entrypoint] FATAL: TOR_CONTROL_PASSWORD is unset." >&2
-    echo "[tor entrypoint]   Set it in /var/lib/darkwebapp/env (host) so it" >&2
-    echo "[tor entrypoint]   propagates here via compose env_file." >&2
+    echo "[tor entrypoint]   Set it in /var/lib/darkwebapp/env (host); compose passes" >&2
+    echo "[tor entrypoint]   it here through tor's environment: entry, read from the" >&2
+    echo "[tor entrypoint]   repo .env link or --env-file (ops/deploy.sh uses the latter)." >&2
     exit 1
 fi
 

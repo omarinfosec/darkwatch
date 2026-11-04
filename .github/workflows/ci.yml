@@ -17,26 +17,41 @@ jobs:
       matrix:
         suite: [darkwatch, setup]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"   # matches the Docker images
           cache: pip
-          cache-dependency-path: ${{ matrix.suite }}/requirements.txt
+          cache-dependency-path: |
+            ${{ matrix.suite }}/requirements.txt
+            requirements-dev.txt
       - name: Install dependencies
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: |
           python -m pip install --upgrade pip
-          pip install -r ${{ matrix.suite }}/requirements.txt pytest httpx
+          pip install -r ${{ matrix.suite }}/requirements.txt
+      - name: Install test tools
+        run: pip install -r requirements-dev.txt
       - name: Run tests
-        run: python -m pytest -q ${{ matrix.suite }}/tests
+        # -rs lists every skipped test and why, so a missing test
+        # dependency cannot hide a suite.
+        run: python -m pytest -q -rs ${{ matrix.suite }}/tests
 
   shell-and-compose:
     name: Shell syntax + compose config
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install shellcheck (pinned)
+        run: pip install shellcheck-py==0.11.0.1 && shellcheck --version
       - name: bash -n on all ops scripts
         run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
       - name: shellcheck (errors only)
@@ -53,8 +68,9 @@ jobs:
         run: sudo bash tests/verify-egress/check.sh
       - name: docker compose config
         run: |
-          data="$(mktemp -d)" && touch "$data/env"
-          DARKWEBAPP_DATA_ROOT="$data" docker compose \
+          data="$(mktemp -d)"
+          printf 'TOR_CONTROL_PASSWORD=ci\nSETUP_AUTH_TOKEN=ci-sentinel\n' > "$data/env"
+          DARKWEBAPP_DATA_ROOT="$data" docker compose --env-file "$data/env" \
             --profile tor --profile tg --profile setup config -q
-      - name: compose DNS isolation (darkwatch dns 127.0.0.1, no other service)
+      - name: compose checks (DNS isolation, env scoping, TOR_CONTROL_PASSWORD required)
         run: bash tests/compose/check.sh

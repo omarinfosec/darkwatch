@@ -56,6 +56,9 @@ ENV_FILE = DATA_ROOT / "env"
 SECRETS_ROOT = DATA_ROOT / "secrets"
 TUNNEL1_CONF = SECRETS_ROOT / "tunnel1" / "wg_confs" / "wg0.conf"
 TUNNEL2_CONF = SECRETS_ROOT / "tunnel2" / "wg_confs" / "wg0.conf"
+# Locally built by deploy.sh; must match the tor service's image: in
+# docker-compose.yml.
+TOR_IMAGE = "darkwatch-tor:local"
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 _SETUP_CONTAINERS = ("darkwatch", "tunnel1", "tunnel2", "tor", "tg-socks", "setup")
@@ -168,6 +171,22 @@ app = FastAPI(title="DarkWatch Setup", docs_url=None, redoc_url=None)
 _BASE = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=_BASE / "static"), name="static")
 templates = Jinja2Templates(directory=_BASE / "templates")
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Same baseline headers as the dashboard. Pages here show WireGuard
+    keys and Telegram credentials, so nothing but /static/ may be cached."""
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    # Not no-referrer: _same_origin falls back to Referer for older clients.
+    h.setdefault("Referrer-Policy", "same-origin")
+    if not request.url.path.startswith("/static/"):
+        h["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -353,6 +372,23 @@ async def save_tunnel(request: Request, n: int, conf: str = Form(...)):
     except (PermissionError, OSError):
         pass
 
+    # tor is built locally by deploy.sh; setup cannot build it (see
+    # _compose_up_tunnel). The config is saved either way.
+    if n == 1 and _image_missing(TOR_IMAGE):
+        log.error("tunnel1 saved but %s is not built yet", TOR_IMAGE)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "saved": True,
+                "error": (
+                    f"tunnel1 config saved, but the tor image {TOR_IMAGE} "
+                    "has not been built yet. On the VM, run sudo ./ops/deploy.sh "
+                    "(it builds the image and starts tunnel1 + tor)."
+                ),
+            },
+        )
+
     # Recreate this tunnel + its sidecar. A plain `up -d` is a no-op when the
     # container already exists (only the mounted file changed), so an edited
     # WG config would otherwise never be applied.
@@ -426,11 +462,37 @@ def _compose_profiles() -> list[str]:
     return profiles
 
 
+# Process env passed to `docker`. This container's env was loaded from the env
+# file when it was created, and compose prefers process env over --env-file,
+# so passing it on would recreate services with stale values (an old
+# DARKWATCH_IP outside the lockdown rule, an old TG_SOCKS_PASSWORD or
+# TOR_CONTROL_PASSWORD). Only what the docker CLI itself needs goes through;
+# every compose variable comes from the live env file.
+_DOCKER_ENV_KEYS = {"PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TMPDIR"}
+_DOCKER_ENV_PREFIXES = ("LC_", "DOCKER_")
+_PROXY_ENV_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"}
+
+
+def _docker_env() -> dict[str, str]:
+    env = {
+        k: v for k, v in os.environ.items()
+        if k in _DOCKER_ENV_KEYS
+        or k.startswith(_DOCKER_ENV_PREFIXES)
+        or k.upper() in _PROXY_ENV_KEYS
+    }
+    # Setup's own DARKWEBAPP_DATA_ROOT=/data must not reach compose variable
+    # substitution — that would bind-mount bogus host paths like /data/darkwatch/...
+    env["DARKWEBAPP_DATA_ROOT"] = str(HOST_DATA_ROOT)
+    env["DARKWATCH_HOST_REPO_ROOT"] = str(HOST_REPO_ROOT)
+    return env
+
+
 def _compose_run(
     services: list[str],
     *,
     force_recreate: bool = False,
     no_deps: bool = False,
+    no_build: bool = False,
 ) -> tuple[bool, str]:
     """Run docker compose up for `services`. Use force_recreate when env vars
     on disk changed — a plain container restart does NOT reload env_file."""
@@ -465,12 +527,9 @@ def _compose_run(
         cmd.append("--force-recreate")
     if no_deps:
         cmd.append("--no-deps")
+    if no_build:
+        cmd.append("--no-build")
     cmd.extend(services)
-
-    # Setup's own DARKWEBAPP_DATA_ROOT=/data must not leak into compose variable
-    # substitution — that would bind-mount bogus host paths like /data/darkwatch/...
-    compose_env = os.environ.copy()
-    compose_env["DARKWEBAPP_DATA_ROOT"] = str(HOST_DATA_ROOT)
 
     try:
         proc = subprocess.run(
@@ -478,7 +537,7 @@ def _compose_run(
             capture_output=True,
             text=True,
             timeout=300,
-            env=compose_env,
+            env=_docker_env(),
         )
     except subprocess.TimeoutExpired:
         return False, "docker compose up timed out after 5 minutes"
@@ -488,15 +547,34 @@ def _compose_run(
     return True, ", ".join(services)
 
 
+def _image_missing(image: str) -> bool:
+    """True only when `docker image inspect` says the image is not there.
+    Other failures (no CLI, timeout, daemon unreachable, socket permission)
+    are left for compose to report."""
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_docker_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode != 0 and "no such image" in (proc.stderr or "").lower()
+
+
 def _compose_up_tunnel(n: int) -> tuple[bool, str]:
     """Force-recreate tunnel N and its sidecar so a new WG config takes effect.
-    Only the listed services are force-recreated; the other tunnel is untouched."""
+    Only the listed services are force-recreated; the other tunnel is untouched.
+    --no-build: this container cannot build (the build contexts are host
+    paths), so a missing image would only fail with an obscure error."""
     services = ["tunnel1", "tor"] if n == 1 else ["tunnel2", "tg-socks"]
-    ok, detail = _compose_run(services, force_recreate=True)
+    ok, detail = _compose_run(services, force_recreate=True, no_build=True)
     if not ok:
         return ok, detail
     # Make sure darkwatch is up too (no-op when it already is).
-    ok, more = _compose_run(["darkwatch"], no_deps=True)
+    ok, more = _compose_run(["darkwatch"], no_deps=True, no_build=True)
     return ok, f"{detail}, {more}" if ok else more
 
 

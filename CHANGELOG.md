@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.3.1 — 2026-11-04
+
+Fix release. v0.3.0's deploy.sh stopped silently on default installs and
+never rebuilt the Setup UI; upgrade as described below.
 
 ### Upgrade notes
 - From v0.2.0 or v0.3.0, pull first and then deploy:
@@ -52,6 +55,17 @@
 - The Setup UI rejects a WireGuard config without a `DNS =` line. Check that
   a hand-placed tunnel2 `wg0.conf` has one; `verify-egress.sh` warns when
   tunnel2 still resolves through Docker's embedded DNS.
+- The first start after upgrading adds three indexes on the `pages` table
+  (`content_hash`, `(url_id, scanned_at)`, `(url_id, page_url)`); this takes
+  about a second per 150k pages. They are not UNIQUE, so a rolled-back
+  release still runs against the database.
+- Every `docker compose` command now needs `TOR_CONTROL_PASSWORD` (tor gets
+  it by variable substitution instead of the whole env file) and fails with
+  "TOR_CONTROL_PASSWORD unset: is the repo .env linked to the operator env
+  file?" without it. `install.sh` generates it and `deploy.sh` already
+  requires it; run plain `docker compose` from `/opt/darkwebapp` with the
+  `.env` link in place, or pass `--env-file /var/lib/darkwebapp/env`. The
+  first deploy recreates tor and darkwatch.
 
 ### Security
 - The tunnel kill switch also drops new connections that arrive through
@@ -69,6 +83,59 @@
   keep the host's DNS, which hostname Endpoints need.
 - The Setup UI requires a `DNS =` line in WireGuard configs, so tg-socks
   resolves Telegram's names through the VPN instead of Docker's embedded DNS.
+- The dashboard's `ip_leak` gate fails when the egress lockdown is missing.
+  It passed whenever the direct IP lookup failed, and with darkwatch's DNS
+  isolated that lookup always fails, lockdown or not. With the lockdown on it
+  now opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` (2 s timeout,
+  no DNS, independent of the Tor check) and passes only when both time out
+  or fail with no route or `EPERM`. A completed connection fails the gate
+  with "run sudo ./ops/egress-lockdown.sh"; `ECONNREFUSED` fails it too and
+  says so, since the lockdown drops and never refuses. The detail shows each
+  probe's errno. Both probes run in parallel with the other health checks,
+  so with the lockdown on the gate takes about 2 s.
+  With `DARKWATCH_EGRESS_LOCKDOWN=0` it keeps the old, weaker comparison of
+  the Tor exit IP with the direct IP.
+- Saves in the Setup UI recreate containers with the current env file. The
+  Setup UI passed its own environment, loaded from the env file when the
+  Setup UI was created, to `docker compose`, which prefers it over
+  `--env-file`. A save could then put darkwatch back on an old
+  `DARKWATCH_IP` outside the lockdown rule, or start tg-socks and tor with an
+  old `TG_SOCKS_PASSWORD` or `TOR_CONTROL_PASSWORD`. It now passes only
+  `PATH`, `HOME`, locale, `TZ`, `TMPDIR`, `DOCKER_*`, the proxy variables and
+  its host paths.
+- The dashboard's request guard also covers GET requests. It checked only
+  writes, so a page the operator visited could trigger a live Telegram user
+  lookup (`<img src=".../api/telegram/user/...?download=1">`) or an export
+  through the operator's browser. Any request with `Sec-Fetch-Site:
+  cross-site` now gets 403, except a top-level navigation to `/` (a link to
+  the dashboard). An `Origin` header on any method must name an allowed host,
+  and `Origin: null` is rejected. Same-origin, same-site and header-less
+  requests (curl, healthchecks, Prometheus) are unaffected. The user lookup's
+  `photo_limit` is clamped to 1-50 and a non-number is a 400, not a 500.
+- The dashboard and the Setup UI send `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'`,
+  `X-Content-Type-Options: nosniff` and `Referrer-Policy: same-origin` on
+  every response, so neither can be framed (clickjacking). Dashboard
+  `/api/*` responses (findings, Telegram data, exports, screenshots) and all
+  Setup UI responses except `/static/` are `Cache-Control: no-store`.
+  Downloaded Telegram media keeps its own sandbox CSP.
+- Failed alerts no longer log the Telegram bot token or webhook secrets.
+  requests/urllib3 quote the target URL or its path in their errors ("Max
+  retries exceeded with url: /bot<token>/sendMessage"), and those went to the
+  container log at ERROR, percent-encoded when the token or webhook held a
+  space, a newline or non-ASCII. Alert errors now keep only the scheme and
+  host and name the exception type (`ConnectionError`, `InvalidURL`...);
+  errors other than connection failures (an invalid or scheme-less URL, a
+  read timeout) are scrubbed too and are not retried on the next route. If alerts ever
+  failed and the logs left the VM, rotate the bot token (BotFather
+  `/revoke`) and the Slack/Discord webhooks.
+- tor gets only `TOR_CONTROL_PASSWORD`, not the whole env file (alert tokens,
+  Telegram credentials, `SETUP_AUTH_TOKEN`), and darkwatch gets
+  `SETUP_AUTH_TOKEN` blanked; only the Setup UI has the Setup UI's token.
+- The Telegram session file (a full login to the account) is set to 0600
+  whenever a client is built and after every login, including the QR login
+  with a 2FA password, which left it at the umask's 0644. Existing 0644 files
+  are fixed on the next Telegram call.
 
 ### Fixed
 - `verify-egress.sh` checks that are real:
@@ -147,6 +214,27 @@
   daemon that enables IPv6 by default can't give darkwatch a route around the
   IPv4 lockdown rule. `egress-lockdown.sh` and `--status` warn when the
   network has IPv6 anyway.
+- Saving Tunnel 1 in the Setup UI before the tor image exists returns 409
+  saying the config was saved and to run `sudo ./ops/deploy.sh` (which builds
+  the image and starts tunnel1 + tor) instead of a compose build error.
+  Tunnel saves run `docker compose up --no-build`, since the Setup UI cannot
+  build images. Other image check failures, such as an unreachable Docker
+  daemon, still show the compose error.
+- A rescan (`/api/rescan`, the auto-rescan) no longer deletes findings. It
+  purged every finding on a page URL and re-derived them from each stored
+  snapshot's stripped text, so findings from older versions of a page and
+  from the raw-HTML pass (attributes, comments, `<meta>`) were lost for good.
+  A rescan now only adds findings: rows it matches again keep their
+  `occurrence_count` and `last_seen_at` (a raised rule score still raises
+  their score and severity, never lowers them), its `findings` count is
+  the number of new rows, and it never lowers a page's cached severity. Findings of
+  YARA rules that were deleted since are kept as well; delete them in the
+  dashboard if you no longer want them. Findings already lost to earlier
+  rescans cannot be recovered except from a backup.
+- The dashboard no longer freezes on large databases. `pages` had no
+  indexes, so `/api/urls`, the findings list and the dedup check run for
+  every scanned page and Telegram message each scanned the whole table
+  (`/api/urls` took 43 s at realistic Telegram volume; now under 200 ms).
 
 ### Internal
 - `tests/killswitch` fails when the kill switch script fails (it ignored the
@@ -165,6 +253,27 @@
 - New `tests/verify-egress/check.sh` runs `verify-egress.sh` against stubbed
   docker, iptables and curl in CI; new `tests/compose/check.sh` asserts in CI
   that darkwatch's `dns` is `127.0.0.1` and that no other service sets one.
+- `scan_tg_message` links the Telegram message to the page id `add_page`
+  returns instead of re-selecting it by content hash outside the database
+  lock. New `darkwatch/tests/test_db_integrity.py` checks the query plans
+  of the hot `pages` queries and the rescan behaviour.
+- New `darkwatch/tests/test_secret_handling.py` drives failed alerts through
+  refusing proxies and an invalid URL and checks that no log record at any
+  level holds the token or webhook path, and checks the session file mode
+  for every login path. `tests/compose/check.sh` checks that only setup has
+  a non-empty `SETUP_AUTH_TOKEN`, that tor's environment is exactly
+  `TOR_CONTROL_PASSWORD`, and that `config` fails without it; CI's compose
+  config step passes an env file with both.
+- CI: `actions/checkout` and `actions/setup-python` are pinned to commit
+  SHAs (v7.0.1, v7.1.0; Node 24) and check out without persisting the token.
+  A new `.github/dependabot.yml` proposes action updates in one monthly PR.
+- CI installs the test tools from the new `requirements-dev.txt` (`pytest`,
+  `httpx2`) in their own step, runs pytest with `-rs`, and installs a pinned
+  `shellcheck-py==0.11.0.1`. The Setup UI auth tests now run with `httpx2`
+  (Starlette's preferred TestClient backend) and fall back to `httpx`; they
+  skipped the whole file when only `httpx2` was installed.
+- The `shellcheck_py` wheel committed at the repo root is removed and `*.whl`
+  is ignored.
 
 ## v0.3.0 — 2026-10-25
 

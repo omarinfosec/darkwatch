@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-blue.svg">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.1-blue.svg">
   <img alt="Status: public release" src="https://img.shields.io/badge/status-public%20release-brightgreen.svg">
   <img alt="Platform: Linux + Docker" src="https://img.shields.io/badge/platform-linux%20%2B%20docker-informational">
   <img alt="OPSEC: first" src="https://img.shields.io/badge/OPSEC-first-critical">
@@ -18,7 +18,7 @@
 
 ---
 
-**Status:** Public release — **v0.3.0**
+**Status:** Public release — **v0.3.1**
 
 <p align="center">
   <img src="assets/dashboard.png" alt="DarkWatch dashboard — scan panel with security gate, targets, and live log" width="900">
@@ -54,7 +54,7 @@ Runs via `docker compose` on a single Linux VM. Operator state — credentials, 
 
 - **Not a tool for accessing illegal content.** The crawler exists to detect and triage threats. What you do with what it finds is on you, and your legal posture is your responsibility.
 - **Not a turn-key SaaS.** You bring your own VM, your own VPN, your own YARA rules, and your own legal review.
-- **Not safe to expose to the public internet.** The DarkWatch dashboard (:8080) has no built-in login (it only accepts requests addressed to localhost / `DARKWATCH_BIND_IP`; set `DARKWATCH_ALLOWED_HOSTS` for a reverse proxy), and the Setup UI (:8082) is gated by a bearer token — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
+- **Not safe to expose to the public internet.** The DarkWatch dashboard (:8080) has no built-in login (it only accepts requests addressed to localhost / `DARKWATCH_BIND_IP`, and rejects requests from other sites and framing; set `DARKWATCH_ALLOWED_HOSTS` for a reverse proxy), and the Setup UI (:8082) is gated by a bearer token — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
 
 ## Architecture
 
@@ -207,7 +207,7 @@ open http://$DARKWATCH_BIND_IP:8082/?token=<SETUP_AUTH_TOKEN>
 sudo docker compose --profile setup stop setup
 ```
 
-The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research path)**, **Tunnel 2 (Telegram research path)** — pre-populated with whatever's already configured. Each Save validates inputs and restarts the affected services. There's also a **Settings ↗** link in the main DarkWatch dashboard navigation that opens the Setup UI in a new tab.
+The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research path)**, **Tunnel 2 (Telegram research path)** — pre-populated with whatever's already configured. Each Save validates inputs and recreates the affected services from the current env file. The Setup UI never builds images: if Tunnel 1 is saved before `deploy.sh` has built the tor image, the config is kept and the UI asks you to run `sudo ./ops/deploy.sh`. There's also a **Settings ↗** link in the main DarkWatch dashboard navigation that opens the Setup UI in a new tab.
 
 ## Day-to-day operations
 

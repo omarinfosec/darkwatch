@@ -8,6 +8,7 @@ all pass.
 """
 
 import csv
+import errno
 import io
 import json
 import logging
@@ -62,7 +63,15 @@ app = Flask(__name__,
 # body-less endpoints (/api/stop, /api/rescan, ...). So:
 #   - the Host header must name this dashboard (loopback, DARKWATCH_BIND_IP,
 #     the container name, or DARKWATCH_ALLOWED_HOSTS for a reverse proxy);
-#   - state-changing requests must not come from another origin.
+#   - no request of any method may come from another site
+#     (Sec-Fetch-Site: cross-site). GETs matter too: a cross-site <img> or
+#     link can fire a live Telegram lookup (/api/telegram/user/...) or an
+#     export. The one exception is a top-level navigation to "/" (a link to
+#     the dashboard on another site), which only loads the page shell;
+#   - an Origin header, on any method, must name an allowed host; "null"
+#     (sandboxed iframe, file:// page) never does.
+# Browsers without Sec-Fetch-* and non-browser clients (curl, healthchecks,
+# Prometheus) send neither header and still get through on the Host check.
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "darkwatch"} | {
     h.strip().lower().strip("[]")
     for h in (os.environ.get("DARKWATCH_BIND_IP", ""),
@@ -83,9 +92,10 @@ def _hostname(value):
 def _request_guard():
     if _hostname(request.host) not in _ALLOWED_HOSTS:
         abort(403)
-    if request.method in ("GET", "HEAD", "OPTIONS"):
-        return None
-    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+    if request.headers.get("Sec-Fetch-Site") == "cross-site" and not (
+            request.method == "GET" and request.path == "/"
+            and request.headers.get("Sec-Fetch-Mode") == "navigate"
+            and request.headers.get("Sec-Fetch-Dest") == "document"):
         abort(403)
     origin = request.headers.get("Origin")
     # "null" = sandboxed iframe / file:// page: never the dashboard itself.
@@ -93,6 +103,24 @@ def _request_guard():
                    or _hostname(urlsplit(origin).netloc) not in _ALLOWED_HOSTS):
         abort(403)
     return None
+
+
+@app.after_request
+def _security_headers(resp):
+    """Baseline headers on every response. setdefault so a route's own,
+    stricter value wins (tg-media keeps its sandbox CSP)."""
+    h = resp.headers
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    # Not no-referrer: that turns a form POST's Origin into "null", which the
+    # guard rejects.
+    h.setdefault("Referrer-Policy", "same-origin")
+    # API answers hold findings, Telegram data and exports. Assigned, not
+    # setdefault: send_file already sets "no-cache", which still stores.
+    if request.path.startswith("/api/"):
+        h["Cache-Control"] = "no-store"
+    return resp
 
 
 def _int_param(value, default):
@@ -241,6 +269,16 @@ IP_ECHO_SERVICES = [
 ]
 ONION_CANARY = ("http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6"
                 "twagswzczad.onion/")
+# IP literals the in-app IP-leak gate tries to reach directly (no DNS: with
+# darkwatch's DNS isolated a hostname would never resolve, so the probe would
+# pass with no lockdown at all). Two providers, so one being down can't hide
+# an open route.
+LOCKDOWN_PROBES = (("1.1.1.1", 443), ("9.9.9.9", 443))
+LOCKDOWN_PROBE_TIMEOUT = 2
+# Errors that mean the packet never got out: the lockdown's DROP (timeout),
+# no route, or a local netfilter rule rejecting the send (EPERM).
+_BLOCKED_ERRNOS = {errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH,
+                   errno.EPERM}
 
 
 def _fetch_ip(proxies=None, timeout=5):
@@ -330,22 +368,83 @@ def _check_vpn():
         return {"ok": False, "detail": f"VPN check failed: {e}"}
 
 
-def _check_ip_leak(tor_result):
-    """Compare the Tor exit IP against the container's 'direct' egress IP.
+def _probe_direct(host, port):
+    """Try a direct TCP connection to host:port (an IP literal).
 
-    The darkwatch container is on the compose `darknet` network behind
-    ProtonVPN, so 'direct' should be the VPN's IP — not the host's real
-    IP. A leak looks like: tor_exit == direct_ip (same route).
+    Returns (state, detail): state is "connected", "blocked", "refused" or
+    "error"; detail names the errno."""
+    addr = f"{host}:{port}"
+    try:
+        with socket.create_connection((host, port),
+                                      timeout=LOCKDOWN_PROBE_TIMEOUT):
+            return "connected", f"{addr} connected"
+    except OSError as e:
+        code = e.errno
+        if code is None and isinstance(e, socket.timeout):
+            # create_connection's own timeout carries no errno.
+            return "blocked", (f"{addr} timed out after "
+                               f"{LOCKDOWN_PROBE_TIMEOUT}s (no errno)")
+        name = errno.errorcode.get(code, "?") if code is not None else "no errno"
+        if code in _BLOCKED_ERRNOS:
+            return "blocked", f"{addr} {name} (errno {code})"
+        if code == errno.ECONNREFUSED:
+            return "refused", f"{addr} {name} (errno {code})"
+        return "error", f"{addr} {name} (errno {code}): {e}"
 
-    Tor exit IP is READ from the _check_tor() result instead of
-    re-fetched — fixing the previous flakiness where ipify over Tor
-    timed out and tanked the whole security gate. The direct probe
-    tries multiple echo services with short per-service timeouts.
 
-    Accepts either the full result dict (new shape) or the legacy
-    string (fallback) so the gate doesn't break on partial upgrades.
-    We fail closed on timeout.
+def _check_ip_leak_lockdown():
+    """Lockdown mode: darkwatch must not reach the internet directly.
+
+    Probes LOCKDOWN_PROBES concurrently with plain TCP connects to IP
+    literals: no DNS, no echo service, and no dependency on the Tor exit
+    IP. ops/egress-lockdown.sh DROPs darkwatch's non-darknet traffic, so
+    every probe should time out (or fail with no route / EPERM).
+      - a completed handshake means the lockdown is missing: fail;
+      - ECONNREFUSED fails too: a DROP never answers, so a refusal means
+        the SYN reached something outside the container;
+      - any other error fails closed.
     """
+    with ThreadPoolExecutor(max_workers=len(LOCKDOWN_PROBES)) as ex:
+        results = list(ex.map(lambda hp: _probe_direct(*hp), LOCKDOWN_PROBES))
+    states = {state for state, _ in results}
+    detail = "; ".join(d for _, d in results)
+    if "connected" in states:
+        return {"ok": False,
+                "detail": "LEAK: direct egress is open, run sudo "
+                          f"./ops/egress-lockdown.sh ({detail})"}
+    if "refused" in states:
+        return {"ok": False,
+                "detail": "direct connection refused (ECONNREFUSED): the "
+                          "lockdown drops, so something outside darkwatch "
+                          "answered; check sudo ./ops/egress-lockdown.sh "
+                          f"--status ({detail})"}
+    if states != {"blocked"}:
+        return {"ok": False,
+                "detail": f"direct egress probe failed (fail-closed): {detail}"}
+    return {"ok": True, "detail": f"direct egress blocked (lockdown): {detail}"}
+
+
+def _check_ip_leak(tor_result):
+    """IP-leak gate.
+
+    With the egress lockdown on (the default), this checks that darkwatch
+    cannot open a direct connection at all (_check_ip_leak_lockdown);
+    `tor_result` is not used.
+
+    With DARKWATCH_EGRESS_LOCKDOWN=0 it falls back to comparing the Tor
+    exit IP with the container's direct egress IP, and a leak looks like
+    tor_exit == direct_ip. That check is weak: it only catches the crawler
+    sharing one route with the direct path, not darkwatch reaching the
+    internet from the host's own IP. It also needs a real DARKWATCH_DNS
+    for the echo services to resolve.
+
+    The Tor exit IP is read from the _check_tor() result instead of
+    re-fetched. Accepts either the full result dict or the legacy string
+    so the gate doesn't break on partial upgrades. Fails closed.
+    """
+    if os.environ.get("DARKWATCH_EGRESS_LOCKDOWN", "1") != "0":
+        return _check_ip_leak_lockdown()
+
     # Accept both shapes for back-compat.
     if isinstance(tor_result, dict):
         tor_ip = tor_result.get("exit_ip")
@@ -361,12 +460,6 @@ def _check_ip_leak(tor_result):
 
     direct_ip, direct_err = _fetch_ip(proxies=None, timeout=5)
     if not direct_ip:
-        if os.environ.get("DARKWATCH_EGRESS_LOCKDOWN", "1") != "0":
-            # ops/egress-lockdown.sh blocks this container's direct internet
-            # access, so the direct probe failing is the expected, safest
-            # outcome: there is no non-Tor route for a request to leak over.
-            return {"ok": True,
-                    "detail": f"direct egress blocked (lockdown); tor_exit {tor_ip}"}
         return {"ok": False,
                 "detail": f"direct IP fetch failed (fail-closed): {direct_err}"}
 
@@ -374,7 +467,8 @@ def _check_ip_leak(tor_result):
         return {"ok": False,
                 "detail": f"LEAK: tor_exit == direct ({tor_ip})"}
     return {"ok": True,
-            "detail": f"tor_exit {tor_ip} ≠ direct {direct_ip}"}
+            "detail": f"tor_exit {tor_ip} ≠ direct {direct_ip} "
+                      "(weak check: egress lockdown is off)"}
 
 
 def _check_dns():
@@ -433,11 +527,16 @@ def _run_health_checks():
         "playwright": _check_playwright,
         "tg_vpn": _check_tg_vpn,
     }
+    # With the egress lockdown on, ip_leak doesn't need the Tor result, so
+    # it runs alongside the others instead of adding ~2 s after them.
+    lockdown = os.environ.get("DARKWATCH_EGRESS_LOCKDOWN", "1") != "0"
+    if lockdown:
+        checks["ip_leak"] = _check_ip_leak_lockdown
     results = {}
     # One shared 20s deadline, and don't wait for stragglers on exit: the
     # `with` form's shutdown(wait=True) blocked for the slowest check
     # (_check_dns can take ~60s), stalling /api/scan's security gate.
-    ex = ThreadPoolExecutor(max_workers=5)
+    ex = ThreadPoolExecutor(max_workers=len(checks))
     deadline = time.monotonic() + 20
     try:
         futs = {name: ex.submit(fn) for name, fn in checks.items()}
@@ -451,8 +550,10 @@ def _run_health_checks():
                 results[name] = {"ok": False, "detail": f"error: {e}"}
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
-    # IP-leak must run after Tor to share connection pools sensibly.
-    results["ip_leak"] = _check_ip_leak(results["tor"])
+    # With DARKWATCH_EGRESS_LOCKDOWN=0, ip_leak compares against the Tor
+    # exit IP, so it has to run after Tor.
+    if not lockdown:
+        results["ip_leak"] = _check_ip_leak(results["tor"])
     # `dns` (onion canary) is required for scans — clearnet exit via Tor
     # can pass while .onion resolution still fails (v2 deprecation, slow
     # circuits). `playwright` and `tg_vpn` stay advisory.
@@ -1797,10 +1898,12 @@ def route_tg_user_lookup(handle):
     photos = (request.args.get("photos") or "1") not in ("0", "false", "no")
     download = (request.args.get("download") or "0") in ("1", "true", "yes")
     dest = os.path.join(_crawler.loot_dir, "tg-media", "users") if download else None
+    # Each photo is a Telegram request (and a download with download=1).
+    photo_limit = min(max(_int_param(request.args.get("photo_limit"), 10), 1), 50)
     with _tg_lock:
         info = _tg.lookup_user(
             handle, photo_history=photos,
-            photo_history_limit=int(request.args.get("photo_limit") or 10),
+            photo_history_limit=photo_limit,
             photo_dest_dir=dest)
     if info.get("error"):
         return jsonify(info), 400

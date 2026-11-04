@@ -7,3 +7,6 @@ tunnels/*/wg_confs/*.conf
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Downloaded wheels (e.g. shellcheck-py) never enter the repo.
+*.whl
