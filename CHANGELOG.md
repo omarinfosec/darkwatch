@@ -47,10 +47,6 @@
   page is now skipped; it used to end that site's crawl with an error.
 
 ### Internal
-- The image smoke test (`tests/images/smoke.sh`) also checks the two native
-  wheels: Telethon must pick up cryptg (it silently falls back to slow
-  pure-Python AES without it), an AES-IGE round trip must succeed, and a
-  YARA rule must compile and match.
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new
   `tests/images/smoke.sh`, every container under `--network none` and a
@@ -64,6 +60,10 @@
   (a rename counts under both its old and new path), so the `images` check
   can be required. Run the smoke tests on a host after a build with
   `sudo bash tests/images/smoke.sh`.
+- The image smoke test (`tests/images/smoke.sh`) also checks the two native
+  wheels: Telethon must pick up cryptg (it silently falls back to slow
+  pure-Python AES without it), an AES-IGE round trip must succeed, and a
+  YARA rule must compile and match.
 - The darkwatch Dockerfile copies every top-level `*.py` module instead of a
   fixed list, so a new module cannot be left out of the image.
 - The Release workflow runs the full CI workflow first (`ci.yml` is now
