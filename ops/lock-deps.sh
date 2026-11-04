@@ -48,7 +48,9 @@ pins() {
         { sub(/#.*/, ""); gsub(/^[ \t]+|[ \t\\]+$/, "") }
         $0 == "" || /^--/ { next }
         match($0, /^[A-Za-z0-9._-]+(\[[^]]*\])?==[A-Za-z0-9.!+_-]+$/) {
-            name = $0; sub(/[[=].*/, "", name)
+            # Two plain subs: GNU awk rejects "[[=]" (it reads "[=" as the
+            # start of an equivalence class), mawk accepts it.
+            name = $0; sub(/\[.*/, "", name); sub(/=.*/, "", name)
             name = tolower(name); gsub(/[-_.]+/, "-", name)
             ver = $0; sub(/.*==/, "", ver)
             print name "==" ver; next
