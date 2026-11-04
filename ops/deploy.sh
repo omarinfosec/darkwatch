@@ -223,14 +223,54 @@ fi
 
 # ─── Network migration ───────────────────────────────────────────────────────
 # v0.3 pins the darknet subnet (egress lockdown needs a fixed address for
-# darkwatch). Compose refuses to reuse a network whose config changed, so
-# recreate it once: `down` stops the containers and removes the network.
+# darkwatch) and v0.3.1 makes it IPv4-only (enable_ipv6: false, marked by the
+# org.darkwatch.ipv4-only label). Compose can't swap a network that a
+# container outside the enabled profiles (a running Setup UI) still uses, so
+# when either differs, recreate it here, once: `down` stops the containers of
+# every profile and removes the network; `up` below creates the new one.
 want_subnet="$(env_val DARKNET_SUBNET 172.31.250.0/24)"
 have_subnet="$(docker network inspect darkwatch_darknet \
     -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
+have_v4only="$(docker network inspect darkwatch_darknet \
+    -f '{{index .Labels "org.darkwatch.ipv4-only"}}' 2>/dev/null || true)"
 if [[ -n "$have_subnet" && "$have_subnet" != "$want_subnet" ]]; then
     log "darknet subnet changes ($have_subnet -> $want_subnet): recreating the network"
     dc --profile tor --profile tg --profile setup down
+elif [[ -n "$have_subnet" && "$have_v4only" != "true" ]]; then
+    log "darknet network predates the IPv4-only setting: recreating it (once)"
+    dc --profile tor --profile tg --profile setup down
+fi
+
+# ─── Block darkwatch's direct internet access (host firewall) ───────────────
+# Before `up`, so darkwatch never runs without the rule. It matches on
+# darkwatch's fixed address, so the container and network needn't exist yet.
+"$SCRIPT_DIR/egress-lockdown.sh" || fail "could not apply egress lockdown"
+# Re-apply after reboots (iptables rules don't persist on their own). The unit
+# runs before docker.service, which starts the containers (restart policy),
+# and after the host firewalls, whose start can flush iptables rules.
+# WantedBy=docker.service: wherever Docker starts, the rule goes in first.
+# reenable, not enable: it drops the links an older unit file asked for.
+UNIT="${DW_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/darkwatch-egress-lockdown.service"
+if command -v systemctl >/dev/null 2>&1; then
+    unit_body="[Unit]
+Description=DarkWatch: block the darkwatch container's direct internet access
+Before=docker.service
+After=firewalld.service ufw.service
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_DIR/egress-lockdown.sh --boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=docker.service
+"
+    if ! printf '%s' "$unit_body" | cmp -s - "$UNIT"; then
+        printf '%s' "$unit_body" > "$UNIT"
+        systemctl daemon-reload
+        systemctl reenable --quiet darkwatch-egress-lockdown.service
+        log "installed darkwatch-egress-lockdown.service (applies the rule at boot, before Docker)"
+    fi
 fi
 
 # ─── Bring stack up ──────────────────────────────────────────────────────────
@@ -252,7 +292,7 @@ fi
 # Refresh it onto the image just built; never start one that is stopped.
 if [[ "$(docker inspect -f '{{.State.Running}}' setup 2>/dev/null || true)" == "true" ]]; then
     log "Setup UI is running: refreshing it"
-    # Optional: a failure here must not stop the health wait and the lockdown.
+    # Optional: a failure here must not stop the health wait and the egress probe.
     dc --profile setup up -d --no-deps setup \
         || warn "could not refresh the Setup UI; run: docker compose --profile setup up -d --build setup"
 fi
@@ -273,29 +313,25 @@ for i in $(seq 1 60); do
     sleep 2
 done
 
-# ─── Block darkwatch's direct internet access (host firewall) ───────────────
-"$SCRIPT_DIR/egress-lockdown.sh" || fail "could not apply egress lockdown"
-# Re-apply after reboots (iptables rules don't persist on their own).
-UNIT="${DW_SYSTEMD_UNIT_DIR:-/etc/systemd/system}/darkwatch-egress-lockdown.service"
-if command -v systemctl >/dev/null 2>&1; then
-    unit_body="[Unit]
-Description=DarkWatch: block the darkwatch container's direct internet access
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=oneshot
-ExecStart=$SCRIPT_DIR/egress-lockdown.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-"
-    if [[ ! -f "$UNIT" ]] || [[ "$(cat "$UNIT")" != "$unit_body" ]]; then
-        printf '%s' "$unit_body" > "$UNIT"
-        systemctl daemon-reload
-        systemctl enable --quiet darkwatch-egress-lockdown.service
-        log "installed darkwatch-egress-lockdown.service (re-applies the rule at boot)"
+# ─── Is the lockdown really in effect? ──────────────────────────────────────
+# Runs even with no tunnels configured: that is when a leak matters most.
+# The flag comes from env_val (env file, else the process environment), the
+# same lookup egress-lockdown.sh uses.
+lockdown="$(env_val DARKWATCH_EGRESS_LOCKDOWN 1)"
+if [[ "$lockdown" == "0" ]]; then
+    warn "egress lockdown is DISABLED (DARKWATCH_EGRESS_LOCKDOWN=0): darkwatch can reach the internet directly"
+else
+    # Docker adds this jump when it starts; without it DOCKER-USER is never
+    # consulted (e.g. Docker running with "iptables": false).
+    iptables -C FORWARD -j DOCKER-USER 2>/dev/null \
+        || warn "FORWARD has no jump to DOCKER-USER: the egress lockdown rule is not consulted"
+    log "probing darkwatch's direct internet access (http://1.1.1.1)"
+    if docker exec darkwatch curl -s --max-time 5 -o /dev/null http://1.1.1.1 2>/dev/null; then
+        fail "darkwatch reached http://1.1.1.1 DIRECTLY although the egress lockdown is on. Check: sudo ./ops/egress-lockdown.sh --status; sudo iptables -S FORWARD | grep DOCKER-USER"
+    elif curl -s --max-time 5 -o /dev/null http://1.1.1.1 2>/dev/null; then
+        log "  darkwatch has no direct internet route (the host does)"
+    else
+        warn "direct-egress probe inconclusive: the host can't reach http://1.1.1.1 either"
     fi
 fi
 

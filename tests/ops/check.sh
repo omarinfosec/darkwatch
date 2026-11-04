@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Exercise ops/deploy.sh and ops/bootstrap.sh against a throwaway copy of
-# ops/ with docker, systemctl, egress-lockdown.sh and verify-egress.sh
-# stubbed out. Every docker call is recorded, so the checks can assert what
-# deploy would have run. Needs root (bootstrap chowns to uid 999):
+# ops/ with docker, systemctl, iptables, curl, egress-lockdown.sh and
+# verify-egress.sh stubbed out. Every docker, systemctl, iptables and lockdown
+# call is recorded in one log, in order, so the checks can assert what deploy
+# would have run and when. Needs root (bootstrap chowns to uid 999):
 #   sudo bash tests/ops/check.sh
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root: sudo bash $0" >&2; exit 1; }
@@ -28,13 +29,28 @@ case "$1" in
             *Running*) [[ "$4" == setup && -n "${STUB_SETUP_STATE:-}" ]] || exit 1
                        echo "$STUB_SETUP_STATE" ;;
         esac ;;
-    network) [[ -n "${STUB_HAVE_SUBNET:-}" ]] || exit 1; echo "$STUB_HAVE_SUBNET" ;;
+    network) [[ -n "${STUB_HAVE_SUBNET:-}" ]] || exit 1
+             case "$*" in
+                 *Labels*)     echo "${STUB_NET_LABEL-true}" ;;
+                 *EnableIPv6*) echo false ;;
+                 *)            echo "$STUB_HAVE_SUBNET" ;;
+             esac ;;
     compose) [[ -n "${STUB_SETUP_UP_FAILS:-}" && "$*" == *"up -d --no-deps setup"* ]] && exit 1 ;;
+    # The direct-egress probe: blocked (curl's timeout) unless STUB_DW_EGRESS.
+    exec)    [[ -n "${STUB_DW_EGRESS:-}" ]] || exit 28 ;;
 esac
 exit 0
 EOF
-printf '#!/bin/sh\nexit 0\n' > "$work/bin/systemctl"
-chmod 755 "$work/bin/docker" "$work/bin/systemctl"
+printf '#!/bin/sh\necho "systemctl $*" >> "$DOCKER_LOG"\n' > "$work/bin/systemctl"
+cat > "$work/bin/iptables" <<'EOF'
+#!/usr/bin/env bash
+echo "iptables $*" >> "$DOCKER_LOG"
+[[ "$*" == "-C FORWARD -j DOCKER-USER" && -n "${STUB_NO_FORWARD_JUMP:-}" ]] && exit 1
+exit 0
+EOF
+# The host side of the probe (positive control): online unless STUB_HOST_OFFLINE.
+printf '#!/bin/sh\n[ -z "$STUB_HOST_OFFLINE" ] || exit 28\n' > "$work/bin/curl"
+chmod 755 "$work/bin/docker" "$work/bin/systemctl" "$work/bin/iptables" "$work/bin/curl"
 export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 
 # A fresh tree per case: ops/ (lockdown + verify stubbed), .env.example and
@@ -45,12 +61,14 @@ new_tree() {
     mkdir -p "$T/repo/tunnels/killswitch" "$T/units"
     cp -a "$repo/ops" "$repo/.env.example" "$T/repo/"
     cp -a "$repo/tunnels/killswitch/10-killswitch.sh" "$T/repo/tunnels/killswitch/"
-    printf '#!/bin/sh\necho "lockdown stub"\n' > "$T/repo/ops/egress-lockdown.sh"
+    printf '#!/bin/sh\necho "lockdown stub"\necho "lockdown-stub $*" >> "$DOCKER_LOG"\n' > "$T/repo/ops/egress-lockdown.sh"
     printf '#!/bin/sh\necho "verify stub $*"\n' > "$T/repo/ops/verify-egress.sh"
     D="$T/data"
     : > "$DOCKER_LOG"
-    unset STUB_SETUP_STATE STUB_HAVE_SUBNET STUB_SETUP_UP_FAILS
+    unset STUB_SETUP_STATE STUB_HAVE_SUBNET STUB_SETUP_UP_FAILS STUB_NET_LABEL \
+          STUB_DW_EGRESS STUB_HOST_OFFLINE STUB_NO_FORWARD_JUMP DARKWATCH_EGRESS_LOCKDOWN
 }
+real_lockdown() { cp -a "$repo/ops/egress-lockdown.sh" "$T/repo/ops/"; }   # iptables stays stubbed
 case_n=0
 
 # Bootstrap the data root and fill the required values (as an operator would).
@@ -125,8 +143,26 @@ grep -q '^compose.* pull' "$DOCKER_LOG" && ! grep '^compose.* pull' "$DOCKER_LOG
     || die "pull must only use the detected profiles"
 ok "build covers tor + setup; pull and up use only the detected profiles"
 grep -q -- ' down' "$DOCKER_LOG" && die "down ran without a subnet change"
-[[ -f "$T/units/darkwatch-egress-lockdown.service" ]] || die "lockdown unit not installed"
+unit="$T/units/darkwatch-egress-lockdown.service"
+[[ -f "$unit" ]] || die "lockdown unit not installed"
 ok "lockdown unit installed into DW_SYSTEMD_UNIT_DIR"
+
+line_of() { grep -n -m1 -- "$1" "$DOCKER_LOG" | cut -d: -f1; }
+up_at="$(line_of 'up -d --remove-orphans')"
+[[ -n "$(line_of '^lockdown-stub')" && "$(line_of '^lockdown-stub')" -lt "$up_at" ]] \
+    || die "the egress lockdown must be applied before compose up"
+[[ -n "$(line_of '^systemctl reenable')" && "$(line_of '^systemctl reenable')" -lt "$up_at" ]] \
+    || die "the lockdown unit must be installed before compose up"
+ok "lockdown applied and its unit installed before compose up"
+
+for want in "Before=docker.service" "After=firewalld.service ufw.service" "WantedBy=docker.service" \
+            "ExecStart=$T/repo/ops/egress-lockdown.sh --boot"; do
+    grep -qxF -- "$want" "$unit" || die "unit: missing '$want'"
+done
+grep -qE '^(Requires|After)=docker' "$unit" && die "unit must not require or follow docker.service"
+grep -q '^systemctl reenable --quiet darkwatch-egress-lockdown.service' "$DOCKER_LOG" \
+    || die "unit must be enabled with reenable"
+ok "unit runs before docker.service, after the host firewalls, WantedBy=docker.service"
 
 [[ "$(grep -c '^TG_SOCKS_PASSWORD=' "$D/env")" == 1 ]] || die "TG_SOCKS_PASSWORD must appear once"
 pw="$(grep '^TG_SOCKS_PASSWORD=' "$D/env" | cut -d= -f2-)"
@@ -136,6 +172,8 @@ expect_ok "second deploy"
 [[ "$(grep -c '^TG_SOCKS_PASSWORD=' "$D/env")" == 1 && "$(grep '^TG_SOCKS_PASSWORD=' "$D/env" | cut -d= -f2-)" == "$pw" ]] \
     || die "TG_SOCKS_PASSWORD changed on redeploy"
 ok "TG_SOCKS_PASSWORD filled exactly once and kept"
+grep -q '^systemctl' "$DOCKER_LOG" && die "an unchanged unit must not be rewritten or re-enabled"
+ok "an unchanged unit is left alone on redeploy"
 
 deploy --skip-build
 expect_ok "--skip-build"
@@ -150,6 +188,11 @@ grep -q -- "^compose --env-file $D/env --profile tor --profile tg --profile setu
 STUB_HAVE_SUBNET=172.31.250.0/24 deploy
 grep -q -- ' down' "$DOCKER_LOG" && die "down ran although the subnet matches the default"
 ok "network recreated only when the subnet differs (default 172.31.250.0/24)"
+STUB_HAVE_SUBNET=172.31.250.0/24 STUB_NET_LABEL="" deploy
+expect_ok "pre-IPv4-only network"
+grep -q -- "^compose --env-file $D/env --profile tor --profile tg --profile setup down" "$DOCKER_LOG" \
+    || die "a network without the org.darkwatch.ipv4-only label must be recreated"
+ok "a network from before enable_ipv6: false is recreated"
 
 STUB_SETUP_STATE=true deploy
 expect_ok "running setup"
@@ -166,7 +209,51 @@ STUB_SETUP_STATE=true STUB_SETUP_UP_FAILS=1 deploy
 expect_ok "setup refresh fails"
 grep -q "lockdown stub" "$work/out" || die "a failed Setup UI refresh must not skip the egress lockdown"
 grep -q "could not refresh the Setup UI" "$work/out" || die "a failed Setup UI refresh must warn"
-ok "a failed Setup UI refresh only warns; lockdown still applied"
+grep -q '^exec darkwatch curl' "$DOCKER_LOG" || die "a failed Setup UI refresh must not skip the egress probe"
+ok "a failed Setup UI refresh only warns; lockdown and probe still run"
+
+# ─── egress lockdown flag and the direct-egress probe ───────────────────────
+# The real egress-lockdown.sh (iptables stubbed), so its iptables calls show.
+# No tunnels are configured here: the probe must run anyway.
+new_tree; seed; real_lockdown
+echo "DARKWATCH_EGRESS_LOCKDOWN=0" >> "$D/env"
+STUB_DW_EGRESS=1 deploy
+expect_ok "LOCKDOWN=0 in env file, darkwatch connects"
+grep -q 'iptables -I DOCKER-USER' "$DOCKER_LOG" && die "LOCKDOWN=0 (env file) must not insert the rule"
+grep -q "egress lockdown is DISABLED" "$work/out" || die "LOCKDOWN=0 (env file) must warn"
+ok "LOCKDOWN=0 in the env file: rule not inserted, warning, deploy completes"
+
+new_tree; seed; real_lockdown
+DARKWATCH_EGRESS_LOCKDOWN=0 STUB_DW_EGRESS=1 deploy
+expect_ok "LOCKDOWN=0 in process env, darkwatch connects"
+grep -q 'iptables -I DOCKER-USER' "$DOCKER_LOG" && die "LOCKDOWN=0 (process env) must not insert the rule"
+grep -q "egress lockdown is DISABLED" "$work/out" || die "LOCKDOWN=0 (process env) must warn"
+ok "LOCKDOWN=0 in the process environment only: same"
+
+new_tree; seed; real_lockdown
+STUB_DW_EGRESS=1 deploy
+expect_fail "lockdown on, darkwatch connects" "darkwatch reached http://1.1.1.1 DIRECTLY"
+grep -q 'deploy complete' "$work/out" && die "a leaking darkwatch must not reach 'deploy complete'"
+ok "lockdown on and darkwatch connects directly: deploy fails"
+
+deploy
+expect_ok "lockdown on, darkwatch blocked"
+ins_at="$(line_of '^iptables -I DOCKER-USER 1 -s 172.31.250.250 ! -d 172.31.250.0/24')"
+[[ -n "$ins_at" && "$ins_at" -lt "$(line_of 'up -d --remove-orphans')" ]] || die "rule must be inserted before compose up"
+grep -q '^exec darkwatch curl -s --max-time 5 -o /dev/null http://1.1.1.1' "$DOCKER_LOG" || die "probe did not run"
+grep -q "darkwatch has no direct internet route" "$work/out" || die "blocked probe must be reported"
+grep -q "inconclusive\|DOCKER-USER: the egress" "$work/out" && die "unexpected probe warning"
+ok "lockdown on and darkwatch blocked: deploy completes"
+
+STUB_HOST_OFFLINE=1 deploy
+expect_ok "host offline"
+grep -q "probe inconclusive" "$work/out" || die "host offline must make the probe inconclusive"
+ok "host can't connect either: inconclusive warning only"
+
+STUB_NO_FORWARD_JUMP=1 deploy
+expect_ok "no FORWARD jump"
+grep -q "FORWARD has no jump to DOCKER-USER" "$work/out" || die "missing FORWARD jump must warn"
+ok "missing FORWARD -> DOCKER-USER jump warns"
 
 # ─── env file pre-flight ────────────────────────────────────────────────────
 new_tree; seed; rm "$D/env"

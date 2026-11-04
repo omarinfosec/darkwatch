@@ -45,6 +45,8 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null
           UNSHARE="sudo unshare -n" PYTHON=/usr/bin/python3 bash tests/killswitch/check.sh
+      - name: egress-lockdown.sh (network namespace test)
+        run: UNSHARE="sudo unshare -n" bash tests/egress-lockdown/check.sh
       - name: deploy.sh / bootstrap.sh (stubbed docker)
         run: sudo bash tests/ops/check.sh
       - name: docker compose config

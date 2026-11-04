@@ -27,6 +27,16 @@
   hooks only produce a warning.
 - The first deploy after upgrading builds the tor and Setup UI images too, so
   it takes longer; later builds come from the cache.
+- The first deploy also recreates the `darknet` network once (it is now
+  IPv4-only), so every container, a running Setup UI included, stops briefly.
+  Start the Setup UI again afterwards if you need it.
+- After the first deploy, `darkwatch-egress-lockdown.service` runs before
+  `docker.service` at boot. After the next reboot, check that
+  `systemctl show -p ActiveEnterTimestampMonotonic --value darkwatch-egress-lockdown`
+  is non-zero and less than
+  `systemctl show -p ExecMainStartTimestampMonotonic --value docker` (the
+  RUNBOOK has a snippet). Docker's own `ActiveEnterTimestamp` comes after it
+  has restarted the containers, so it cannot show the order.
 
 ### Fixed
 - `deploy.sh` restarts itself once after a `git pull` that changes the code,
@@ -49,19 +59,38 @@
   `deploy.sh` already did, instead of saving it and having the next deploy
   refuse it.
 - A failed refresh of a running Setup UI only warns; it no longer stops
-  `deploy.sh` before the health wait and the egress lockdown.
+  `deploy.sh` before the health wait and the egress checks.
 - `deploy.sh` checks that the tunnel kill switch is executable, and its
   "compose up failed" hint points at the `custom-init` / `killswitch` logs.
 - The documented Setup UI command is now
   `docker compose --profile setup up -d --build setup`, so it never starts a
   stale image.
+- The egress lockdown is applied before the containers start, on deploy and
+  at boot: `deploy.sh` applies it and installs its systemd unit before
+  `docker compose up`, and the unit now runs before `docker.service`
+  (`WantedBy=docker.service`, after firewalld/ufw) instead of after it, so
+  darkwatch no longer runs unrestricted until the rule is in place. The unit
+  is installed with `systemctl reenable` (dropping the old
+  `multi-user.target` link) and only rewritten when it changed.
+- `deploy.sh` checks that the lockdown works: it fails when darkwatch can
+  reach `http://1.1.1.1` directly, also with no tunnels configured, using the
+  host as a positive control ("inconclusive" when the host can't connect
+  either). It warns when `FORWARD` has no jump to `DOCKER-USER`, and when
+  `DARKWATCH_EGRESS_LOCKDOWN=0` (read from the env file or the environment,
+  like `egress-lockdown.sh`) it warns and skips the probe.
+- The `darknet` network is IPv4-only (`enable_ipv6: false`), so a Docker
+  daemon that enables IPv6 by default can't give darkwatch a route around the
+  IPv4 lockdown rule. `egress-lockdown.sh` and `--status` warn when the
+  network has IPv6 anyway.
 
 ### Internal
 - `ops/lib/common.sh` holds the `env_val` helper shared by `deploy.sh`,
   `egress-lockdown.sh` and `verify-egress.sh`.
 - New `tests/ops/check.sh` runs `deploy.sh` and `bootstrap.sh` against
   stubbed docker/systemctl in CI, including a self-update from a local git
-  remote.
+  remote, the lockdown order and the direct-egress probe.
+- New `tests/egress-lockdown/check.sh` runs `egress-lockdown.sh` against real
+  iptables in a network namespace in CI.
 
 ## v0.3.0 — 2026-10-25
 
