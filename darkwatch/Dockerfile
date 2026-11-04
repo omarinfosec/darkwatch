@@ -1,5 +1,5 @@
 # ─── Build stage: produce static/ artifacts ───────────────────────────────
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS bundle
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS bundle
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -63,7 +63,7 @@ RUN mkdir -p static && \
 # to Debian Trixie, where Playwright's --with-deps auto-installer fails on
 # packages it expects (libgdk-pixbuf2.0-0 was renamed, fonts-unifont
 # replaced ttf-unifont, etc). Bookworm is what Playwright targets.
-FROM python:3.11-slim-bookworm@sha256:f06d01d4ba3f8ad5af45a3ec87df19c1d317d8e8961edc0fabda61811af6f7cf
+FROM python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
