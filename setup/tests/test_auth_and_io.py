@@ -10,7 +10,13 @@ os.environ.setdefault("SETUP_AUTH_TOKEN", "test-token-fixture")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
+# Starlette's TestClient prefers httpx2 (the package requirements-dev.txt
+# installs) and only falls back to httpx; skipping on a missing httpx alone
+# would silently skip this whole suite in CI.
+try:
+    import httpx2  # noqa: F401
+except ImportError:
+    pytest.importorskip("httpx")
 
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

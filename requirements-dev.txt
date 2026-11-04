@@ -1,0 +1,4 @@
+# Test-only tools for CI and local runs, installed on top of
+# darkwatch/requirements.txt or setup/requirements.txt.
+pytest==9.2.0
+httpx2==2.16.0

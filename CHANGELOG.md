@@ -260,6 +260,16 @@
   a non-empty `SETUP_AUTH_TOKEN`, that tor's environment is exactly
   `TOR_CONTROL_PASSWORD`, and that `config` fails without it; CI's compose
   config step passes an env file with both.
+- CI: `actions/checkout` and `actions/setup-python` are pinned to commit
+  SHAs (v7.0.1, v7.1.0; Node 24) and check out without persisting the token.
+  A new `.github/dependabot.yml` proposes action updates in one monthly PR.
+- CI installs the test tools from the new `requirements-dev.txt` (`pytest`,
+  `httpx2`) in their own step, runs pytest with `-rs`, and installs a pinned
+  `shellcheck-py==0.11.0.1`. The Setup UI auth tests now run with `httpx2`
+  (Starlette's preferred TestClient backend) and fall back to `httpx`; they
+  skipped the whole file when only `httpx2` was installed.
+- The `shellcheck_py` wheel committed at the repo root is removed and `*.whl`
+  is ignored.
 
 ## v0.3.0 — 2026-10-25
 
