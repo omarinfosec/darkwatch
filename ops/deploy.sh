@@ -35,6 +35,8 @@ warn() { printf '\033[1;33m[deploy WARN]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31m[deploy ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 # shellcheck source-path=SCRIPTDIR source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/retention-cron.sh
+source "$SCRIPT_DIR/lib/retention-cron.sh"
 
 # ─── Must run as root (docker socket + /var/lib/darkwebapp/env) ─────────────
 if [[ $EUID -ne 0 ]]; then
@@ -87,6 +89,10 @@ ensure_secret() {
     fi
 }
 ensure_secret TG_SOCKS_PASSWORD   # tg-socks proxy login (Telegram tunnel)
+# Upgrades don't re-run bootstrap, so repeat its short-token warning here.
+if setup_token_short; then
+    warn "SETUP_AUTH_TOKEN is shorter than 32 characters; the Setup UI will answer 401 until you replace it (openssl rand -hex 32)"
+fi
 
 # Required env vars must be present in /var/lib/darkwebapp/env
 required_vars=(
@@ -103,6 +109,11 @@ done
 if (( ${#missing[@]} > 0 )); then
     fail "missing required env vars in $DATA_ROOT/env: ${missing[*]}"
 fi
+# The dashboard's login is opt-in. Warn, without failing, when it is reachable
+# beyond loopback without one (a private VPN may be the only way in).
+while IFS= read -r msg; do
+    warn "$msg"
+done < <(dashboard_auth_warnings)
 
 # WireGuard configs placed by hand skip the Setup UI's validation. The kill
 # switch assumes a full-tunnel config, so check the same rules here that
@@ -174,9 +185,10 @@ fi
 # Operational data dirs must exist and be writable by the container user
 # (uid 999). Re-running bootstrap is idempotent and gets ownership right —
 # a plain `mkdir -p` here would leave root-owned dirs darkwatch can't write.
-for d in loot data investigations yara-private; do
-    if [[ ! -d "$DATA_ROOT/darkwatch/$d" ]]; then
-        log "  $DATA_ROOT/darkwatch/$d missing — re-running bootstrap"
+# config.d (the local config override) is new in v0.4.0.
+for d in darkwatch/loot darkwatch/data darkwatch/investigations darkwatch/yara-private config.d; do
+    if [[ ! -d "$DATA_ROOT/$d" ]]; then
+        log "  $DATA_ROOT/$d missing — re-running bootstrap"
         "$SCRIPT_DIR/bootstrap.sh"
         break
     fi
@@ -185,8 +197,13 @@ done
 # Working tree must be clean (refuse to deploy uncommitted changes).
 # Untracked files are ignored: bootstrap's .env symlink lives in the repo root.
 if [[ -d .git ]]; then
-    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    dirty="$(git status --porcelain --untracked-files=no)"
+    if [[ -n "$dirty" ]]; then
         git status --short --untracked-files=no >&2
+        # Local settings belong in the override file, not the tracked config.
+        if [[ "$(cut -c4- <<<"$dirty")" == "darkwatch/config.json" ]]; then
+            fail "darkwatch/config.json has local edits. Move the settings you changed into $DATA_ROOT/config.d/config.local.json (merged over config.json; see ops/RUNBOOK.md, \"Local config overrides\"), then run: sudo git checkout darkwatch/config.json"
+        fi
         fail "git working tree has uncommitted changes. Commit or stash before deploying."
     fi
     log "git: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"
@@ -272,6 +289,11 @@ WantedBy=docker.service
         log "installed darkwatch-egress-lockdown.service (applies the rule at boot, before Docker)"
     fi
 fi
+
+# Nightly ops/retention.sh (/etc/cron.d/darkwatch-retention). Here and not
+# only in install.sh, which existing VMs never rerun; it also drops the
+# crontab line older RUNBOOKs had operators add. Only warns on failure.
+install_retention_cron "$REPO_ROOT" "$DATA_ROOT"
 
 # ─── Bring stack up ──────────────────────────────────────────────────────────
 # Tunnel sidecars wait for their WireGuard container to report a handshake;

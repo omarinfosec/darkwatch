@@ -9,6 +9,7 @@ __version__ = "0.3.1"
 
 import os
 import sys
+import copy
 import json
 import html as html_lib
 import socket
@@ -27,7 +28,7 @@ from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Doctype
 
 try:
     from playwright.sync_api import sync_playwright
@@ -175,6 +176,19 @@ DEFAULT_CONFIG = {
         # disable defaults. `timeout` is per-feed HTTP timeout in seconds.
         "feeds": None,
         "timeout": 30
+    },
+    # Database retention, applied by `darkwatch.py --retention` (run
+    # nightly by ops/retention.sh, which prunes the loot/ files first).
+    # A days value of 0 turns that step off. Page and finding rows are
+    # never deleted.
+    "retention": {
+        "monitor_events_days": 180,
+        # Older snapshots are set to NULL; the newest one of each page is
+        # kept so a rescan still covers every page.
+        "text_snapshot_days": 365,
+        # NULL screenshot/thumbnail/media paths whose file is gone.
+        "clear_missing_files": True,
+        "wal_checkpoint": True
     }
 }
 
@@ -584,21 +598,30 @@ class Database:
                     "WHERE id = ?", (severity, int(max_score or 0), page_id))
             self.conn.commit()
 
-    def iter_pages_with_text(self, url_id=None):
+    def iter_pages_with_text(self, url_id=None, batch=200):
         """Yield rows suitable for rescan: (page_id, url_id, page_url,
-        text_snapshot). Skips rows without a stored snapshot."""
-        with self.lock:
-            if url_id is not None:
-                cur = self.conn.execute(
-                    "SELECT id, url_id, page_url, text_snapshot "
-                    "FROM pages WHERE url_id = ? AND text_snapshot IS NOT NULL "
-                    "  AND text_snapshot != ''", (url_id,))
-            else:
-                cur = self.conn.execute(
-                    "SELECT id, url_id, page_url, text_snapshot "
-                    "FROM pages WHERE text_snapshot IS NOT NULL "
-                    "  AND text_snapshot != ''")
-            return cur.fetchall()
+        text_snapshot). Skips rows without a stored snapshot.
+
+        Reads `batch` rows per lock acquisition, in id order, so a rescan
+        of a large database neither holds every snapshot in memory nor
+        keeps the lock (and with it the dashboard and the crawler) for
+        the whole read."""
+        where = "text_snapshot IS NOT NULL AND text_snapshot != '' AND id > ?"
+        params = []
+        if url_id is not None:
+            where += " AND url_id = ?"
+            params.append(url_id)
+        last_id = 0
+        while True:
+            with self.lock:
+                rows = self.conn.execute(
+                    "SELECT id, url_id, page_url, text_snapshot FROM pages "
+                    "WHERE " + where + " ORDER BY id LIMIT ?",
+                    [last_id] + params + [batch]).fetchall()
+            yield from rows
+            if len(rows) < batch:
+                return
+            last_id = rows[-1][0]
 
     def record_url_error(self, url_id, category):
         """Tag a URL with its most recent error category for adaptive
@@ -1329,8 +1352,32 @@ class Database:
         Order matters under `PRAGMA foreign_keys = ON`: tables whose
         rows reference others must be purged first. tg_messages has
         FKs to BOTH pages and urls, so it has to go before pages.
-        Missing this was the root cause of silent-fail deletes."""
+        Missing this was the root cause of silent-fail deletes.
+
+        Returns the files the deleted rows pointed to, for
+        DarkWebCrawler.delete_url to remove: {"screenshots": [...],
+        "thumbnails": [...]} (paths as stored) and {"tg_media": [...],
+        "avatars": [...]} (relative to loot/tg-media)."""
+        files = {"screenshots": [], "thumbnails": [], "tg_media": [],
+                 "avatars": []}
         with self.lock:
+            for key, sql in (
+                    ("screenshots", "SELECT screenshot_path FROM pages "
+                                    "WHERE url_id = ? AND screenshot_path IS NOT NULL"),
+                    ("thumbnails", "SELECT thumbnail_path FROM pages "
+                                   "WHERE url_id = ? AND thumbnail_path IS NOT NULL"),
+                    ("tg_media", "SELECT media_path FROM tg_messages "
+                                 "WHERE url_id = ? AND media_path IS NOT NULL"),
+                    # An avatar another tracked row still shows is kept.
+                    ("avatars", "SELECT tg_photo_path FROM urls u WHERE id = ? "
+                                "  AND tg_photo_path IS NOT NULL AND NOT EXISTS ("
+                                "    SELECT 1 FROM urls o WHERE o.id != u.id "
+                                "      AND o.tg_photo_path = u.tg_photo_path)")):
+                try:
+                    files[key] = sorted({r[0] for r in self.conn.execute(
+                        sql, (url_id,)) if r[0]})
+                except sqlite3.OperationalError as e:
+                    log.debug(f"delete_url: no {key} lookup: {e}")
             # Child-first order. `monitor_events` has ON DELETE CASCADE
             # on url_id but we include it explicitly for clarity +
             # consistency across pre-CASCADE schema versions.
@@ -1343,6 +1390,121 @@ class Database:
                     # Table may not exist on older DBs — tolerate and continue.
                     log.debug(f"delete_url: skipping {tbl}: {e}")
             self.conn.commit()
+        return files
+
+    # ── Retention (darkwatch.py --retention, run by ops/retention.sh) ─────
+    # Each step works in chunks, one lock acquisition and one commit per
+    # chunk, so the dashboard and crawler (another process, same database)
+    # never wait long for the write lock.
+    _RETENTION_CHUNK = 500
+
+    @staticmethod
+    def _retention_cutoff(days):
+        """`days` ago in the format of CURRENT_TIMESTAMP columns."""
+        return (utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def prune_monitor_events(self, days, dry_run=False):
+        """Delete monitor_events rows older than `days`. Returns the count
+        (that would be) deleted."""
+        cutoff = self._retention_cutoff(days)
+        if dry_run:
+            with self.lock:
+                return self.conn.execute(
+                    "SELECT COUNT(*) FROM monitor_events WHERE checked_at < ?",
+                    (cutoff,)).fetchone()[0]
+        total = 0
+        while True:
+            with self.lock:
+                cur = self.conn.execute(
+                    "DELETE FROM monitor_events WHERE id IN ("
+                    "  SELECT id FROM monitor_events WHERE checked_at < ? "
+                    "  LIMIT ?)", (cutoff, self._RETENTION_CHUNK))
+                self.conn.commit()
+            total += cur.rowcount
+            if cur.rowcount < self._RETENTION_CHUNK:
+                return total
+
+    def prune_text_snapshots(self, days, dry_run=False):
+        """Set text_snapshot to NULL on pages scanned more than `days` ago,
+        except the newest snapshot of each (url_id, page_url), which a
+        rescan still needs. Page rows (title, IOCs, findings links) stay.
+        Returns the count (that would be) cleared."""
+        cutoff = self._retention_cutoff(days)
+        with self.lock:
+            ids = [r[0] for r in self.conn.execute(
+                "SELECT p.id FROM pages p "
+                "WHERE p.text_snapshot IS NOT NULL AND p.text_snapshot != '' "
+                "  AND p.scanned_at < ? "
+                "  AND p.id != (SELECT p2.id FROM pages p2 "
+                "    WHERE p2.url_id = p.url_id AND p2.page_url = p.page_url "
+                "      AND p2.text_snapshot IS NOT NULL "
+                "      AND p2.text_snapshot != '' "
+                "    ORDER BY p2.scanned_at DESC, p2.id DESC LIMIT 1)",
+                (cutoff,))]
+        if dry_run:
+            return len(ids)
+        total = 0
+        for i in range(0, len(ids), self._RETENTION_CHUNK):
+            chunk = ids[i:i + self._RETENTION_CHUNK]
+            with self.lock:
+                cur = self.conn.execute(
+                    "UPDATE pages SET text_snapshot = NULL WHERE id IN ("
+                    + ",".join("?" * len(chunk)) + ") "
+                    "AND text_snapshot IS NOT NULL", chunk)
+                self.conn.commit()
+            total += cur.rowcount
+        return total
+
+    def clear_missing_file_paths(self, tg_media_dir, dry_run=False):
+        """Set pages.screenshot_path / thumbnail_path and
+        tg_messages.media_path to NULL where the file no longer exists
+        (pruned by ops/retention.sh, or removed by hand), so the dashboard
+        stops linking to it. A path whose directory is missing as a whole
+        (loot not mounted) is left alone. Returns {column: count}."""
+        def page_file(p):
+            return p, os.path.dirname(p)
+
+        def media_file(p):
+            return os.path.join(tg_media_dir, p), tg_media_dir
+
+        counts = {}
+        for table, col, resolve in (("pages", "screenshot_path", page_file),
+                                    ("pages", "thumbnail_path", page_file),
+                                    ("tg_messages", "media_path", media_file)):
+            counts[col] = 0
+            last_id = 0
+            while True:
+                with self.lock:
+                    rows = self.conn.execute(
+                        f"SELECT id, {col} FROM {table} WHERE id > ? "
+                        f"  AND {col} IS NOT NULL AND {col} != '' "
+                        "ORDER BY id LIMIT ?",
+                        (last_id, self._RETENTION_CHUNK)).fetchall()
+                if not rows:
+                    break
+                last_id = rows[-1][0]
+                missing = []
+                for rid, p in rows:
+                    path, root = resolve(p)
+                    if os.path.isdir(root) and not os.path.isfile(path):
+                        missing.append((rid, p))
+                if missing and not dry_run:
+                    with self.lock:
+                        # Only if the path is unchanged since it was read.
+                        self.conn.executemany(
+                            f"UPDATE {table} SET {col} = NULL "
+                            f"WHERE id = ? AND {col} = ?", missing)
+                        self.conn.commit()
+                counts[col] += len(missing)
+        return counts
+
+    def wal_checkpoint(self):
+        """PRAGMA wal_checkpoint(TRUNCATE): copy the WAL into the database
+        and truncate it. Returns (busy, wal_pages, checkpointed_pages);
+        busy=1 means a reader (the dashboard) kept it from finishing."""
+        with self.lock:
+            return tuple(self.conn.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
 
     # ── User keyword management ───────────────────────────────────────────
     def add_keyword(self, keyword, severity="medium", category="user"):
@@ -2047,10 +2209,54 @@ class Alerter:
 # ─── HTML Sanitizer ──────────────────────────────────────────────────────────
 
 class HTMLSanitizer:
+    # Saved pages are opened in an analyst's browser. The policy is the
+    # backstop for everything the tag and attribute rules below miss: no
+    # script, frame, fetch, form or remote load, only inline styles and
+    # data: images, media and fonts.
+    CSP = ("default-src 'none'; img-src data:; media-src data:; "
+           "font-src data:; style-src 'unsafe-inline'; base-uri 'none'; "
+           "form-action 'none'")
+
     TRACKING_PATTERNS = [
-        r'url\(["\x27]?https?://[^)]+["\x27]?\)',
-        r'@import\s+["\x27]https?://',
+        r'url\(\s*["\x27]?\s*(?:https?:)?//[^)]+["\x27]?\s*\)',
+        r'@import\s+["\x27](?:https?:)?//',
     ]
+
+    # Attributes a browser reads as a URL.
+    URL_ATTRS = {"src", "href", "action", "formaction", "srcset", "poster",
+                 "background", "data", "xlink:href", "cite", "longdesc",
+                 "lowsrc", "dynsrc", "ping", "manifest", "codebase", "icon"}
+
+    # (tag, attribute) pairs that load a resource as soon as the page is
+    # shown. A remote value moves to data-original-<attribute>.
+    REMOTE_LOADS = {"video": ("src", "poster"), "audio": ("src",),
+                    "source": ("src", "srcset"), "track": ("src",),
+                    "image": ("href", "xlink:href"), "link": ("href",),
+                    "img": ("srcset",)}
+
+    # A scheme ("http:x" is remote from a file:// page too) or a
+    # protocol-relative "//", after _norm_url.
+    _REMOTE = re.compile(r"^(?:[a-z][a-z0-9+.\-]*:|//)")
+
+    @staticmethod
+    def _norm_url(val):
+        """The URL as a browser reads its scheme: without control
+        characters or whitespace (so "java\\tscript:" is javascript:), with
+        "\\" read as "/", lower-cased."""
+        return re.sub(r"[\x00-\x20\x7f\s]+", "", str(val)).replace(
+            "\\", "/").lower()
+
+    @staticmethod
+    def _is_remote(norm):
+        return (bool(HTMLSanitizer._REMOTE.match(norm))
+                and not norm.startswith("data:"))
+
+    @staticmethod
+    def _srcset_is_remote(norm):
+        # Candidates are comma-separated, but data: URLs contain commas
+        # too, so any "//" or non-data scheme counts.
+        return "//" in norm or bool(
+            re.search(r"(?:^|,)(?!data:)[a-z][a-z0-9+.\-]*:", norm))
 
     @staticmethod
     def sanitize(html, config):
@@ -2075,18 +2281,28 @@ class HTMLSanitizer:
         for tag in soup.find_all(["form", "input", "button", "textarea", "select"]):
             tag.decompose()
 
+        # <base> would point every relative URL at a remote host.
+        for tag in soup.find_all("base"):
+            tag.decompose()
+
         # strip tracking and event handlers
         if config.get("strip_tracking", True):
             for tag in soup.find_all(True):
                 for attr in list(tag.attrs.keys()):
                     if attr.lower().startswith("on"):
                         del tag[attr]
-                    if attr in ("src", "href", "action"):
-                        val = str(tag.get(attr, ""))
-                        if val.strip().lower().startswith("javascript:"):
+                        continue
+                    if attr.lower() in HTMLSanitizer.URL_ATTRS:
+                        val = HTMLSanitizer._norm_url(tag.get(attr, ""))
+                        if (val.startswith(("javascript:", "vbscript:"))
+                                or (val.startswith("data:")
+                                    and not val.startswith("data:image/"))):
                             del tag[attr]
-                        if val.strip().lower().startswith("data:") and "script" in val.lower():
-                            del tag[attr]
+                    elif attr.lower() == "style":
+                        text = str(tag[attr])
+                        for pattern in HTMLSanitizer.TRACKING_PATTERNS:
+                            text = re.sub(pattern, "/* REMOVED */", text, flags=re.I)
+                        tag[attr] = text
 
             # remove tracking pixels
             for img in soup.find_all("img"):
@@ -2096,9 +2312,21 @@ class HTMLSanitizer:
                     img.decompose()
                     continue
                 src = img.get("src", "")
-                if src.startswith("http"):
+                if HTMLSanitizer._is_remote(HTMLSanitizer._norm_url(src)):
                     img["src"] = "[EXTERNAL_IMAGE_REMOVED]"
                     img["data-original-src"] = src
+
+            # media, SVG images and stylesheets that load on view
+            for tag in soup.find_all(list(HTMLSanitizer.REMOTE_LOADS)):
+                for attr in HTMLSanitizer.REMOTE_LOADS[tag.name]:
+                    if not tag.has_attr(attr):
+                        continue
+                    norm = HTMLSanitizer._norm_url(tag[attr])
+                    if (HTMLSanitizer._srcset_is_remote(norm)
+                            if attr == "srcset"
+                            else HTMLSanitizer._is_remote(norm)):
+                        tag["data-original-" + attr.replace(":", "-")] = tag[attr]
+                        del tag[attr]
 
             # strip meta refresh
             for meta in soup.find_all("meta"):
@@ -2117,6 +2345,23 @@ class HTMLSanitizer:
                 rel = " ".join(link.get("rel", []))
                 if "stylesheet" not in rel.lower():
                     link.decompose()
+
+        # The policy goes last, as the first child of <head>, so that no
+        # element the page carries comes before it.
+        html_tag = soup.find("html")
+        if html_tag is None:
+            html_tag = soup.new_tag("html")
+            for node in list(soup.contents):
+                if not isinstance(node, Doctype):
+                    html_tag.append(node.extract())
+            soup.append(html_tag)
+        head = html_tag.find("head", recursive=False)
+        if head is None:
+            head = soup.new_tag("head")
+            html_tag.insert(0, head)
+        head.insert(0, soup.new_tag(
+            "meta", attrs={"http-equiv": "Content-Security-Policy",
+                           "content": HTMLSanitizer.CSP}))
 
         # Operator fingerprint removed: no timestamped comment injected.
         # Saved pages must not reveal when/which operator touched them.
@@ -5187,6 +5432,37 @@ class DarkWebCrawler:
         os.makedirs(os.path.join(self.loot_dir, "screenshots"), exist_ok=True)
         os.makedirs(self.thumbnails_dir, exist_ok=True)
 
+    def delete_url(self, url_id):
+        """Delete a URL's rows (Database.delete_url), then, best effort, the
+        files they pointed to: screenshots, thumbnails, downloaded Telegram
+        media and the channel avatar. Only files inside their own loot
+        directory are removed; a failure is logged and skipped. Saved HTML
+        copies (loot/pages) are not tracked per URL; ops/retention.sh ages
+        them out. Returns the number of files removed."""
+        files = self.db.delete_url(url_id) or {}
+        tg_media = os.path.join(self.loot_dir, "tg-media")
+        targets = [(p, os.path.join(self.loot_dir, "screenshots"))
+                   for p in files.get("screenshots", [])]
+        targets += [(p, self.thumbnails_dir) for p in files.get("thumbnails", [])]
+        targets += [(os.path.join(tg_media, p), tg_media)
+                    for p in files.get("tg_media", []) + files.get("avatars", [])]
+        removed = 0
+        for path, base in targets:
+            full = os.path.realpath(path)
+            if not full.startswith(os.path.realpath(base) + os.sep):
+                log.warning(f"delete_url: not removing {path}: outside {base}")
+                continue
+            try:
+                os.remove(full)
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.warning(f"delete_url: could not remove {path}: {e}")
+        if removed:
+            log.info(f"delete_url: removed {removed} file(s) of URL {url_id}")
+        return removed
+
     def rotate_tor_circuit(self):
         """Request a new Tor circuit via the ControlPort (NEWNYM).
         Silently no-ops if stem or ControlPort is unavailable — scans must
@@ -5688,6 +5964,9 @@ class DarkWebCrawler:
         if self.db.page_seen(content_hash):
             log.debug(f"  Skipping duplicate content: {page_url}")
             return 0
+        # Saved copy (loot/pages) only for content not stored before: an
+        # unchanged page on every monitor check used to add a file each time.
+        self.save_page(page_url, html)
 
         # IOC extraction: clean text + HTML context (attrs, meta, comments, <pre>).
         # Keys from both passes are merged; dedup via set().
@@ -5971,7 +6250,7 @@ class DarkWebCrawler:
 
             pages_scanned += 1
 
-            self.save_page(current_url, html)
+            # scan_page saves the HTML copy itself, for new content only.
             findings = self.scan_page(url_id, current_url, html)
             total_findings += findings
 
@@ -6073,10 +6352,18 @@ class DarkWebCrawler:
             findings = [f for f in findings if keyword.lower() in json.dumps(f).lower()]
         return findings
 
+    REPORT_MAX_FINDINGS = 1000
+
     def generate_report(self, min_score=0):
-        findings = self.db.get_findings(min_score=min_score, limit=1000)
+        # One row past the cap tells whether older findings were left out.
+        cap = self.REPORT_MAX_FINDINGS
+        findings = self.db.get_findings(min_score=min_score, limit=cap + 1)
+        truncated = len(findings) > cap
+        findings = findings[:cap]
         stats = self.db.get_stats()
-        report = {"generated_at": datetime.now().isoformat(), "statistics": stats, "findings": findings}
+        report = {"generated_at": datetime.now().isoformat(), "statistics": stats,
+                  "findings_included": len(findings), "truncated": truncated,
+                  "findings": findings}
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = os.path.join(self.reports_dir, f"report_{ts}.json")
@@ -6093,6 +6380,9 @@ class DarkWebCrawler:
             for k, v in stats.items():
                 f.write(f"  {k}: {v}\n")
             f.write("\n")
+            if truncated:
+                f.write(f"NOTE: report truncated: only the newest {cap} findings are "
+                        "included below. Use Export CSV for more.\n\n")
 
             for sev in ["critical", "high", "medium", "low"]:
                 sev_findings = [x for x in findings if x.get("severity") == sev]
@@ -6143,21 +6433,118 @@ def _substitute_env(value):
     return value
 
 
-def load_config(config_path):
-    config = DEFAULT_CONFIG.copy()
+# Operator overrides merged over config.json, so local settings live outside
+# the git checkout (deploy.sh refuses a dirty tree). Compose mounts
+# $DARKWEBAPP_DATA_ROOT/config.d read-only at /app/config.local.d. An empty
+# DARKWATCH_CONFIG_LOCAL turns the override off.
+DEFAULT_CONFIG_LOCAL = "/app/config.local.d/config.local.json"
+
+
+def _deep_merge(base, override):
+    """Merge `override` into `base` in place: nested dicts merge key by
+    key, so keys the override doesn't name keep their value; anything else
+    (lists included) is replaced. Returns `base`."""
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def _read_config_file(path, missing_ok=False):
+    """Parse one config file and resolve its ${VAR} placeholders. A file
+    that exists but can't be read or isn't a JSON object is an error, not
+    something to skip: running on half the operator's settings is worse
+    than not starting. With `missing_ok`, a file that doesn't exist gives
+    None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        if missing_ok:
+            return None
+        raise ValueError(f"cannot read config file {path}: {e}") from e
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(f"config file {path} is not valid JSON: {e}") from e
+    except OSError as e:
+        raise ValueError(f"cannot read config file {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"config file {path} must hold a JSON object, "
+                         f"not {type(data).__name__}")
+    # Resolve ${VAR} placeholders against the environment BEFORE merging,
+    # so DEFAULT_CONFIG fallbacks aren't shadowed by unsubstituted literal
+    # strings.
+    return _substitute_env(data)
+
+
+def load_config(config_path, local_path=None):
+    """DEFAULT_CONFIG, then `config_path` (config.json), then the local
+    override file (`local_path`, else $DARKWATCH_CONFIG_LOCAL, else
+    DEFAULT_CONFIG_LOCAL), each merged recursively over the one before.
+    Missing files are skipped; invalid ones raise ValueError."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if config_path and os.path.exists(config_path):
-        with open(config_path) as f:
-            user_config = json.load(f)
-        # Resolve ${VAR} placeholders against the environment BEFORE
-        # merging, so DEFAULT_CONFIG fallbacks aren't shadowed by
-        # unsubstituted literal strings.
-        user_config = _substitute_env(user_config)
-        for key in user_config:
-            if isinstance(user_config[key], dict) and key in config:
-                config[key].update(user_config[key])
-            else:
-                config[key] = user_config[key]
+        _deep_merge(config, _read_config_file(config_path))
+    if local_path is None:
+        local_path = os.environ.get("DARKWATCH_CONFIG_LOCAL", DEFAULT_CONFIG_LOCAL)
+    # Opened rather than checked with os.path.exists, which also says False
+    # for a file darkwatch may not look up (EACCES), and that must fail.
+    local = _read_config_file(local_path, missing_ok=True) if local_path else None
+    if local is not None:
+        _deep_merge(config, local)
+        log.info(f"config: applied local overrides from {local_path}")
     return config
+
+
+def run_retention(db, loot_dir, retention_cfg=None, dry_run=False):
+    """Apply the database retention steps (see DEFAULT_CONFIG["retention"])
+    and log what each one did. `dry_run` only counts. Returns the counts.
+    Deletes and NULLs cannot be undone: the backup taken before v0.4.0 is
+    the only way back."""
+    rc = dict(DEFAULT_CONFIG["retention"])
+    rc.update(retention_cfg or {})
+    # A dashboard write can hold the lock for a moment; wait for it.
+    db.conn.execute("PRAGMA busy_timeout = 30000")
+    def did(done, would):
+        return would if dry_run else done
+    tag = "retention (dry run)" if dry_run else "retention"
+    out = {}
+    days = int(rc.get("monitor_events_days") or 0)
+    if days > 0:
+        out["monitor_events"] = db.prune_monitor_events(days, dry_run=dry_run)
+        log.info(f"{tag}: monitor_events: {out['monitor_events']} row(s) "
+                 f"older than {days} days {did('deleted', 'to delete')}")
+    else:
+        log.info(f"{tag}: monitor_events: step off")
+    days = int(rc.get("text_snapshot_days") or 0)
+    if days > 0:
+        out["text_snapshots"] = db.prune_text_snapshots(days, dry_run=dry_run)
+        log.info(f"{tag}: pages.text_snapshot: {out['text_snapshots']} "
+                 f"snapshot(s) older than {days} days and not the newest "
+                 f"of their page {did('set to NULL', 'to set to NULL')}")
+    else:
+        log.info(f"{tag}: pages.text_snapshot: step off")
+    if rc.get("clear_missing_files", True):
+        missing = db.clear_missing_file_paths(
+            os.path.join(loot_dir, "tg-media"), dry_run=dry_run)
+        out.update(missing)
+        log.info(f"{tag}: paths whose file is gone "
+                 f"{did('set to NULL', 'to set to NULL')}: "
+                 + ", ".join(f"{k}={v}" for k, v in missing.items()))
+    else:
+        log.info(f"{tag}: missing file paths: step off")
+    if rc.get("wal_checkpoint", True) and not dry_run:
+        # A pending TRUNCATE checkpoint blocks new writers while it waits for
+        # readers: wait briefly (writers use a 5 s timeout) and leave a busy
+        # checkpoint to the next nightly run.
+        db.conn.execute("PRAGMA busy_timeout = 1000")
+        busy, wal, done = db.wal_checkpoint()
+        out["wal_checkpoint"] = {"busy": busy, "wal_pages": wal,
+                                 "checkpointed": done}
+        log.info(f"{tag}: wal_checkpoint(TRUNCATE): busy={busy} "
+                 f"wal_pages={wal} checkpointed={done}")
+    return out
 
 
 def main():
@@ -6173,9 +6560,12 @@ Examples:
   python darkwatch.py --findings --keyword "example" --min-score 80
   python darkwatch.py --report
   python darkwatch.py --stats
+  python darkwatch.py --retention --dry-run
         """)
 
-    parser.add_argument("--config", "-c", default="config.json")
+    # Same config file as the dashboard (web.py) when run in its container.
+    parser.add_argument("--config", "-c",
+                        default=os.environ.get("DARKWATCH_CONFIG", "config.json"))
     parser.add_argument("--url", "-u", help="Crawl a single .onion URL")
     parser.add_argument("--depth", "-d", type=int, help="Override crawl depth")
     parser.add_argument("--crawl-all", action="store_true")
@@ -6187,10 +6577,38 @@ Examples:
     parser.add_argument("--stats", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--test-tor", action="store_true")
+    parser.add_argument("--retention", action="store_true",
+                        help="Apply database retention (config 'retention'); "
+                             "ops/retention.sh runs it nightly")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --retention: only count, change nothing")
+    parser.add_argument("--monitor-events-days", type=int, metavar="DAYS",
+                        help="With --retention: override "
+                             "retention.monitor_events_days (0 = off)")
+    parser.add_argument("--text-snapshot-days", type=int, metavar="DAYS",
+                        help="With --retention: override "
+                             "retention.text_snapshot_days (0 = off)")
 
     args = parser.parse_args()
+    if not args.retention and (args.dry_run or args.monitor_events_days is not None
+                               or args.text_snapshot_days is not None):
+        parser.error("--dry-run and the --*-days options need --retention")
     setup_logging(args.debug)
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except ValueError as e:
+        sys.exit(f"darkwatch: {e}")
+
+    if args.retention:
+        # Database and loot dir only: no crawler, so no screenshot worker,
+        # YARA compile or Tor session in this one-off process.
+        rcfg = dict(config.get("retention") or {})
+        for key in ("monitor_events_days", "text_snapshot_days"):
+            if getattr(args, key) is not None:
+                rcfg[key] = getattr(args, key)
+        run_retention(Database(config["database"]["path"]),
+                      config["output"]["loot_dir"], rcfg, dry_run=args.dry_run)
+        return
 
     if args.depth:
         config["crawler"]["max_depth"] = args.depth

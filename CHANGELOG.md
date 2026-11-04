@@ -17,6 +17,110 @@
   not. If you roll back, stop darkwatch, copy the file back with `cp -p`
   before starting the old image, or log in to Telegram again with the QR
   code.
+- Scans, scheduled crawls and the mid-scan check now wait until Tor
+  reports a circuit, so after a tor restart they are held until Tor has
+  bootstrapped. If the dashboard's "Tunnel 1 (Tor circuits)" detail says
+  "Tor circuits not checked", Tor's ControlPort did not answer: check that
+  `TOR_CONTROL_PASSWORD` reaches darkwatch's config (see
+  `ops/RUNBOOK.md`).
+
+- **Retention now also prunes the database, and deploy schedules it.**
+  Back up first, including `darkwatch/loot` (RUNBOOK, "Back up and
+  restore"): the deletes and NULLs below cannot be undone, and that backup
+  is the only way back. `ops/retention.sh` additionally removes downloaded
+  Telegram media older than 180 days (`loot/tg-media`, avatars excluded)
+  and then, inside the running darkwatch container, deletes monitor history
+  (`monitor_events`) older than 180 days and sets page text snapshots older
+  than 365 days to NULL, keeping the newest snapshot of each page so a
+  rescan still covers it. Page and finding rows are never deleted. Run
+  `sudo ./ops/retention.sh --dry-run` to see what the first run will
+  remove; change the windows with the `RETENTION_*` variables in
+  `/var/lib/darkwebapp/env` (RUNBOOK, "Retention"). `ops/deploy.sh` now
+  installs the nightly job as `/etc/cron.d/darkwatch-retention` and removes
+  the `ops/retention.sh` line the old RUNBOOK had you add to root's
+  crontab, keeping your other jobs. After deploying, `grep -c retention.sh
+  /etc/cron.d/darkwatch-retention` prints 1 and `sudo crontab -l
+  2>/dev/null | grep -c retention.sh || true` prints 0. The database file
+  does not shrink by itself; RUNBOOK describes a manual VACUUM with the
+  stack stopped.
+
+- **Local settings move to `/var/lib/darkwebapp/config.d/config.local.json`.**
+  darkwatch now merges that file over `darkwatch/config.json` at start
+  (compose mounts `config.d` read-only; `bootstrap.sh`, which `deploy.sh`
+  re-runs when the directory is missing, creates it `root:999` `0750`).
+  Nested keys the file doesn't name keep their `config.json` value, and
+  `"${VAR}"` values are read from the env file as in `config.json`. A file
+  that is not valid JSON, not an object or not readable by uid/gid 999
+  stops darkwatch from starting; a missing file is fine. If you edited
+  `darkwatch/config.json` on the VM, copy the keys you changed into
+  `config.local.json` (`root:999`, `0640`), then `sudo git checkout
+  darkwatch/config.json` and deploy. `deploy.sh` still refuses a dirty
+  checkout, and now names the override file when `config.json` is the only
+  modified file. Add `config.d` to your backups (RUNBOOK, "Local config
+  overrides").
+
+- **Dashboard login (optional).** If `DARKWATCH_BIND_IP` is not a loopback
+  address and `DARKWATCH_AUTH_TOKEN` is unset, `ops/deploy.sh` now warns
+  that the dashboard has no login; it also warns about a token shorter than
+  32 characters.
+  Turn it on with `echo "DARKWATCH_AUTH_TOKEN=$(openssl rand -hex 32)" |
+  sudo tee -a /var/lib/darkwebapp/env` before deploying, then sign in at
+  `/login`; a Prometheus scraper of `/metrics` then needs the token as a
+  bearer token. See README, "Dashboard login".
+
+- **Setup UI: sign in again after the upgrade.** Session cookies from
+  earlier releases are no longer accepted, and new ones last 12 hours
+  instead of 7 days. A `SETUP_AUTH_TOKEN` shorter than 32 characters is now
+  treated as unset: every Setup UI request gets 401 and the setup container
+  logs why; `ops/deploy.sh` and `ops/bootstrap.sh` warn about it too
+  (without printing the value). The one `bootstrap.sh` generates is 64
+  characters; if you set a shorter one by hand, replace it with
+  `openssl rand -hex 32` (no restart needed).
+
+### Security
+- The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
+  holds the issue time and an HMAC of it keyed by the token, is valid for
+  12 hours, and is checked against the token in the env file on every
+  request, so changing the token signs every session out. The cookie is
+  marked `Secure` when the request came over HTTPS, directly or with
+  `X-Forwarded-Proto: https` from a reverse proxy. Tokens shorter than 32
+  characters are refused (see Upgrade notes), and failed sign-ins on
+  `/auth` are logged with the client IP, never the value submitted.
+- Saved HTML copies (`loot/pages`) no longer make network requests when
+  you open them. The sanitizer now puts a Content-Security-Policy first
+  in `<head>` (adding a `<head>` if the page has none): only inline
+  styles and `data:` images, media and fonts, no scripts, frames, forms or
+  `<base>`. It also removes `<base>`, reads URL attributes the way a browser
+  does (control characters and whitespace removed, so `java\tscript:` is
+  caught) and drops `javascript:`, `vbscript:` and every `data:` URL that is
+  not an image. Remote loads, protocol-relative `//host` ones included, are
+  taken out of `<img>`, `<video>`, `<audio>`, `<source>`, `<track>`, SVG
+  `<image>`, stylesheet links and `srcset` (the URL is kept in a
+  `data-original-*` attribute), and `url(//host)` (with or without quotes
+  or whitespace inside the parentheses) / `@import "//host"` are removed
+  from `<style>` and `style=""`. Pages saved before this release
+  are not rewritten and keep their remote references.
+- Optional dashboard login. Set `DARKWATCH_AUTH_TOKEN` (at least 32
+  characters, `openssl rand -hex 32`) in `/var/lib/darkwebapp/env` and every
+  dashboard request needs it, as `Authorization: Bearer <token>` or the
+  session cookie the new `/login` page sets: HttpOnly, `SameSite=Strict`,
+  valid 7 days, not `Secure` (the usual way in is plain http through an SSH
+  tunnel), holding a timestamp signed with the token rather than the token.
+  `/healthz`, `/login` and `/static/` stay open; `/metrics` needs the Bearer
+  header. Without a valid session the dashboard sends the browser to
+  `/login`, also when a request or the deep-search stream fails with 401. A
+  shorter token fails closed (every request gets 401, logged), and failed
+  sign-ins are logged with the client IP only. Unset, as by default, nothing
+  changes. `ops/deploy.sh` now warns, without failing, when
+  `DARKWATCH_BIND_IP` is not a loopback address and no token is set, or when
+  the token is too short (never printing it). `ops/install.sh`, when you
+  let it bind the dashboard to the host's private IP, now offers to
+  generate the token into the env file (default yes, also with `--yes`) and
+  warns when you decline.
+  `ops/RUNBOOK.md`, "Roll back a release", now says what rolling back past
+  this release undoes: the older dashboard has no login (set
+  `DARKWATCH_BIND_IP=127.0.0.1` first), the older darkwatch ignores
+  `config.d/config.local.json`, and the retention cron job stays installed.
 
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
@@ -118,8 +222,87 @@
   lock, so it does not hold up a sign-in, search or scrape, and the
   channel's cursor is read after the delay, so a scrape during the delay
   is taken into account.
+- The dashboard picks up a scan it did not start. A scan started in
+  another tab, or running when the page was reloaded, showed as idle with
+  no progress or log until it ended; the dashboard now checks on load and
+  every 30 seconds and switches to the scan view. A failed status poll no
+  longer ends the scan view with "Scan complete", and a request that
+  can't reach the dashboard shows an error instead of failing silently
+  (lists already on screen are kept).
+- Every open dashboard gets every live log line. `/api/status` handed
+  each line to whichever tab polled first, so two tabs each saw part of
+  the log. The last 2000 lines are now kept in memory with a sequence
+  number: `/api/status?since=<log_seq>` returns the lines after it, plus
+  `log_seq` and `logs_gap` (true when lines between were dropped);
+  without `since` it returns the last 200 lines. The log panel says
+  "earlier lines not shown" when there is a gap.
+- A toast closes after 3.5 seconds during a scan too; the scan clock
+  restarted its timer every second, so it stayed up until the scan ended.
+- A non-numeric `max_hops` on `/api/telegram/search/deep` and
+  `/api/telegram/chain/<id>` returns 400 instead of a 500.
+- Truncation is visible. A report holds at most the newest 1000 findings;
+  its JSON now has `findings_included` and `truncated`, and the TXT
+  summary says when findings were left out. The findings CSV export
+  (`/api/findings.csv`) stopped silently at 5000 rows; it now streams up
+  to 100,000 and reports `X-Findings-Total` and `X-Findings-Truncated`
+  headers. The file itself holds only findings.
+- The Tunnel 1 ("VPN") health check only probed Tor's SOCKS port, which
+  accepts connections with Tunnel 1 down, and the quick check (polled
+  every 30 seconds, every 2 seconds during a scan, and by the monitor
+  scheduler before it crawls) made that same probe twice. The check now
+  asks Tor's ControlPort for `status/circuit-established` (2 s timeout),
+  like the tor container's healthcheck, and fails when Tor has no
+  circuit, so scans and scheduled crawls wait while Tor bootstraps. When
+  the ControlPort doesn't answer it falls back to the SOCKS probe and
+  says so. The quick check makes one SOCKS probe and reuses a ControlPort
+  answer for 10 seconds (Tor logs every control connection); the full
+  check before a scan asks afresh. The dashboard labels
+  these checks "Tunnel 1 (Tor circuits)" and "Telegram SOCKS reachable".
+
+- Storage growth. A crawl saved an HTML copy (`loot/pages`) of every
+  fetched page, also when its content was already stored, so each monitor
+  check of an unchanged page added a file; it now saves one only for new
+  content. A rescan read every stored page text at once while holding the
+  database lock; it now reads 200 pages per lock acquisition. Deleting a
+  URL now also removes its screenshots, thumbnails, downloaded Telegram
+  media and channel avatar (best effort; saved HTML copies are not tracked
+  per URL and age out with retention). New `darkwatch.py --retention
+  [--dry-run]` applies the database retention (config section
+  `retention`; `--monitor-events-days` and `--text-snapshot-days` override
+  it, 0 turns a step off) and logs a count per step: old monitor events,
+  old text snapshots, screenshot/thumbnail/media paths whose file is gone
+  (set to NULL, so the dashboard stops offering a thumbnail that would
+  answer 404) and a `wal_checkpoint(TRUNCATE)`.
+- `ops/retention.sh` prunes the files first and runs the database step
+  only when the darkwatch container is running; otherwise it warns and
+  still exits 0. A failed database step only warns and exits 3, after the
+  files were pruned. A window that is not a whole number stops it before
+  anything is deleted. It takes `--dry-run` and reads its windows from the
+  env file. A file that disappears before it is hashed (a URL deleted in
+  the dashboard meanwhile) is logged with `sha256=unknown` instead of
+  aborting the run.
+- Loading the config no longer writes into the built-in defaults: it
+  copied them shallowly and then updated the nested sections in place, so a
+  second load (or `run_retention`'s fallback) saw the first file's values,
+  and two loaded configs shared their sections. An invalid `config.json`
+  now ends the CLI with a one-line error naming the file instead of a
+  traceback.
+- `darkwatch.py --config` now defaults to `$DARKWATCH_CONFIG` (else
+  `config.json`), as `web.py` already did, so the CLI and `--retention`
+  read the same config as the dashboard.
 
 ### Internal
+- New `darkwatch/tests/test_sanitizer.py` covers the saved-page sanitizer,
+  including a headless-Chromium check that a sanitized page opened from
+  `file://` makes no request (skipped without a Playwright Chromium;
+  `DARKWATCH_TEST_CHROMIUM` names another binary).
+- New `tests/retention/check.sh` (run in CI) tests `ops/retention.sh` and
+  the cron install (`ops/lib/retention-cron.sh`) with docker and crontab
+  stubbed; `darkwatch/tests/test_retention.py` covers the database steps,
+  the batched rescan read, file removal on URL delete and `/api/findings`
+  after retention on a copy of a populated database. The image smoke test
+  (`tests/images/smoke.sh`) runs `darkwatch.py --retention --dry-run` in
+  the darkwatch image.
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new
   `tests/images/smoke.sh`, every container under `--network none` and a

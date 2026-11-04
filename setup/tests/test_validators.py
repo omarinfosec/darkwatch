@@ -6,7 +6,7 @@ import sys
 import pytest
 
 # Make main.py importable. Set required env so import doesn't SystemExit.
-os.environ.setdefault("SETUP_AUTH_TOKEN", "test-token-fixture")
+os.environ.setdefault("SETUP_AUTH_TOKEN", "t" * 64)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 

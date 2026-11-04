@@ -21,8 +21,8 @@
       <h2>Sign in</h2>
       <p class="helper">
         Paste your <code>SETUP_AUTH_TOKEN</code> once. An HttpOnly session cookie
-        is stored for 7 days so you can open Settings from the main dashboard
-        without the long URL.
+        is stored for 12 hours so you can open Settings from the main dashboard
+        without the long URL. Changing the token signs every session out.
       </p>
       {% if auth_error %}
       <p class="result err">{{ auth_error }}</p>

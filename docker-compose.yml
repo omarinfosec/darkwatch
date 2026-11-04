@@ -189,8 +189,17 @@ services:
       # compiled at startup and via the Rules tab. Writable from the dashboard.
       - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/darkwatch/yara-private:/app/yara-private:rw
       - ./darkwatch/config.json:/app/config.json:ro
+      # Operator overrides, merged over config.json: put local settings in
+      # ${DARKWEBAPP_DATA_ROOT}/config.d/config.local.json instead of editing
+      # the tracked file (deploy.sh refuses a dirty checkout). Read at start:
+      # `docker compose restart darkwatch` applies a change. The directory is
+      # mounted, not the file, so a restart also sees a file that was added
+      # or replaced (a file mount keeps the old one). ops/bootstrap.sh
+      # creates it root-owned, readable by darkwatch's group (999).
+      - ${DARKWEBAPP_DATA_ROOT:-/var/lib/darkwebapp}/config.d:/app/config.local.d:ro
     environment:
       - DARKWATCH_CONFIG=/app/config.json
+      - DARKWATCH_CONFIG_LOCAL=/app/config.local.d/config.local.json
       # The env file holds the Setup UI's bearer token; darkwatch has no use
       # for it, so blank it here (environment: overrides env_file).
       - SETUP_AUTH_TOKEN=
@@ -218,7 +227,9 @@ services:
     # the corresponding feature (Tor crawl or Telegram scrape) is just
     # unavailable, and the dashboard shows it as such.
     healthcheck:
-      # /healthz, not /api/status — the latter drains the dashboard log queue.
+      # /healthz, not /api/status: /healthz is exempt from the optional
+      # dashboard login (DARKWATCH_AUTH_TOKEN), and /api/status queries the
+      # database on every call.
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz > /dev/null || exit 1"]
       interval: 15s
       timeout: 10s

@@ -30,7 +30,7 @@ sudo grep -c '^TG_SOCKS_PASSWORD=.\+' /var/lib/darkwebapp/env   # 1
 sudo docker image inspect darkwatch-setup:local -f '{{.Created}}' # after you started this upgrade, not the v0.2.0/v0.3.0 install date
 ```
 
-`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes, if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
+`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes (for local edits to `darkwatch/config.json` it points you at the [override file](#local-config-overrides) instead), if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
 
 The plain `sudo docker compose …` commands below read their settings through that `.env` link.
 
@@ -49,7 +49,7 @@ sudo docker exec tunnel1 iptables -S DW_KS_IN        # inbound drop on wg0
 ```
 `verify-egress.sh` checks all of these. Three layers stop the host's real IP from leaking:
 - **Tunnel kill switch** (`tunnels/killswitch/10-killswitch.sh`): inside tunnel1/tunnel2, nothing may leave except through WireGuard, so if a tunnel drops, Tor and Telegram traffic is rejected instead of exiting via Docker's NAT. The tunnels only report healthy (and tor / tg-socks only start) once it is in place. It also drops new connections arriving through WireGuard, so the VPN side can't reach Tor's SOCKS and control ports. A hostname `Endpoint` is resolved once at tunnel start, before egress closes, and pinned in the container's `/etc/hosts` (`docker logs tunnel1 2>&1 | grep killswitch` shows it); if the VPN changes that address, recreate the tunnel with its sidecar (`sudo docker compose up -d --force-recreate tunnel1 tor`, or `tunnel2 tg-socks`).
-- **Egress lockdown** (`ops/egress-lockdown.sh`): a host firewall rule so the darkwatch container can only talk to the darknet subnet (the proxies). Alerts go out through the Telegram tunnel, falling back to Tor; set `alerts.allow_direct` in `config.json` only if you accept them leaving from the host. Before every scan the dashboard's `ip_leak` check opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` and refuses to start (403, `ip_leak` in the failed list) if either connects or is refused (`ECONNREFUSED`: the lockdown drops, so a refusal means the packet got out); only timeouts, no-route errors and `EPERM` pass. With `DARKWATCH_EGRESS_LOCKDOWN=0` it only compares the Tor exit IP with darkwatch's direct IP, which is a much weaker check.
+- **Egress lockdown** (`ops/egress-lockdown.sh`): a host firewall rule so the darkwatch container can only talk to the darknet subnet (the proxies). Alerts go out through the Telegram tunnel, falling back to Tor; set `alerts.allow_direct` in your [config override](#local-config-overrides) only if you accept them leaving from the host. Before every scan the dashboard's `ip_leak` check opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` and refuses to start (403, `ip_leak` in the failed list) if either connects or is refused (`ECONNREFUSED`: the lockdown drops, so a refusal means the packet got out); only timeouts, no-route errors and `EPERM` pass. With `DARKWATCH_EGRESS_LOCKDOWN=0` it only compares the Tor exit IP with darkwatch's direct IP, which is a much weaker check.
 - **DNS isolation** (`dns: 127.0.0.1` on darkwatch in `docker-compose.yml`): darkwatch resolves only the service names (`tunnel1`, `tunnel2`); every other lookup goes to 127.0.0.1 inside its own namespace and fails at once. Without it, Docker would send those lookups to the host's resolver, and a loopback one (dnsmasq, unbound, bind) answers them from the host, past the lockdown. Leave `DARKWATCH_DNS` unset; set a real resolver only with `DARKWATCH_EGRESS_LOCKDOWN=0` (which `alerts.allow_direct` also needs to send directly), where darkwatch needs one for direct alerts and the in-app IP-leak check. With the lockdown on, `verify-egress.sh` and `deploy.sh` fail on any other `DARKWATCH_DNS`. On Docker 26 and later, `sudo docker exec darkwatch cat /etc/resolv.conf` contains the line `# ExtServers: [127.0.0.1]` and no `host(`; `host(` there means darkwatch was not recreated with the current compose file (run `sudo ./ops/deploy.sh`). Docker 24/25 write no such line; `verify-egress.sh` then relies on a lookup of `example.com` failing. The tunnels keep the host's DNS (they need it for hostname Endpoints) until WireGuard is up; after that tunnel2 uses the `DNS =` line of its `wg0.conf`, which the Setup UI requires and `verify-egress.sh` warns about when it is missing.
 
 `deploy.sh` applies the lockdown before it starts the containers, and its `darkwatch-egress-lockdown` unit re-applies it at boot before `docker.service` starts them. After each deploy it probes `http://1.1.1.1` from darkwatch (the host is the positive control) and fails if darkwatch connects. After a reboot:
@@ -73,6 +73,21 @@ sudo docker compose logs -f darkwatch  # one service
 ```bash
 sudo docker compose restart darkwatch
 ```
+
+### Local config overrides
+Don't edit `darkwatch/config.json` on the VM: it is tracked, so `deploy.sh` refuses the dirty checkout. Put the settings you change in `/var/lib/darkwebapp/config.d/config.local.json` instead. darkwatch merges it over `config.json` at start (mounted read-only at `/app/config.local.d`), key by key: a nested key the file doesn't name keeps its `config.json` value, and a list replaces the whole list. Like `config.json`, a value that is exactly `"${VAR}"` is read from `/var/lib/darkwebapp/env`, so secrets can stay in the env file.
+```bash
+sudoedit /var/lib/darkwebapp/config.d/config.local.json
+#   {"crawler": {"max_threads": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
+sudo chown root:999 /var/lib/darkwebapp/config.d/config.local.json
+sudo chmod 0640 /var/lib/darkwebapp/config.d/config.local.json
+sudo docker compose restart darkwatch
+sudo docker compose logs darkwatch | grep 'local overrides'   # "config: applied local overrides from ..."
+```
+- darkwatch runs as uid/gid 999 and must be able to read the file: keep it `root:999` and `0640` (`bootstrap.sh` creates `config.d` as `root:999`, `0750`).
+- A file that is not valid JSON, not a JSON object or not readable stops darkwatch from starting (`docker compose logs darkwatch` names the file and the error). A missing file is fine.
+- Moving existing edits: put only the keys you changed into `config.local.json`, then `sudo git checkout darkwatch/config.json` and deploy. Copying the whole file also works, but then changes to `config.json` in later releases never reach you.
+- `ops/retention.sh` and other `darkwatch.py` runs inside the container read the same override.
 
 ### Rebuild after changing the Dockerfile
 ```bash
@@ -133,6 +148,7 @@ tar -C /var/lib/darkwebapp -czf /root/dw-$(git describe --tags)-$(date +%F).tgz 
 chmod 600 /root/dw-*.tgz
 docker compose start darkwatch       # start setup too only if you were using it
 ```
+- From v0.4.0, add `config.d` (your [config overrides](#local-config-overrides)) to the `tar` list.
 - Before upgrading to v0.4.0, add `darkwatch/loot` to the `tar` list: that backup is the only way to get back data that v0.4.0's retention removes.
 - `darkwatch/data` holds the database, `telegram.session` (the Telegram login: whoever has it can use the account) and `user.yar` (your keyword rules). `env` and `secrets` hold every password and WireGuard key. Keep the archive root-only and off shared storage.
 - **Never `cp` the live database.** It runs in WAL mode, and a plain copy of the running file can miss every committed row that is still in the `-wal` file.
@@ -174,6 +190,9 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 - If the two image IDs differ, darkwatch is still running the newer image: run `docker compose up -d darkwatch` and compare again.
 - Run `git checkout main` before the next upgrade. The checkout leaves a detached HEAD, and `git pull --ff-only` (and so `deploy.sh`) fails on it.
 - Database: v0.3.0 runs on a v0.3.1 database as is (the indexes v0.3.1 adds are not UNIQUE), so no restore is needed. Going back past v0.4.0's retention, which removes data, is only possible by restoring the backup taken before v0.4.0.
+- Dashboard login: releases before v0.4.0 ignore `DARKWATCH_AUTH_TOKEN` and `ops/deploy.sh` there does not warn, so a dashboard bound to a non-loopback `DARKWATCH_BIND_IP` comes back with no login. Before rolling back past v0.4.0, set `DARKWATCH_BIND_IP=127.0.0.1` in `/var/lib/darkwebapp/env` (and use an SSH tunnel), or put a reverse proxy with its own auth in front.
+- Config: releases before v0.4.0 read `darkwatch/config.json` alone and ignore `/var/lib/darkwebapp/config.d/config.local.json`, so settings you moved there quietly fall back to the defaults in `config.json`. After the checkout, copy those keys back into `darkwatch/config.json` and commit the change (`git commit -m 'local config' darkwatch/config.json`), since the older `deploy.sh` refuses uncommitted changes. Before the next upgrade, drop that commit (`git checkout main` leaves it behind) and keep the keys in `config.local.json`.
+- The retention cron job (`/etc/cron.d/darkwatch-retention`) stays installed and keeps running the checked-out `ops/retention.sh` nightly. Before v0.4.0 that script only prunes `loot/` files, so it is harmless; remove the file if you don't want it.
 - Telegram login: v0.3.1 and earlier (Telethon 1.36) can't open a `telegram.session` that Telethon 1.45 (the release after v0.3.1) has opened; every Telegram call fails with `too many values to unpack (expected 5)`. Before `./ops/deploy.sh --skip-pull`, with darkwatch stopped (`docker compose stop darkwatch`), copy the pre-upgrade file back: `cp -p /root/telegram.session.pre-upgrade /var/lib/darkwebapp/darkwatch/data/telegram.session`. Otherwise take it from the full backup made before that upgrade, or log in to Telegram again with the QR code after the rollback.
 
 ---
@@ -182,7 +201,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 
 | Cadence    | Task                                                       |
 |------------|------------------------------------------------------------|
-| Nightly    | `ops/retention.sh` purges old `loot/` content (cron job)    |
+| Nightly    | `ops/retention.sh` purges old `loot/` files and database rows ([Retention](#retention), cron job installed by deploy) |
 | Weekly     | `ops/verify-egress.sh` (manual)                             |
 | Weekly     | Review `fail2ban-client status sshd` for SSH brute-force    |
 | Weekly     | Check `Dependency audit` workflow (pip-audit of `darkwatch/requirements.lock`, `setup/requirements.lock`, `requirements-dev.txt`) + Dependabot PRs |
@@ -194,15 +213,70 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 
 ---
 
-## Cron setup
+## Retention
 
-Install on first deploy:
+`ops/deploy.sh` (and `ops/install.sh`) install the nightly job as
+`/etc/cron.d/darkwatch-retention` (03:17, as root, log in
+`/var/log/darkwatch-retention.log`) and rewrite it on every deploy. They also
+remove an `ops/retention.sh` line from root's crontab, which older versions of
+this runbook had you add by hand; other crontab jobs are kept. Check it:
 ```bash
-sudo crontab -l 2>/dev/null > /tmp/cron.bak || true
-echo '0 3 * * * /opt/darkwebapp/ops/retention.sh >> /var/log/darkwatch-retention.log 2>&1' >> /tmp/cron.bak
-sudo crontab /tmp/cron.bak
-rm /tmp/cron.bak
+grep -c retention.sh /etc/cron.d/darkwatch-retention       # 1
+sudo crontab -l 2>/dev/null | grep -c retention.sh || true  # 0
 ```
+A host without `/etc/cron.d` (no cron installed) gets a deploy warning
+instead: run `sudo ./ops/retention.sh` from your own scheduler.
+
+Each run first prunes files under `loot/`, then applies the database steps
+inside the running darkwatch container (`darkwatch.py --retention`). Windows
+are in days; set them in `/var/lib/darkwebapp/env`:
+
+| Variable | Default | What goes |
+|---|---|---|
+| `RETENTION_SCREENSHOT_DAYS` | 90 | screenshots and thumbnails |
+| `RETENTION_PAGE_DAYS` | 90 | saved HTML copies (`loot/pages`) |
+| `RETENTION_REPORT_DAYS` | 365 | reports |
+| `RETENTION_TG_MEDIA_DAYS` | 180 | downloaded Telegram media; never the avatars in `tg-media/channels/` and `tg-media/users/` |
+| `RETENTION_MONITOR_EVENTS_DAYS` | 180 | monitor history rows (`monitor_events`) |
+| `RETENTION_TEXT_SNAPSHOT_DAYS` | 365 | page text kept for rescans (`pages.text_snapshot`, set to NULL); the newest snapshot of each page stays |
+
+`0` turns a database step off (the two database defaults come from the
+`retention` section of darkwatch's config). For the file windows
+(`SCREENSHOT`, `PAGE`, `REPORT`, `TG_MEDIA`) `0` is **not** "off": it removes
+every such file older than a day. The database step also clears the
+screenshot, thumbnail and media paths whose file is gone, so the dashboard
+stops offering them, and checkpoints the WAL. Page and finding rows are never
+deleted: findings keep their page, title and extracted IOCs.
+
+```bash
+sudo ./ops/retention.sh --dry-run    # list what would go; changes nothing
+sudo ./ops/retention.sh              # run now
+```
+- **Nothing it deletes or sets to NULL can be undone.** The only way back is
+  a backup taken before (see [Back up and restore](#back-up-and-restore); for
+  v0.4.0 include `darkwatch/loot`).
+- If darkwatch is not running, the database step is skipped with a warning
+  and the run still exits 0; the next run catches up. If the database step
+  fails, the files are still pruned and the run exits 3.
+- Deleting a URL in the dashboard also removes its screenshots, thumbnails,
+  downloaded Telegram media and channel avatar. Its saved HTML copies are not
+  tracked per URL and age out with `RETENTION_PAGE_DAYS`.
+
+### Shrinking the database file (VACUUM, manual)
+Retention frees space inside `darkwatch.db` for new rows; the file itself
+does not shrink. To shrink it, with the stack stopped and at least the
+database's size free on the disk, after a [backup](#back-up-and-restore):
+```bash
+cd /opt/darkwebapp
+du -h /var/lib/darkwebapp/darkwatch/data/darkwatch.db; df -h /var/lib/darkwebapp
+sudo docker compose stop darkwatch setup
+sudo sqlite3 /var/lib/darkwebapp/darkwatch/data/darkwatch.db 'PRAGMA wal_checkpoint(TRUNCATE); VACUUM;'
+sudo chown 999:999 /var/lib/darkwebapp/darkwatch/data/darkwatch.db*
+sudo docker compose start darkwatch
+```
+Never run VACUUM while darkwatch is running: it needs an exclusive lock for
+the whole rewrite, and the dashboard and scans would fail meanwhile. Nothing
+schedules it.
 
 ---
 
@@ -234,6 +308,14 @@ sudo docker compose logs tunnel1 | tail -30
 sudo docker exec tunnel1 wg show wg0
 ```
 
+### Dashboard: "Tunnel 1 (Tor circuits)" is red
+The dashboard asks Tor's ControlPort (`tunnel1:9051`) whether Tor has built a circuit, the same question as the tor container's healthcheck. "Tor has no circuit" means Tor is up but can't reach the network through Tunnel 1: see the tunnel playbook above, or wait a minute after a restart while Tor bootstraps. When the ControlPort doesn't answer (a wrong `TOR_CONTROL_PASSWORD`, an old tor image), the check falls back to the SOCKS port and its detail says "Tor circuits not checked"; scans are not blocked by that. The dashboard reuses an answer for up to 10 seconds, so a fix can take that long to show.
+```bash
+sudo docker compose ps tor
+# Tor logs each control connection (the check and the healthcheck): hide them
+sudo docker compose logs --tail=300 tor | grep -v 'New control connection'
+```
+
 ### "I committed a secret by mistake"
 1. Stop. Don't push.
 2. `git reset --soft HEAD~1` to uncommit (keeps changes staged).
@@ -255,7 +337,8 @@ You'll need console access via the VM provider.
 | `TELEGRAM_API_ID`        | darkwatch (Telethon)             | optional (Setup UI; needed for TG scrape) |
 | `TELEGRAM_API_HASH`      | darkwatch (Telethon)             | optional (Setup UI; needed for TG scrape) |
 | `TOR_CONTROL_PASSWORD`   | darkwatch (NEWNYM) + tor sidecar | yes (auto-generated by install.sh) |
-| `SETUP_AUTH_TOKEN`       | Setup UI                         | yes (auto-generated by bootstrap.sh) |
+| `SETUP_AUTH_TOKEN`       | Setup UI                         | yes (auto-generated by bootstrap.sh; at least 32 characters, or every Setup UI request gets 401) |
+| `DARKWATCH_AUTH_TOKEN`   | darkwatch dashboard login        | optional (off when empty; set it, at least 32 characters, whenever `DARKWATCH_BIND_IP` is not loopback: deploy.sh warns) |
 | `DARKWATCH_ALLOWED_HOSTS` | darkwatch Host-header allowlist | optional (reverse proxy name) |
 | `TG_SOCKS_PASSWORD`      | tg-socks login (darkwatch, Setup UI, verify-egress) | yes (auto-generated by deploy.sh) |
 | `DARKNET_SUBNET` / `DARKWATCH_IP` | compose network, egress lockdown | optional (defaults 172.31.250.0/24 / .250) |

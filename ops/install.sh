@@ -56,6 +56,9 @@ ask()  {
     [[ "$ans" =~ ^[Yy] ]]
 }
 
+# shellcheck source-path=SCRIPTDIR source=lib/retention-cron.sh
+source "$SCRIPT_DIR/lib/retention-cron.sh"
+
 [[ $EUID -eq 0 ]] || fail "must run as root (sudo ./ops/install.sh)"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -90,6 +93,9 @@ else
     log "creating $DATA_ROOT and seeding state"
 fi
 "$SCRIPT_DIR/bootstrap.sh"
+# Nightly ops/retention.sh. deploy.sh installs it too (existing VMs never
+# rerun install.sh); also here so --skip-deploy gets it.
+install_retention_cron "$REPO_ROOT" "$DATA_ROOT"
 
 # Extract the auto-generated SETUP_AUTH_TOKEN for printing at the end
 SETUP_TOKEN="$(grep -E '^SETUP_AUTH_TOKEN=' "$DATA_ROOT/env" 2>/dev/null | head -1 | cut -d= -f2-)" || true
@@ -108,6 +114,20 @@ if [[ "$current_bind" == "127.0.0.1" || -z "$current_bind" ]]; then
         if ask "Bind dashboards to $PRIV_IP instead of 127.0.0.1?" "n"; then
             sed -i "s|^DARKWATCH_BIND_IP=.*|DARKWATCH_BIND_IP=$PRIV_IP|" "$DATA_ROOT/env"
             ok "DARKWATCH_BIND_IP=$PRIV_IP"
+            # Off loopback the dashboard has no login unless
+            # DARKWATCH_AUTH_TOKEN is set (README, "Dashboard login").
+            dash_tok="$(grep -E '^DARKWATCH_AUTH_TOKEN=' "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)" || true
+            if [[ -n "$dash_tok" ]]; then
+                ok "DARKWATCH_AUTH_TOKEN already set (dashboard login on)"
+            elif ask "The dashboard has no login unless DARKWATCH_AUTH_TOKEN is set. Generate one now?" "y"; then
+                sed -i '/^DARKWATCH_AUTH_TOKEN=/d' "$DATA_ROOT/env"
+                printf 'DARKWATCH_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$DATA_ROOT/env"
+                ok "generated DARKWATCH_AUTH_TOKEN (32 bytes); sign in at http://$PRIV_IP:8080/login with it"
+            else
+                warn "the dashboard has no login: anyone who can reach $PRIV_IP:8080 can use it."
+                warn "set DARKWATCH_AUTH_TOKEN in $DATA_ROOT/env (openssl rand -hex 32; README, \"Dashboard login\")"
+            fi
+            unset dash_tok
         else
             ok "DARKWATCH_BIND_IP=127.0.0.1 (reach via SSH tunnel)"
         fi
@@ -191,6 +211,9 @@ BIND_IP="${BIND_IP:-127.0.0.1}"
 
 ok "Dashboard:"
 echo "      DarkWatch:       http://$BIND_IP:8080/"
+if [[ -n "$(grep -E '^DARKWATCH_AUTH_TOKEN=' "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)" ]]; then
+    echo "      sign in with DARKWATCH_AUTH_TOKEN from $DATA_ROOT/env"
+fi
 echo
 ok "Bring up the Setup UI to configure tunnels + Telegram from your browser:"
 echo "      cd $REPO_ROOT"

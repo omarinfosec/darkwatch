@@ -48,9 +48,12 @@ echo "iptables $*" >> "$DOCKER_LOG"
 [[ "$*" == "-C FORWARD -j DOCKER-USER" && -n "${STUB_NO_FORWARD_JUMP:-}" ]] && exit 1
 exit 0
 EOF
+# No root crontab; writing one would be a bug here (the retention cron goes
+# to DW_CRON_DIR and the legacy-line cleanup has nothing to remove).
+printf '#!/bin/sh\n[ "$1" = -l ] || echo "crontab $*" >> "$DOCKER_LOG"\nexit 1\n' > "$work/bin/crontab"
 # The host side of the probe (positive control): online unless STUB_HOST_OFFLINE.
 printf '#!/bin/sh\n[ -z "$STUB_HOST_OFFLINE" ] || exit 28\n' > "$work/bin/curl"
-chmod 755 "$work/bin/docker" "$work/bin/systemctl" "$work/bin/iptables" "$work/bin/curl"
+chmod 755 "$work/bin/docker" "$work/bin/systemctl" "$work/bin/iptables" "$work/bin/curl" "$work/bin/crontab"
 export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 
 # A fresh tree per case: ops/ (lockdown + verify stubbed), .env.example and
@@ -58,7 +61,7 @@ export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 # check (the self-update case at the end makes its own checkout).
 new_tree() {
     T="$work/case$((++case_n))"
-    mkdir -p "$T/repo/tunnels/killswitch" "$T/units"
+    mkdir -p "$T/repo/tunnels/killswitch" "$T/units" "$T/cron.d"
     cp -a "$repo/ops" "$repo/.env.example" "$T/repo/"
     cp -a "$repo/tunnels/killswitch/10-killswitch.sh" "$T/repo/tunnels/killswitch/"
     printf '#!/bin/sh\necho "lockdown stub"\necho "lockdown-stub $*" >> "$DOCKER_LOG"\n' > "$T/repo/ops/egress-lockdown.sh"
@@ -82,7 +85,7 @@ seed() {
 deploy() {   # extra args are passed to deploy.sh; sets rc
     : > "$DOCKER_LOG"
     set +e
-    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" \
+    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" DW_CRON_DIR="$T/cron.d" \
         "$T/repo/ops/deploy.sh" --skip-pull "$@" > "$work/out" 2>&1
     rc=$?
     set -e
@@ -113,14 +116,104 @@ for d in "" /darkwatch /darkwatch/loot /darkwatch/data /darkwatch/investigations
     want="700 999:999"; [[ -z "$d" ]] && want="700 0:0"
     [[ "$(stat -c '%a %u:%g' "$D$d")" == "$want" ]] || die "bootstrap: $D$d is $(stat -c '%a %u:%g' "$D$d"), want $want"
 done
+[[ "$(stat -c '%a %u:%g' "$D/config.d")" == "750 0:999" ]] || die "bootstrap: config.d is $(stat -c '%a %u:%g' "$D/config.d"), want 750 0:999"
 [[ "$(stat -c %a "$D/env")" == 600 ]] || die "bootstrap: env not 0600"
 [[ "$(readlink -f "$T/repo/.env")" == "$(readlink -f "$D/env")" ]] || die "bootstrap: .env link"
-ok "bootstrap creates 0700 dirs (uid 999 for darkwatch/) and links .env"
+ok "bootstrap creates 0700 dirs (uid 999 for darkwatch/), a root-owned config.d and links .env"
 
 rm "$T/repo/.env"; echo x > "$T/repo/.env"
 set +e; DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1; rc=$?; set -e
 [[ $rc -ne 0 ]] && grep -q "not a link to" "$work/out" || die "bootstrap: a copied .env must be an error"
 ok "bootstrap fails on a .env that is not the link"
+
+# A hand-set SETUP_AUTH_TOKEN under 32 characters is kept but warned about,
+# by bootstrap and by deploy (upgrades don't re-run bootstrap). Never echoed.
+new_tree; seed
+grep -qE '^SETUP_AUTH_TOKEN=[0-9a-f]{64}$' "$D/env" || die "bootstrap: generated token is not 64 hex characters"
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap re-run failed"
+grep -q "shorter than 32" "$work/out" && die "bootstrap: warned about a 64-character token"
+deploy
+expect_ok "64-character token"
+grep -q "shorter than 32" "$work/out" && die "deploy: warned about a 64-character token"
+short_tok="handset0123456789abcdefghijklmn"   # 31 characters
+sed -i "s|^SETUP_AUTH_TOKEN=.*|SETUP_AUTH_TOKEN=$short_tok  |" "$D/env"
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap failed on a short token"
+grep -q "SETUP_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "bootstrap: no warning for a short token"
+grep -qF "$short_tok" "$work/out" && die "bootstrap: printed the token"
+grep -qF "SETUP_AUTH_TOKEN=$short_tok" "$D/env" || die "bootstrap: replaced a hand-set token"
+deploy
+expect_ok "short token"
+grep -q "SETUP_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "deploy: no warning for a short token"
+grep -qF "$short_tok" "$work/out" && die "deploy: printed the token"
+sed -i "s|^SETUP_AUTH_TOKEN=.*|SETUP_AUTH_TOKEN=${short_tok}x|" "$D/env"   # exactly 32
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap failed on a 32-character token"
+grep -q "shorter than 32" "$work/out" && die "bootstrap: warned about a 32-character token"
+ok "bootstrap and deploy warn about a SETUP_AUTH_TOKEN under 32 characters without printing it"
+
+# The dashboard login (DARKWATCH_AUTH_TOKEN) is opt-in: deploy warns, without
+# failing, when port 8080 is published beyond loopback with no token, and
+# about a token under 32 characters. Never echoed.
+new_tree; seed
+deploy
+expect_ok "loopback bind, no dashboard token"
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: dashboard auth warning on a loopback bind"
+for bind in 10.8.0.5 0.0.0.0 "::"; do
+    sed -i "s|^DARKWATCH_BIND_IP=.*|DARKWATCH_BIND_IP=$bind|" "$D/env"
+    deploy
+    expect_ok "bind $bind, no dashboard token"
+    grep -qF "the dashboard is published on $bind:8080 with no login" "$work/out" || die "deploy: no warning for bind $bind without a token"
+done
+printf 'DARKWATCH_AUTH_TOKEN=\n' >> "$D/env"
+deploy
+grep -q "with no login" "$work/out" || die "deploy: an empty DARKWATCH_AUTH_TOKEN= line silenced the warning"
+dash_tok="$(printf 'd%.0s' {1..64})"
+printf 'DARKWATCH_AUTH_TOKEN="%s"\n' "$dash_tok" >> "$D/env"   # last line wins, quotes stripped
+deploy
+expect_ok "bind :: with a dashboard token"
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: warned although a 64-character dashboard token is set"
+sed -i '/^DARKWATCH_AUTH_TOKEN=/d' "$D/env"
+short_dash="dashtok0123456789abcdefghijklmn"   # 31 characters
+printf 'DARKWATCH_AUTH_TOKEN=%s \n' "$short_dash" >> "$D/env"
+sed -i "s|^DARKWATCH_BIND_IP=.*|DARKWATCH_BIND_IP=127.0.0.1|" "$D/env"
+deploy
+expect_ok "short dashboard token"
+grep -q "DARKWATCH_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "deploy: no warning for a short dashboard token"
+grep -qF "$short_dash" "$work/out" && die "deploy: printed the dashboard token"
+ok "deploy warns about a dashboard published beyond loopback without DARKWATCH_AUTH_TOKEN, and about a short one"
+
+# install.sh: binding the dashboard to the private IP offers to generate
+# DARKWATCH_AUTH_TOKEN (default yes), warns when declined, and never prints it.
+printf '#!/bin/sh\necho 10.8.0.5 192.0.2.7\n' > "$work/bin/hostname"; chmod 755 "$work/bin/hostname"
+install() {   # $1 = answers on stdin, rest = extra flags; sets rc
+    local answers="$1"; shift
+    set +e
+    printf '%b' "$answers" | DARKWEBAPP_DATA_ROOT="$D" DW_CRON_DIR="$T/cron.d" \
+        "$T/repo/ops/install.sh" --skip-hardening --skip-deploy "$@" > "$work/out" 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || die "install.sh exited $rc"
+}
+dash_tok_of() { grep -E '^DARKWATCH_AUTH_TOKEN=' "$D/env" | tail -1 | cut -d= -f2- || true; }
+new_tree; install 'y\ny\n'
+grep -q '^DARKWATCH_BIND_IP=10.8.0.5$' "$D/env" || die "install: bind not set to the private IP"
+tok="$(dash_tok_of)"
+[[ "$tok" =~ ^[0-9a-f]{64}$ ]] || die "install: no 64-hex DARKWATCH_AUTH_TOKEN after answering yes"
+grep -qF "$tok" "$work/out" && die "install: printed the dashboard token"
+grep -q "sign in with DARKWATCH_AUTH_TOKEN" "$work/out" || die "install: no sign-in hint at the end"
+deploy
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: warned after install generated a dashboard token"
+new_tree; install 'y\nn\n'
+[[ -z "$(dash_tok_of)" ]] || die "install: set DARKWATCH_AUTH_TOKEN although declined"
+grep -q 'the dashboard has no login' "$work/out" || die "install: no warning when the dashboard token is declined"
+grep -q 'README, "Dashboard login"' "$work/out" || die "install: the warning must point at README \"Dashboard login\""
+new_tree; install '' --yes
+[[ "$(dash_tok_of)" =~ ^[0-9a-f]{64}$ ]] || die "install --yes: no dashboard token with a non-loopback bind"
+new_tree; install 'n\n'
+grep -q '^DARKWATCH_BIND_IP=127.0.0.1$' "$D/env" || die "install: bind changed although declined"
+[[ -z "$(dash_tok_of)" ]] || die "install: set DARKWATCH_AUTH_TOKEN on a loopback bind"
+grep -q "DARKWATCH_AUTH_TOKEN" "$work/out" && die "install: asked about the dashboard token on a loopback bind"
+rm "$work/bin/hostname"
+ok "install.sh offers DARKWATCH_AUTH_TOKEN when it binds the dashboard beyond loopback"
 
 # ─── default env (no DARKNET_SUBNET) reaches the end ────────────────────────
 new_tree; seed
@@ -164,6 +257,13 @@ grep -q '^systemctl reenable --quiet darkwatch-egress-lockdown.service' "$DOCKER
     || die "unit must be enabled with reenable"
 ok "unit runs before docker.service, after the host firewalls, WantedBy=docker.service"
 
+cron="$T/cron.d/darkwatch-retention"
+[[ -f "$cron" ]] || die "retention cron not installed into DW_CRON_DIR"
+grep -qx "DARKWEBAPP_DATA_ROOT=$D" "$cron" && grep -q " root /bin/bash $T/repo/ops/retention\.sh >> " "$cron" \
+    || die "retention cron: $(cat "$cron")"
+grep -q '^crontab' "$DOCKER_LOG" && die "deploy must not write a crontab when there is no legacy line"
+ok "deploy installs the retention cron (cron.d, this checkout's retention.sh, this data root)"
+
 [[ "$(grep -c '^TG_SOCKS_PASSWORD=' "$D/env")" == 1 ]] || die "TG_SOCKS_PASSWORD must appear once"
 pw="$(grep '^TG_SOCKS_PASSWORD=' "$D/env" | cut -d= -f2-)"
 [[ ${#pw} -ge 32 ]] || die "TG_SOCKS_PASSWORD not generated"
@@ -179,6 +279,13 @@ deploy --skip-build
 expect_ok "--skip-build"
 grep -q '^compose.* build' "$DOCKER_LOG" && die "--skip-build still built"
 ok "--skip-build skips the build"
+
+# An install from before v0.4.0 has no config.d: deploy re-runs bootstrap.
+rmdir "$D/config.d"
+deploy --skip-build
+expect_ok "missing config.d"
+[[ "$(stat -c '%a %u:%g' "$D/config.d")" == "750 0:999" ]] || die "deploy did not recreate config.d"
+ok "deploy creates a missing config.d (via bootstrap)"
 
 # ─── subnet migration and Setup UI refresh ──────────────────────────────────
 STUB_HAVE_SUBNET=172.20.0.0/16 deploy
@@ -356,7 +463,8 @@ seed
 self_deploy() {   # like deploy(), but lets deploy.sh pull
     : > "$DOCKER_LOG"
     set +e
-    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" "$T/repo/ops/deploy.sh" "$@" > "$work/out" 2>&1
+    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" DW_CRON_DIR="$T/cron.d" \
+        "$T/repo/ops/deploy.sh" "$@" > "$work/out" 2>&1
     rc=$?
     set -e
 }
@@ -389,5 +497,34 @@ expect_ok "self-update without exec bit"
 [[ "$(grep -c 'deploy.sh v3 running (args: --skip-pull --skip-build)' "$work/out")" == 1 ]] \
     || die "self-update without exec bit: v3 must run exactly once"
 ok "the restart does not need deploy.sh's exec bit"
+
+# ─── dirty checkout: local config.json edits ────────────────────────────────
+# Only darkwatch/config.json modified: deploy refuses and points at the
+# override file. Any other dirty file: the plain message, no hint.
+new_tree
+mkdir -p "$T/repo/darkwatch"
+cp -a "$repo/darkwatch/config.json" "$T/repo/darkwatch/"
+git -C "$T/repo" init -q && git -C "$T/repo" add -A && git -C "$T/repo" commit -qm v1
+seed
+sed -i 's/"max_threads": [0-9]*/"max_threads": 1/' "$T/repo/darkwatch/config.json"
+git -C "$T/repo" diff --quiet && die "fixture: config.json not modified"
+deploy
+expect_fail "dirty config.json" "darkwatch/config.json has local edits"; no_compose "dirty config.json"
+grep -qF "$D/config.d/config.local.json" "$work/out" && grep -qF "git checkout darkwatch/config.json" "$work/out" \
+    || die "dirty config.json: the hint must name the override file and the checkout"
+git -C "$T/repo" add darkwatch/config.json
+deploy
+expect_fail "staged config.json" "darkwatch/config.json has local edits"
+echo "# local" >> "$T/repo/.env.example"
+deploy
+expect_fail "dirty config.json and another file" "git working tree has uncommitted changes"; no_compose "two dirty files"
+grep -q "config.local.json" "$work/out" && die "the override hint is only for a dirty config.json alone"
+git -C "$T/repo" checkout -q HEAD -- darkwatch/config.json && git -C "$T/repo" reset -q
+git -C "$T/repo" diff --quiet HEAD -- darkwatch/config.json || die "fixture: config.json not restored"
+git -C "$T/repo" diff --quiet HEAD -- .env.example && die "fixture: .env.example not modified"
+deploy
+expect_fail "other dirty file" "git working tree has uncommitted changes"
+grep -q "config.local.json" "$work/out" && die "the override hint is only for a dirty config.json"
+ok "a checkout dirty only in darkwatch/config.json is refused with a pointer to config.local.json"
 
 echo "ops checks OK ($pass)"

@@ -1,12 +1,15 @@
 """Auth (CSRF, token compare, URL-token redirect), WG hook rejection and
 atomic env-file writes. No docker daemon needed."""
 
+import hashlib
+import hmac
 import os
 import sys
+import time
 
 import pytest
 
-os.environ.setdefault("SETUP_AUTH_TOKEN", "test-token-fixture")
+os.environ.setdefault("SETUP_AUTH_TOKEN", "t" * 64)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 pytest.importorskip("fastapi")
@@ -65,7 +68,7 @@ def test_non_ascii_token_is_401_not_500(client):
 
 
 def test_cookie_post_requires_same_origin(client):
-    client.cookies.set(main.SESSION_COOKIE, TOKEN)
+    client.cookies.set(main.SESSION_COOKIE, main._make_session(TOKEN))
     # Cross-origin (e.g. the dashboard on :8080) — rejected before any write.
     r = client.post("/api/tunnel/1", data={"conf": "x"},
                     headers={"Origin": "http://testserver:8080"})
@@ -77,6 +80,147 @@ def test_cookie_post_requires_same_origin(client):
     r = client.post("/api/tunnel/1", data={"conf": "x"},
                     headers={"Origin": "http://testserver"})
     assert r.status_code == 400
+
+
+def _session_cookie(response) -> str:
+    """The raw Set-Cookie header for the session cookie."""
+    cookies = [c for c in response.headers.get_list("set-cookie")
+               if c.startswith(main.SESSION_COOKIE + "=")]
+    assert len(cookies) == 1, response.headers.get_list("set-cookie")
+    return cookies[0]
+
+
+def test_session_cookie_is_not_the_token(client):
+    r = client.post("/auth", data={"token": TOKEN}, follow_redirects=False)
+    assert r.status_code == 303
+    header = _session_cookie(r)
+    value = r.cookies[main.SESSION_COOKIE]
+    assert TOKEN not in header
+    ts, mac = value.split(".")
+    assert abs(int(ts) - time.time()) < 60
+    assert mac == hmac.new(TOKEN.encode(), f"dw-setup-session:{ts}".encode(),
+                           hashlib.sha256).hexdigest()
+    assert "max-age=43200" in header.lower()
+    assert "httponly" in header.lower()
+    # Plain http: no Secure, or the browser would never send it back.
+    assert "secure" not in header.lower()
+    # The issued cookie works on its own.
+    fresh = TestClient(main.app, base_url="http://testserver")
+    fresh.cookies.set(main.SESSION_COOKIE, value)
+    assert fresh.get("/api/state").status_code == 200
+
+
+def test_raw_token_cookie_is_rejected(client):
+    # The pre-HMAC cookie format (the token itself) no longer authenticates.
+    client.cookies.set(main.SESSION_COOKIE, TOKEN)
+    assert client.get("/api/state").status_code == 401
+    assert client.get("/").status_code == 401
+    r = client.post("/api/tunnel/1", data={"conf": "x"},
+                    headers={"Origin": "http://testserver"})
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("cookie", [
+    "", ".", "abc.def", "123", "123.", "١٢٣.abc", "9" * 5000 + ".abc",
+])
+def test_malformed_session_cookie_is_401(client, cookie):
+    # Raw header: httpx refuses to encode the non-ASCII digits itself.
+    header = f"{main.SESSION_COOKIE}={cookie}".encode()
+    assert client.get("/api/state", headers={"Cookie": header}).status_code == 401
+
+
+def test_expired_session_cookie_is_rejected(client):
+    now = time.time()
+    client.cookies.set(main.SESSION_COOKIE,
+                       main._make_session(TOKEN, now - main.SESSION_MAX_AGE + 60))
+    assert client.get("/api/state").status_code == 200
+    client.cookies.set(main.SESSION_COOKIE,
+                       main._make_session(TOKEN, now - main.SESSION_MAX_AGE - 60))
+    assert client.get("/api/state").status_code == 401
+    # A stamp from the future would outlive the 12 h window.
+    client.cookies.set(main.SESSION_COOKIE, main._make_session(TOKEN, now + 3600))
+    assert client.get("/api/state").status_code == 401
+
+
+def test_rotated_token_revokes_session(client, tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    env.write_text(f"SETUP_AUTH_TOKEN={TOKEN}\n")
+    monkeypatch.setattr(main, "ENV_FILE", env)
+    client.cookies.set(main.SESSION_COOKIE, main._make_session(TOKEN))
+    assert client.get("/api/state").status_code == 200
+    env.write_text("SETUP_AUTH_TOKEN=" + "r" * 64 + "\n")
+    assert client.get("/api/state").status_code == 401
+    assert client.get("/").status_code == 401
+
+
+@pytest.mark.parametrize("headers,base_url", [
+    ({"X-Forwarded-Proto": "https"}, "http://testserver"),
+    ({"X-Forwarded-Proto": "HTTPS, http"}, "http://testserver"),
+    ({}, "https://testserver"),
+])
+def test_https_session_cookie_is_secure(headers, base_url):
+    c = TestClient(main.app, base_url=base_url)
+    for r in (c.post("/auth", data={"token": TOKEN}, headers=headers,
+                     follow_redirects=False),
+              c.get(f"/?token={TOKEN}", headers=headers, follow_redirects=False)):
+        assert r.status_code == 303
+        assert "; secure" in _session_cookie(r).lower()
+
+
+def test_failed_sign_in_logs_ip_not_value(client, caplog):
+    attempt = "wrong-" + "x" * 40
+    with caplog.at_level("WARNING", logger="setup"):
+        r = client.post("/auth", data={"token": attempt})
+    assert r.status_code == 401
+    assert "failed sign-in from testclient" in caplog.text
+    assert attempt not in caplog.text and "xxxx" not in caplog.text
+
+
+@pytest.mark.parametrize("short", ["s" * 31, "abc", "zq"])
+def test_short_token_is_401_everywhere(client, tmp_path, monkeypatch, caplog, short):
+    env = tmp_path / "env"
+    env.write_text(f"SETUP_AUTH_TOKEN={short}\n")
+    monkeypatch.setattr(main, "ENV_FILE", env)
+    monkeypatch.setattr(main, "_short_token_logged", False)
+    # Must not reach the docker/compose helpers even if auth were bypassed.
+    monkeypatch.setattr(main.subprocess, "run", None)
+    bearer = {"Authorization": f"Bearer {short}"}
+    with caplog.at_level("ERROR", logger="setup"):
+        responses = [
+            client.get("/"),
+            client.get(f"/?token={short}", follow_redirects=False),
+            client.get("/", headers=bearer),
+            client.get("/api/state", headers=bearer),
+            client.get(f"/api/state?token={short}"),
+            client.post("/auth", data={"token": short}, follow_redirects=False),
+            client.post("/api/tunnel/1", data={"conf": VALID_WG}, headers=bearer),
+            client.post("/api/tunnel/2", data={"conf": VALID_WG}, headers=bearer),
+            client.post("/api/telegram", data={"api_id": "123456",
+                                               "api_hash": "a" * 32}, headers=bearer),
+        ]
+        # A session cookie minted with the short token is refused too.
+        client.cookies.set(main.SESSION_COOKIE, main._make_session(short))
+        responses += [
+            client.get("/api/state"),
+            client.post("/api/tunnel/1", data={"conf": VALID_WG},
+                        headers={"Origin": "http://testserver"}),
+        ]
+    assert [r.status_code for r in responses] == [401] * len(responses)
+    assert all(main.SESSION_COOKIE not in r.cookies for r in responses)
+    assert env.read_text() == f"SETUP_AUTH_TOKEN={short}\n"
+    # Logged once, not per request, and without the value.
+    msgs = [r.getMessage() for r in caplog.records if "shorter than" in r.getMessage()]
+    assert len(msgs) == 1, msgs
+    assert short not in msgs[0]
+
+
+def test_32_char_token_is_accepted(client, tmp_path, monkeypatch):
+    token = "k" * 32
+    env = tmp_path / "env"
+    env.write_text(f"SETUP_AUTH_TOKEN={token}\n")
+    monkeypatch.setattr(main, "ENV_FILE", env)
+    assert client.get("/api/state",
+                      headers={"Authorization": f"Bearer {token}"}).status_code == 200
 
 
 def test_bearer_header_post_needs_no_origin(client):
@@ -98,7 +242,7 @@ def test_update_env_is_atomic_and_private(tmp_path, monkeypatch):
 
 
 def test_cookie_post_behind_reverse_proxy(client):
-    client.cookies.set(main.SESSION_COOKIE, TOKEN)
+    client.cookies.set(main.SESSION_COOKIE, main._make_session(TOKEN))
     # nginx default: Host rewritten to the upstream, public host in X-Forwarded-Host.
     r = client.post("/api/tunnel/1", data={"conf": "x"},
                     headers={"Origin": "https://setup.example.org",
