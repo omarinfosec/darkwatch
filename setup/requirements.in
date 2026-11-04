@@ -1,0 +1,12 @@
+# DarkWatch Setup UI image: direct Python dependencies, each pinned to one
+# version. The image installs requirements.lock, which pins these and
+# everything they pull in, with hashes. After editing this file run
+# ./ops/lock-deps.sh and commit both files; CI fails while the lock is behind.
+
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+jinja2==3.1.6
+python-multipart==0.0.33
+docker==7.2.0
+telethon==1.45.0
+python-socks[asyncio]==3.2.1

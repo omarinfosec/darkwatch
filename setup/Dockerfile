@@ -40,8 +40,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements.lock is generated from requirements.in by ops/lock-deps.sh;
+# --require-hashes fails the build on any file whose hash is not in it.
+COPY requirements.lock .
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY . .
 

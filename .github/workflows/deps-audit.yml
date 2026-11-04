@@ -1,0 +1,45 @@
+name: Dependency audit
+
+# pip-audit against the known-vulnerability database, once per file that
+# something installs: each image's hash-locked requirements.lock (every
+# package the image gets, transitive ones included, at the locked version)
+# and the test tools. Weekly, because a new advisory needs no commit to
+# appear; also on pull requests that change a requirements file.
+on:
+  schedule:
+    - cron: "41 6 * * 3"   # Wednesdays 06:41 UTC
+  pull_request:
+    paths:
+      - "**/requirements*.txt"
+      - "**/requirements*.in"
+      - "**/requirements*.lock"
+      - ".github/workflows/deps-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deps-audit:
+    name: pip-audit (${{ matrix.requirements }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        requirements:
+          - darkwatch/requirements.lock
+          - setup/requirements.lock
+          - requirements-dev.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"   # matches the Docker images
+      - name: Install pip-audit (pinned)
+        run: python -m pip install pip-audit==2.10.1
+      - name: pip-audit
+        env:
+          REQUIREMENTS: ${{ matrix.requirements }}
+        run: pip-audit --progress-spinner off --strict -r "$REQUIREMENTS"

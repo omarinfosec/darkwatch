@@ -4,35 +4,48 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this whole workflow and publishes only if it passes.
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   python-tests:
-    name: Tests (${{ matrix.suite }})
+    # The 3.11 legs keep their old check names ("Tests (darkwatch)"), so
+    # branch protection that requires them still matches.
+    name: Tests (${{ matrix.suite }}${{ matrix.python != '3.11' && format(', Python {0}', matrix.python) || '' }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         suite: [darkwatch, setup]
+        python: ["3.11"]   # matches the Docker images
+        include:
+          # A newer interpreter, so moving the images off 3.11 holds no
+          # surprises.
+          - { suite: darkwatch, python: "3.13" }
+          - { suite: setup, python: "3.13" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.11"   # matches the Docker images
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: |
-            ${{ matrix.suite }}/requirements.txt
+            ${{ matrix.suite }}/requirements.lock
             requirements-dev.txt
-      - name: Install dependencies
+      # The same hash-locked set the image installs. requirements-dev.txt
+      # has no hashes, so it gets its own pip run: pip checks hashes for
+      # every requirement of a run once any one of them has a hash.
+      - name: Install dependencies (hash-locked)
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: |
           python -m pip install --upgrade pip
-          pip install -r ${{ matrix.suite }}/requirements.txt
+          pip install --require-hashes -r ${{ matrix.suite }}/requirements.lock
       - name: Install test tools
         run: pip install -r requirements-dev.txt
       - name: Run tests
@@ -52,10 +65,12 @@ jobs:
           python-version: "3.11"
       - name: Install shellcheck (pinned)
         run: pip install shellcheck-py==0.11.0.1 && shellcheck --version
+      - name: requirements.lock files cover requirements.in
+        run: bash ops/lock-deps.sh --check
       - name: bash -n on all ops scripts
         run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
-      - name: shellcheck (errors only)
-        run: shellcheck -S error ops/*.sh ops/lib/*.sh tor/*.sh tunnels/killswitch/*.sh tests/*/*.sh
+      - name: shellcheck (warnings and errors)
+        run: shellcheck -S warning ops/*.sh ops/lib/*.sh tor/*.sh tunnels/killswitch/*.sh tests/*/*.sh darkwatch/scan.sh
       - name: WireGuard kill switch (network namespace test)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null
@@ -74,3 +89,37 @@ jobs:
             --profile tor --profile tg --profile setup config -q
       - name: compose checks (DNS isolation, env scoping, TOR_CONTROL_PASSWORD required)
         run: bash tests/compose/check.sh
+      - name: lock-deps.sh (stubbed uv)
+        run: bash tests/lock-deps/check.sh
+      - name: release/CI workflow and Dependabot checks
+        run: pip install pyyaml==6.0.3 && bash tests/workflows/check.sh
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # scan every commit, not only the tip
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.10"
+          cache: false
+      # Built from the pinned module version. `go` verifies the module and
+      # every dependency against go.sum and sum.golang.org; the h1: hash
+      # (a SHA-256 over the module's files) is pinned here as well, so a
+      # re-tagged or swapped release cannot slip in.
+      - name: Install gitleaks (pinned, hash-checked)
+        env:
+          GITLEAKS_MODULE: github.com/zricethezav/gitleaks/v8
+          GITLEAKS_VERSION: v8.30.1
+          GITLEAKS_SUM: "h1:PmEvCfVI7ti9dV3s5aMZUY7sS2GxRvG3yzih7E+cS3w="
+        run: |
+          sum="$(go mod download -json "$GITLEAKS_MODULE@$GITLEAKS_VERSION" | jq -r .Sum)"
+          if [ "$sum" != "$GITLEAKS_SUM" ]; then
+            echo "gitleaks module hash mismatch: got $sum" >&2; exit 1
+          fi
+          GOBIN="$RUNNER_TEMP/bin" go install "$GITLEAKS_MODULE@$GITLEAKS_VERSION"
+      - name: gitleaks (full history, .gitleaks.toml)
+        run: '"$RUNNER_TEMP/bin/gitleaks" git --no-banner --redact --config .gitleaks.toml --exit-code 1 .'

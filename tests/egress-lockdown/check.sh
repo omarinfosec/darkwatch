@@ -11,7 +11,7 @@ repo="$(cd "$here/../.." && pwd)"
 # Re-run inside a fresh network namespace: its own, empty iptables.
 if [[ -z "${DW_LOCKDOWN_NS:-}" ]]; then
     # CI runners block unprivileged user namespaces: UNSHARE="sudo unshare -n".
-    unshare_cmd=(${UNSHARE:-unshare -rn})
+    read -ra unshare_cmd <<<"${UNSHARE:-unshare -rn}"
     exec "${unshare_cmd[@]}" env DW_LOCKDOWN_NS=1 PATH="$PATH" bash "${BASH_SOURCE[0]}"
 fi
 

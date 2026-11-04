@@ -75,14 +75,24 @@ RUN groupadd -r -g 999 darkwatch && \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements.lock is generated from requirements.in by ops/lock-deps.sh;
+# --require-hashes fails the build on any file whose hash is not in it.
+COPY requirements.lock .
+# Wheel policy: cryptg and yara-python must install from wheels. cryptg's
+# sdist needs a Rust toolchain this image does not have, and yara-python's
+# compiles the bundled libyara; a pin with no cp311 wheel for the build
+# platform should fail here rather than fall back to an untested source
+# build. Not --only-binary=:all:, because stem ships only an sdist.
+RUN pip install --no-cache-dir --require-hashes --only-binary=cryptg,yara-python \
+        -r requirements.lock
 
 # Headless Firefox for offline screenshot rendering.
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/.browsers
 RUN playwright install --with-deps firefox
 
-COPY darkwatch.py web.py threat_intel.py index.html config.json ./
+# Every top-level module, so a new one cannot be left out of the image
+# (tests/images/smoke.sh imports them).
+COPY *.py index.html config.json ./
 COPY --from=bundle /build/static/ ./static/
 COPY yara/ yara/
 

@@ -21,11 +21,14 @@ def web(tmp_path_factory):
                          thumbnails_dir=str(d / "loot/thumbs"))
     cfg["database"]["path"] = str(d / "dw.db")
     (d / "config.json").write_text(json.dumps(cfg))
-    os.environ["DARKWATCH_CONFIG"] = str(d / "config.json")
-    os.environ["DARKWATCH_BIND_IP"] = "10.8.0.5"
     pytest.importorskip("flask")
-    import web as web_mod
-    return web_mod
+    # Module-scoped, so the function-scoped monkeypatch fixture is not
+    # available; the context restores the environment after this module.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DARKWATCH_CONFIG", str(d / "config.json"))
+        mp.setenv("DARKWATCH_BIND_IP", "10.8.0.5")
+        import web as web_mod
+        yield web_mod
 
 
 def test_host_header_must_name_the_dashboard(web):
@@ -179,6 +182,129 @@ def test_tg_media_keeps_sandbox_csp(web):
     _assert_baseline_headers(r, csp="sandbox; default-src 'none'")
 
 
+def _write(path, data=b"x"):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def test_tg_media_html_is_a_sandboxed_forced_download(web):
+    _write(os.path.join(web._crawler.loot_dir, "tg-media", "chan", "x.html"),
+           b"<script>fetch('/api/findings')</script>")
+    r = web.app.test_client().get("/loot/tg-media/chan/x.html", base_url=BASE)
+    assert r.status_code == 200
+    assert r.headers["Content-Disposition"].startswith("attachment")
+    assert r.mimetype == "application/octet-stream"
+    _assert_baseline_headers(r, csp="sandbox; default-src 'none'")
+
+
+def test_tg_media_png_is_inline(web):
+    _write(os.path.join(web._crawler.loot_dir, "tg-media", "chan", "i.png"),
+           b"\x89PNG\r\n\x1a\n")
+    r = web.app.test_client().get("/loot/tg-media/chan/i.png", base_url=BASE)
+    assert r.status_code == 200
+    assert r.mimetype == "image/png"
+    assert "attachment" not in r.headers.get("Content-Disposition", "")
+    _assert_baseline_headers(r, csp="sandbox; default-src 'none'")
+
+
+@pytest.mark.parametrize("path", [
+    "/loot/tg-media/../outside.png",            # parent of tg-media
+    "/loot/tg-media/..%2foutside.png",           # encoded separator
+    "/loot/tg-media/%2e%2e/outside.png",         # encoded dots
+    "/loot/tg-media/../tg-media-old/x.png",     # sibling sharing the prefix
+])
+def test_tg_media_traversal_is_404(web, path):
+    loot = web._crawler.loot_dir
+    os.makedirs(os.path.join(loot, "tg-media"), exist_ok=True)
+    _write(os.path.join(loot, "outside.png"))
+    _write(os.path.join(loot, "tg-media-old", "x.png"))
+    r = web.app.test_client().get(path, base_url=BASE)
+    assert r.status_code == 404
+
+
+def test_tg_media_absolute_path_is_404(web):
+    """An absolute relpath makes os.path.join drop the tg-media base. The
+    router merges a leading "//" before the view runs, so call the view."""
+    from werkzeug.exceptions import NotFound
+    outside = os.path.join(web._crawler.loot_dir, "outside.png")
+    _write(outside)
+    with web.app.test_request_context("/loot/tg-media/x", base_url=BASE):
+        with pytest.raises(NotFound):
+            web.route_tg_media_serve(os.path.abspath(outside))
+
+
+def _csv_rows(body):
+    import csv
+    import io
+    return list(csv.DictReader(io.StringIO(body)))
+
+
+def test_findings_csv_export_escapes_formulas(web):
+    db = web._crawler.db
+    db.add_url("http://csvtest.onion")
+    url_id = db.conn.execute("SELECT id FROM urls WHERE url = ?",
+                             ("http://csvtest.onion",)).fetchone()[0]
+    db.add_finding(url_id, "http://csvtest.onion/p", "csv_rule", "keyword:text",
+                   50, '=HYPERLINK("http://x")', "@SUM(A1)", "medium")
+    r = web.app.test_client().get("/api/findings.csv", base_url=BASE)
+    assert r.status_code == 200
+    assert r.mimetype == "text/csv"
+    assert r.headers["Content-Disposition"].startswith("attachment")
+    (row,) = [x for x in _csv_rows(r.get_data(as_text=True))
+              if x["rule_name"] == "csv_rule"]
+    assert row["matched_strings"] == '\'=HYPERLINK("http://x")'
+    assert row["snippet"] == "'@SUM(A1)"
+
+
+def test_keywords_csv_export_escapes_formulas(web):
+    web._crawler.db.add_keyword("=cmd|'/C calc'!A0", category="+csv")
+    r = web.app.test_client().get("/api/keywords/export.csv", base_url=BASE)
+    assert r.status_code == 200
+    assert r.mimetype == "text/csv"
+    assert r.headers["Content-Disposition"].startswith("attachment")
+    (row,) = [x for x in _csv_rows(r.get_data(as_text=True))
+              if x["category"] == "'+csv"]
+    assert row["keyword"] == "'=cmd|'/C calc'!A0"
+
+
+@pytest.fixture(scope="module")
+def tg_channel(web):
+    db = web._crawler.db
+    url_id = db.upsert_tg_channel("csvchan", 4242, title="t")
+    page_id = db.add_page(url_id, "https://t.me/csvchan/1", "t", "csvchan-1",
+                          page_type="telegram_message")
+    db.add_tg_message(url_id, page_id, {
+        "msg_id": 1, "text": "=1+1", "sender_name": "-Mallory",
+        "sender_username": "@m", "media_path": "+x.bin"})
+    return url_id
+
+
+def test_channel_csv_export_escapes_formulas(web, tg_channel):
+    r = web.app.test_client().get(
+        f"/api/telegram/channels/{tg_channel}/export.csv", base_url=BASE)
+    assert r.status_code == 200
+    assert r.mimetype == "text/csv"
+    assert r.headers["Content-Disposition"].startswith("attachment")
+    (row,) = _csv_rows(r.get_data(as_text=True))
+    assert (row["text"], row["sender_name"], row["sender_username"]) == \
+        ("'=1+1", "'-Mallory", "'@m")
+
+
+def test_channel_zip_export_escapes_messages_csv(web, tg_channel):
+    import io
+    import zipfile
+    r = web.app.test_client().get(
+        f"/api/telegram/channels/{tg_channel}/export.zip", base_url=BASE)
+    assert r.status_code == 200
+    assert r.mimetype == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(r.data)) as z:
+        (name,) = [n for n in z.namelist() if n.endswith("/messages.csv")]
+        (row,) = _csv_rows(z.read(name).decode())
+    assert (row["text"], row["sender_name"], row["media_path"]) == \
+        ("'=1+1", "'-Mallory", "'+x.bin")
+
+
 def test_bad_int_params_are_400_not_500(web):
     c = web.app.test_client()
     base = "http://127.0.0.1:8080"
@@ -186,6 +312,25 @@ def test_bad_int_params_are_400_not_500(web):
     assert c.delete("/api/findings?min_score=x", base_url=base).status_code == 400
     r = c.post("/api/scan", base_url=base, json={"urls": "abc"})
     assert r.status_code == 400
+
+
+def test_metrics_scrape(web):
+    pytest.importorskip("prometheus_client")
+    r = web.app.test_client().get("/metrics", base_url=BASE)
+    assert r.status_code == 200
+    # prometheus-client 0.26 advertises text format version 1.0.0
+    # (0.20 sent 0.0.4); Prometheus accepts both.
+    assert r.headers["Content-Type"] == \
+        "text/plain; version=1.0.0; charset=utf-8"
+    body = r.get_data(as_text=True)
+    assert "# TYPE darkwatch_urls_total gauge" in body
+    assert "darkwatch_scan_running 0.0" in body
+
+
+def test_qr_login_svg_renders(web):
+    pytest.importorskip("qrcode")
+    svg = web._render_qr_svg("tg://login?token=AbC-123_x")
+    assert svg is not None and "<svg" in svg and "<path" in svg
 
 
 def test_csv_safe(web):

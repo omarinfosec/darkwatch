@@ -18,7 +18,7 @@ DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
 log()  { printf '\033[1;36m[harden]\033[0m %s\n' "$*"; }
-run()  { if (( DRY_RUN )); then echo "  DRY: $*"; else eval "$@"; fi; }
+run()  { if (( DRY_RUN )); then echo "  DRY: $*"; else eval "$*"; fi; }
 warn() { printf '\033[1;33m[harden WARN]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31m[harden ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 

@@ -44,11 +44,11 @@ def test_wg_config_validator_accepts_valid():
     main = _import_main()
     # Synthetic all-A WG private key — passes the 43-base64-char + "="
     # length/charset check the validator does. Zero entropy so it is
-    # obviously fake to a human reader. gitleaks would otherwise flag
-    # this string as a WireGuard private key; the .gitleaks.toml
-    # `[allowlist]` block scopes the exemption to files matching
-    # `.*/tests/test_validators\.py$`. If you move this file, update
-    # the allowlist regex or the secret scan will start failing CI.
+    # obviously fake to a human reader. gitleaks could flag this
+    # string as a WireGuard private key; the `[[allowlists]]` entry in
+    # .gitleaks.toml exempts this file only, by its repo path. If you
+    # move this file, update that path or the CI secret scan may start
+    # failing.
     valid = """[Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address    = 10.2.0.2/32

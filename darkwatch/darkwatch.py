@@ -212,6 +212,13 @@ def setup_logging(debug=False):
 log = logging.getLogger("darkwatch")
 
 
+def utcnow():
+    """Current UTC time as a naive datetime, like the deprecated
+    datetime.utcnow() (Python 3.12+): stored timestamps are naive UTC ISO
+    strings, compared as strings or against naive datetimes."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ─── Database ────────────────────────────────────────────────────────────────
 
 class Database:
@@ -3705,19 +3712,22 @@ class DarkMTProto:
         entity = self._entity_ref(channel_id, username)
 
         async def _go():
-            # GetForumTopicsRequest moved between Telethon versions:
-            #   * ≤1.32 or so: telethon.tl.functions.channels
-            #   * ≥1.33 (current 1.43): telethon.tl.functions.messages
+            # GetForumTopicsRequest moved between Telethon versions, and
+            # its entity argument was renamed with it:
+            #   * pinned 1.45: telethon.tl.functions.messages, peer=
+            #   * 1.36 and older: telethon.tl.functions.channels, channel=
             # Both paths tried; if neither works we degrade gracefully
             # and just don't label messages with their forum topic.
-            GetForumTopicsRequest = None
+            GetForumTopicsRequest, topic_peer_kw = None, None
             try:
                 from telethon.tl.functions.messages \
                     import GetForumTopicsRequest
+                topic_peer_kw = "peer"
             except ImportError:
                 try:
                     from telethon.tl.functions.channels \
                         import GetForumTopicsRequest
+                    topic_peer_kw = "channel"
                 except ImportError:
                     pass
             c = self._build_client()
@@ -3730,18 +3740,30 @@ class DarkMTProto:
                     return []
                 # Detect forum and fetch topic map (once per fetch call).
                 topic_map = {}     # topic_id → title
+                ent = None
                 if GetForumTopicsRequest is not None:
                     try:
                         ent = await c.get_entity(entity)
-                        if bool(getattr(ent, "forum", False)):
-                            resp = await c(GetForumTopicsRequest(
-                                channel=ent, offset_date=None, offset_id=0,
-                                offset_topic=0, limit=100))
-                            for t in getattr(resp, "topics", []) or []:
-                                topic_map[getattr(t, "id", None)] = \
-                                    getattr(t, "title", None)
                     except Exception as e:
+                        # iter_messages below fails on the same entity and
+                        # logs it, so debug is enough here.
                         log.debug(f"forum topic fetch skipped for {entity}: {e}")
+                if ent is not None and bool(getattr(ent, "forum", False)):
+                    try:
+                        resp = await c(GetForumTopicsRequest(
+                            offset_date=None, offset_id=0,
+                            offset_topic=0, limit=100,
+                            **{topic_peer_kw: ent}))
+                        for t in getattr(resp, "topics", []) or []:
+                            topic_map[getattr(t, "id", None)] = \
+                                getattr(t, "title", None)
+                    except Exception as e:
+                        # Warning, not debug: a failure here drops every
+                        # topic label of the fetch (a channel= / peer= mixup
+                        # does it on every call), and nothing else shows it.
+                        log.warning(f"[tg] forum topic fetch failed for {entity}, "
+                                    f"messages stored without topic labels: "
+                                    f"{type(e).__name__}: {e}")
 
                 kwargs = {"entity": entity, "limit": limit}
                 if since_msg_id:
@@ -5262,9 +5284,15 @@ class DarkWebCrawler:
         links = set()
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            full = urljoin(base_url, href)
-            parsed = urlparse(full)
-            if ".onion" in parsed.netloc:
+            try:
+                full = urljoin(base_url, href)
+                parsed = urlparse(full)
+            except ValueError:          # e.g. "http://[::1": skip, don't abort
+                continue
+            # The host itself must be an onion: "<x>.onion.evil.com" and
+            # "<x>.onion@evil.com" (userinfo) only contain the string.
+            if (parsed.scheme in ("http", "https")
+                    and (parsed.hostname or "").endswith(".onion")):
                 clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                 if clean.endswith("/"):
                     clean = clean[:-1]
@@ -5733,7 +5761,7 @@ class DarkWebCrawler:
             scanned += 1
             findings_total += page_findings
         if url_id is None:
-            self.db.ops_set("last_rescan_at", datetime.utcnow().isoformat())
+            self.db.ops_set("last_rescan_at", utcnow().isoformat())
         log.info(f"rescan_pages: scanned={scanned} findings={findings_total} "
                  f"skipped={skipped}")
         return {"scanned": scanned, "findings": findings_total, "skipped": skipped}

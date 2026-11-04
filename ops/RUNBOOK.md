@@ -78,6 +78,30 @@ sudo docker compose restart darkwatch
 ```bash
 sudo ./ops/deploy.sh   # builds darkwatch, tor and setup (skip with --skip-build)
 ```
+To check the built images without touching the running stack (offline
+imports, an offline screenshot, `tor --version`; the same tests CI runs):
+```bash
+sudo bash tests/images/smoke.sh
+```
+
+### Update Python dependencies
+Each image pins its direct dependencies in `requirements.in`
+(`darkwatch/`, `setup/`) and installs `requirements.lock`, which
+`ops/lock-deps.sh` generates from it: every package, transitive ones
+included, at one version with the SHA-256 of each of its files. The
+Dockerfiles and CI install it with `pip install --require-hashes`, so a
+file that does not match its hash fails the build. On a dev machine with PyPI
+access (not on the VM):
+```bash
+$EDITOR darkwatch/requirements.in           # bump the pin
+./ops/lock-deps.sh                          # re-lock both images (pinned uv)
+./ops/lock-deps.sh --upgrade                # also move transitive deps to their newest versions
+git add darkwatch/requirements.in darkwatch/requirements.lock
+```
+CI fails while a lock is behind its `requirements.in` (`./ops/lock-deps.sh
+--check`); on a Dependabot pip PR, run `./ops/lock-deps.sh` on its branch
+and push the locks. The locks are resolved for CPython 3.11 on x86_64
+Linux, which the images use; arm64 hosts are untested.
 
 ### Stop everything
 ```bash
@@ -150,6 +174,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 - If the two image IDs differ, darkwatch is still running the newer image: run `docker compose up -d darkwatch` and compare again.
 - Run `git checkout main` before the next upgrade. The checkout leaves a detached HEAD, and `git pull --ff-only` (and so `deploy.sh`) fails on it.
 - Database: v0.3.0 runs on a v0.3.1 database as is (the indexes v0.3.1 adds are not UNIQUE), so no restore is needed. Going back past v0.4.0's retention, which removes data, is only possible by restoring the backup taken before v0.4.0.
+- Telegram login: v0.3.1 and earlier (Telethon 1.36) can't open a `telegram.session` that Telethon 1.45 (the release after v0.3.1) has opened; every Telegram call fails with `too many values to unpack (expected 5)`. Before `./ops/deploy.sh --skip-pull`, with darkwatch stopped (`docker compose stop darkwatch`), copy the pre-upgrade file back: `cp -p /root/telegram.session.pre-upgrade /var/lib/darkwebapp/darkwatch/data/telegram.session`. Otherwise take it from the full backup made before that upgrade, or log in to Telegram again with the QR code after the rollback.
 
 ---
 
@@ -160,8 +185,8 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 | Nightly    | `ops/retention.sh` purges old `loot/` content (cron job)    |
 | Weekly     | `ops/verify-egress.sh` (manual)                             |
 | Weekly     | Review `fail2ban-client status sshd` for SSH brute-force    |
+| Weekly     | Check `Dependency audit` workflow (pip-audit of `darkwatch/requirements.lock`, `setup/requirements.lock`, `requirements-dev.txt`) + Dependabot PRs |
 | Monthly    | `docker scout cves` against pinned images; bump if needed   |
-| Monthly    | `pip-audit -r darkwatch/requirements.txt` (if local)        |
 | Monthly    | Review who can SSH to the VM and reach dashboard bind IP |
 | Quarterly  | Rotate Telegram session (regen api credentials, delete old) |
 | Quarterly  | Rotate WireGuard configs                                    |

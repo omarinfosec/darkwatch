@@ -1,9 +1,12 @@
 name: Release
 
 # Publish a GitHub Release whose notes are the matching "## vX.Y.Z" section
-# of CHANGELOG.md. Either push a tag like v0.2.0, or run this workflow by
-# hand (Actions -> Release -> Run workflow) with the version: it then creates
-# the tag on the current main commit.
+# of CHANGELOG.md, after the full CI workflow (ci.yml) has passed on the
+# commit being released. Either push a tag like v0.2.0 on a commit that is
+# on main, or run this workflow by hand on main (Actions -> Release -> Run
+# workflow, branch main) with the version: it then creates the tag on the
+# main commit the run checked out. A manual run on any other branch skips
+# both jobs and publishes nothing.
 on:
   push:
     tags: ["v*"]
@@ -14,15 +17,26 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  ci:
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    # A skipped or failed ci job skips this one.
+    needs: ci
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0   # origin/main, for the ancestry check
       - name: Resolve tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
@@ -32,6 +46,12 @@ jobs:
             echo "tag must look like v1.2.3 (got: $tag)" >&2; exit 1
           fi
           echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: Commit is on main
+        # A pushed tag can point anywhere; only release what main contains.
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_SHA is not on main; not releasing it" >&2; exit 1
+          fi
       - name: Extract release notes from CHANGELOG.md
         run: |
           tag="$TAG"

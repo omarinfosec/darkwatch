@@ -259,3 +259,36 @@ def test_rescan_tg_channel_is_idempotent_and_releases_db_lock(tmp_path):
         assert out == {"scanned": 2, "findings": 2}
     # Second run purged the first run's findings instead of doubling them.
     assert db.conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 2
+
+
+def test_utcnow_is_naive_utc():
+    """utcnow() replaces datetime.utcnow() (deprecated in 3.12): it must
+    stay naive, since stored timestamps are naive UTC ISO strings."""
+    from datetime import datetime, timezone
+    from darkwatch import utcnow
+
+    now = utcnow()
+    assert now.tzinfo is None
+    ref = datetime.now(timezone.utc).replace(tzinfo=None)
+    assert abs((ref - now).total_seconds()) < 5
+
+
+def test_no_deprecated_datetime_calls():
+    """No datetime.utcnow()/utcfromtimestamp() left in the app modules:
+    they warn on Python 3.12+ and are slated for removal."""
+    import ast
+
+    src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hits = []
+    for name in sorted(os.listdir(src)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(src, name), encoding="utf-8") as fp:
+            tree = ast.parse(fp.read(), filename=name)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and node.attr in ("utcnow", "utcfromtimestamp")
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "datetime"):
+                hits.append(f"{name}:{node.lineno}")
+    assert not hits, f"deprecated datetime calls: {hits}"

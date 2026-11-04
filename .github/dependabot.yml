@@ -8,3 +8,35 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # Pinned Python requirements of both images (requirements.in) and the
+  # test tools; one weekly PR for all of them. Dependabot does not rewrite
+  # the images' requirements.lock files, so CI's lock check fails on its
+  # PR until ./ops/lock-deps.sh is run on the PR branch and the new locks
+  # are pushed. The locks and the test tools are also audited weekly by
+  # .github/workflows/deps-audit.yml.
+  - package-ecosystem: pip
+    directories: ["/darkwatch", "/setup", "/"]
+    schedule:
+      interval: weekly
+    groups:
+      pip:
+        patterns: ["*"]
+
+  # Dockerfile base images: refresh the pinned digests of the current tags
+  # only. A move to a new Python or Debian release is a deliberate change,
+  # not a bot PR.
+  - package-ecosystem: docker
+    directories: ["/darkwatch", "/setup", "/tor"]
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # No docker-compose entry yet: the third-party images in
+  # docker-compose.yml are pinned as name@sha256 without a tag, which
+  # Dependabot cannot track. Add one once they use name:tag@sha256.

@@ -1,0 +1,11 @@
+# gitleaks configuration (CI job "Secret scan (gitleaks)" in
+# .github/workflows/ci.yml). Starts from gitleaks' built-in rules and only
+# exempts files whose "secrets" are synthetic test fixtures.
+title = "DarkWatch"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic, zero-entropy WireGuard keys in the Setup UI validator tests"
+paths = ['''^setup/tests/test_validators\.py$''']

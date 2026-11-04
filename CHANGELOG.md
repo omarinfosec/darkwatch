@@ -1,5 +1,134 @@
 # Changelog
 
+## Unreleased
+
+### Upgrade notes
+- Telethon 1.45 upgrades the Telegram login file
+  (`/var/lib/darkwebapp/darkwatch/data/telegram.session`) to its version 8
+  format the first time it opens it. An older image (Telethon 1.36, v0.3.1
+  and earlier) cannot open the file after that: every Telegram call fails
+  with `ValueError: too many values to unpack (expected 5)`. Before you
+  deploy, stop darkwatch and copy the file, keeping its owner and mode (it is
+  the account login, readable only by its owner; keep the copy root-only):
+  `sudo docker compose stop darkwatch && sudo cp -p
+  /var/lib/darkwebapp/darkwatch/data/telegram.session
+  /root/telegram.session.pre-upgrade` (from `/opt/darkwebapp`). The full
+  backup in `ops/RUNBOOK.md` includes it; the database-only hot backup does
+  not. If you roll back, stop darkwatch, copy the file back with `cp -p`
+  before starting the old image, or log in to Telegram again with the QR
+  code.
+
+### Upgrades
+- Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
+  `async-timeout` is no longer installed (python-socks only needs it on
+  Python older than 3.11). cryptg 0.4 → 0.6.0, yara-python 4.5.1 → 4.5.4,
+  requests 2.34.2, beautifulsoup4 4.15.0, qrcode 8.2, prometheus-client
+  0.26.0; Setup UI: python-multipart 0.0.33, docker 7.2.0.
+- `/metrics` now advertises the Prometheus text format as
+  `text/plain; version=1.0.0; charset=utf-8` (it was `version=0.0.4`).
+  Prometheus accepts both; check any other scraper that matches on the
+  header. The header also no longer carries `charset=utf-8` twice.
+- The darkwatch image installs cryptg and yara-python from wheels only
+  (`pip install --only-binary=cryptg,yara-python`): a pin with no wheel for
+  the build platform fails the build instead of trying a source build
+  (cryptg's needs Rust, which the image does not have).
+
+### Fixed
+- Forum-topic labels on Telegram messages keep working on Telethon 1.45,
+  where `GetForumTopicsRequest` lives in `messages` and takes `peer=` (it
+  was in `channels` with `channel=`). A failed topic fetch is now logged as
+  a warning instead of at debug level; the messages are still stored,
+  without topic labels.
+- The crawler only follows links whose host ends in `.onion` over http or
+  https. It used to accept any link containing `.onion` in the host part,
+  such as `<x>.onion.evil.com` or `<x>.onion@evil.com`; those were already
+  dropped before fetching because a site crawl stays on the seed host, so
+  nothing left the target. A malformed link such as `http://[::1` on a
+  page is now skipped; it used to end that site's crawl with an error.
+
+### Internal
+- New CI workflow `images` (`.github/workflows/images.yml`) builds the
+  darkwatch, setup and tor images and smoke-tests them with the new
+  `tests/images/smoke.sh`, every container under `--network none` and a
+  timeout: darkwatch imports `darkwatch`, `threat_intel` and `web` and takes
+  an offline screenshot (the test checks that the PNG and its thumbnail
+  exist and are non-empty, because a failed Firefox launch is only logged);
+  setup imports `main` and runs `docker compose version`; tor runs
+  `tor --version`. It runs on pushes to main, weekly, and on every pull
+  request, skipping the build when a PR changes nothing under `darkwatch/`,
+  `setup/`, `tor/` or `tests/images/` or `.github/workflows/images.yml`
+  (a rename counts under both its old and new path), so the `images` check
+  can be required. Run the smoke tests on a host after a build with
+  `sudo bash tests/images/smoke.sh`.
+- The image smoke test (`tests/images/smoke.sh`) also checks the two native
+  wheels: Telethon must pick up cryptg (it silently falls back to slow
+  pure-Python AES without it), an AES-IGE round trip must succeed, and a
+  YARA rule must compile and match.
+- The darkwatch Dockerfile copies every top-level `*.py` module instead of a
+  fixed list, so a new module cannot be left out of the image.
+- The Release workflow runs the full CI workflow first (`ci.yml` is now
+  callable through `workflow_call`) and publishes only if it passes. A
+  manual run is only accepted on `main`; on any other branch both jobs are
+  skipped. A pushed tag must point at a commit on `main`
+  (`git merge-base --is-ancestor`), otherwise nothing is published. The
+  workflow's GITHUB_TOKEN is read-only except in the release job.
+- CI runs the test suites on Python 3.13 as well as 3.11 (the images'
+  version). The 3.11 checks keep their names (`Tests (darkwatch)`,
+  `Tests (setup)`); the new ones are `Tests (darkwatch, Python 3.13)` and
+  `Tests (setup, Python 3.13)`, which you can add to the required checks.
+  The `datetime.utcnow()` calls, deprecated since Python 3.12, are replaced
+  by a naive-UTC `utcnow()` helper in `darkwatch.py`; stored timestamps keep
+  their format.
+- New CI job `Secret scan (gitleaks)` scans the full git history with
+  gitleaks v8.30.1, built from the pinned module version whose `h1:` hash is
+  checked first. `.gitleaks.toml` extends gitleaks' default rules and only
+  allowlists `setup/tests/test_validators.py` (synthetic WireGuard keys).
+- Hash-locked Python dependencies. Each image's hand-pinned direct
+  dependencies moved from `requirements.txt` to `requirements.in`
+  (`darkwatch/`, `setup/`), and the new `ops/lock-deps.sh` resolves them
+  with a pinned uv (0.11.32, `uv pip compile --python-version 3.11
+  --python-platform linux --generate-hashes`) into `requirements.lock`:
+  every package, transitive ones included, at one version with the SHA-256
+  of each of its files. Both Dockerfiles and the CI test jobs install the
+  lock with `pip install --require-hashes`, so a file that does not match
+  its hash fails the build; CI installs `requirements-dev.txt` (no hashes)
+  in its own step. CI fails when a lock is behind its `requirements.in`
+  (`ops/lock-deps.sh --check`: every `name==version` there must be in the
+  lock), and `tests/lock-deps/check.sh` tests the script with uv stubbed.
+  The locks are resolved for x86_64 Linux; they carry the hashes of every
+  file of each version, but building the images on arm64 is untested.
+  stem and pyaes ship only source archives: those archives are
+  hash-checked, the setuptools pip fetches to build them is not. Dependabot
+  updates `requirements.in` only; run `./ops/lock-deps.sh` on its PR branch
+  (RUNBOOK, "Update Python dependencies").
+- New weekly workflow `Dependency audit` runs pip-audit 2.10.1 separately on
+  each image's `requirements.lock` (every package the image installs) and
+  on `requirements-dev.txt` (also on pull requests that change a
+  requirements file, and by hand).
+- Dependabot now also opens one weekly grouped PR for the pinned pip
+  requirements and one for the Dockerfile base images, limited to new
+  digests of the current tags (no major or minor version moves). The
+  third-party images in `docker-compose.yml` are pinned by digest only,
+  which Dependabot cannot track, so they are not covered yet.
+- shellcheck in CI now fails on warnings, not only errors, and also covers
+  `darkwatch/scan.sh`. The warnings it found are fixed with no change in
+  behaviour (`harden.sh --dry-run` output is identical).
+- New `tests/workflows/check.sh` (run in CI) checks the release, CI,
+  Dependabot and audit settings above and runs the release job's steps
+  against throwaway repositories with `gh` stubbed.
+- Regression tests for shipped fixes and the core crawl rules:
+  `darkwatch/tests/test_crawl.py` (only the target onion host is fetched,
+  Referer only within that host, `max_pages`, `max_depth`, the per-domain
+  circuit breaker, the stop event, link extraction); the screenshot browser's
+  launch options (Firefox prefs, `socks5h://` to `socks5://`, the dead proxy
+  in offline mode) and NEWNYM dialling the resolved ControlPort IP;
+  `/loot/tg-media` (sandboxed forced download for `.html`, inline `.png`,
+  404 for traversal); the findings, keywords and channel CSV exports and the
+  channel zip's `messages.csv`, requested by URL; and Setup's Telegram
+  credential check against a fake client (five outcomes, the Tunnel 2 proxy
+  passed through). The dashboard test fixture no longer leaks
+  `DARKWATCH_CONFIG` and `DARKWATCH_BIND_IP` into later test modules.
+
 ## v0.3.1 — 2026-11-04
 
 Fix release. v0.3.0's deploy.sh stopped silently on default installs and

@@ -1,4 +1,6 @@
 # Test-only tools for CI and local runs, installed on top of
-# darkwatch/requirements.txt or setup/requirements.txt.
+# darkwatch/requirements.lock or setup/requirements.lock in a separate
+# `pip install` (this file has no hashes, so it cannot share a hash-checked
+# install with a lock).
 pytest==9.2.0
 httpx2==2.16.0
