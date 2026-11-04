@@ -103,3 +103,79 @@ def test_browser_prefs_block_speculative_and_redirect_leaks():
     assert prefs["network.http.speculative-parallel-limit"] == 0
     assert prefs["network.proxy.allow_hijacking_localhost"] is True
     assert dw.ScreenshotEngine.DEAD_PROXY.startswith("socks5://127.0.0.1:")
+
+
+class _FakePlaywright:
+    """Stands in for sync_playwright(): records firefox.launch() kwargs."""
+    def __init__(self):
+        self.launches = []
+        self.firefox = self
+    def __call__(self):
+        return self
+    def start(self):
+        return self
+    def launch(self, **kw):
+        self.launches.append(kw)
+        return object()
+
+
+@pytest.fixture
+def fake_pw(monkeypatch):
+    pw = _FakePlaywright()
+    monkeypatch.setattr(dw, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(dw, "sync_playwright", pw, raising=False)
+    return pw
+
+
+def test_browser_launch_uses_prefs_and_plain_socks5(fake_pw, tmp_path):
+    eng = dw.ScreenshotEngine(str(tmp_path / "s"), proxy_url="socks5h://tunnel1:9050",
+                              mode="tor_render")
+    assert eng._ensure_browser() is True
+    (kw,) = fake_pw.launches
+    assert kw["firefox_user_prefs"] is dw.ScreenshotEngine.FIREFOX_PREFS
+    assert kw["headless"] is True
+    # Firefox rejects socks5h://; the h is dropped, remote DNS is a pref.
+    assert kw["proxy"] == {"server": "socks5://tunnel1:9050"}
+
+
+@pytest.mark.parametrize("mode,proxy_url", [
+    ("offline", "socks5h://tunnel1:9050"),
+    ("tor_render", None),
+])
+def test_browser_without_tor_proxy_uses_dead_proxy(fake_pw, tmp_path, mode, proxy_url):
+    eng = dw.ScreenshotEngine(str(tmp_path / "s"), proxy_url=proxy_url, mode=mode)
+    assert eng._ensure_browser() is True
+    (kw,) = fake_pw.launches
+    assert kw["proxy"] == {"server": dw.ScreenshotEngine.DEAD_PROXY}
+    assert kw["firefox_user_prefs"] is dw.ScreenshotEngine.FIREFOX_PREFS
+
+
+def test_newnym_connects_to_the_resolved_control_ip(monkeypatch):
+    """stem's from_port() only takes an IP literal: the sidecar name must be
+    resolved first and the IP (not the name) passed on."""
+    seen = {}
+
+    class FakeController:
+        @classmethod
+        def from_port(cls, address, port):
+            seen["from_port"] = (address, port)
+            return cls()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def authenticate(self, password=None): seen["password"] = password
+        def signal(self, sig): seen["signal"] = sig
+
+    monkeypatch.setattr(dw, "STEM_AVAILABLE", True)
+    monkeypatch.setattr(dw, "Controller", FakeController, raising=False)
+    monkeypatch.setattr(dw, "Signal", type("Sig", (), {"NEWNYM": "NEWNYM"}),
+                        raising=False)
+    monkeypatch.setattr(dw.socket, "gethostbyname",
+                        lambda name: seen.setdefault("resolved", name) and "172.31.250.2")
+    c = dw.DarkWebCrawler.__new__(dw.DarkWebCrawler)
+    c.newnym_between_sites = True
+    c.tor_control_host = "tunnel1"
+    c.tor_control_port = "9051"
+    c.tor_control_password = "ctl-pw"
+    assert c.rotate_tor_circuit() is True
+    assert seen == {"resolved": "tunnel1", "from_port": ("172.31.250.2", 9051),
+                    "password": "ctl-pw", "signal": "NEWNYM"}

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+- The crawler only follows links whose host ends in `.onion` over http or
+  https. It used to accept any link containing `.onion` in the host part,
+  such as `<x>.onion.evil.com` or `<x>.onion@evil.com`; those were already
+  dropped before fetching because a site crawl stays on the seed host, so
+  nothing left the target. A malformed link such as `http://[::1` on a
+  page is now skipped; it used to end that site's crawl with an error.
+
 ### Internal
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new
@@ -49,6 +57,18 @@
 - New `tests/workflows/check.sh` (run in CI) checks the release, CI,
   Dependabot and audit settings above and runs the release job's steps
   against throwaway repositories with `gh` stubbed.
+- Regression tests for shipped fixes and the core crawl rules:
+  `darkwatch/tests/test_crawl.py` (only the target onion host is fetched,
+  Referer only within that host, `max_pages`, `max_depth`, the per-domain
+  circuit breaker, the stop event, link extraction); the screenshot browser's
+  launch options (Firefox prefs, `socks5h://` to `socks5://`, the dead proxy
+  in offline mode) and NEWNYM dialling the resolved ControlPort IP;
+  `/loot/tg-media` (sandboxed forced download for `.html`, inline `.png`,
+  404 for traversal); the findings, keywords and channel CSV exports and the
+  channel zip's `messages.csv`, requested by URL; and Setup's Telegram
+  credential check against a fake client (five outcomes, the Tunnel 2 proxy
+  passed through). The dashboard test fixture no longer leaks
+  `DARKWATCH_CONFIG` and `DARKWATCH_BIND_IP` into later test modules.
 
 ## v0.3.1 — 2026-11-04
 

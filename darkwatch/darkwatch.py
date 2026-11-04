@@ -5269,9 +5269,15 @@ class DarkWebCrawler:
         links = set()
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            full = urljoin(base_url, href)
-            parsed = urlparse(full)
-            if ".onion" in parsed.netloc:
+            try:
+                full = urljoin(base_url, href)
+                parsed = urlparse(full)
+            except ValueError:          # e.g. "http://[::1": skip, don't abort
+                continue
+            # The host itself must be an onion: "<x>.onion.evil.com" and
+            # "<x>.onion@evil.com" (userinfo) only contain the string.
+            if (parsed.scheme in ("http", "https")
+                    and (parsed.hostname or "").endswith(".onion")):
                 clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                 if clean.endswith("/"):
                     clean = clean[:-1]
