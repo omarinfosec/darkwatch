@@ -27,7 +27,7 @@ from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Doctype
 
 try:
     from playwright.sync_api import sync_playwright
@@ -2208,10 +2208,54 @@ class Alerter:
 # ─── HTML Sanitizer ──────────────────────────────────────────────────────────
 
 class HTMLSanitizer:
+    # Saved pages are opened in an analyst's browser. The policy is the
+    # backstop for everything the tag and attribute rules below miss: no
+    # script, frame, fetch, form or remote load, only inline styles and
+    # data: images, media and fonts.
+    CSP = ("default-src 'none'; img-src data:; media-src data:; "
+           "font-src data:; style-src 'unsafe-inline'; base-uri 'none'; "
+           "form-action 'none'")
+
     TRACKING_PATTERNS = [
-        r'url\(["\x27]?https?://[^)]+["\x27]?\)',
-        r'@import\s+["\x27]https?://',
+        r'url\(\s*["\x27]?\s*(?:https?:)?//[^)]+["\x27]?\s*\)',
+        r'@import\s+["\x27](?:https?:)?//',
     ]
+
+    # Attributes a browser reads as a URL.
+    URL_ATTRS = {"src", "href", "action", "formaction", "srcset", "poster",
+                 "background", "data", "xlink:href", "cite", "longdesc",
+                 "lowsrc", "dynsrc", "ping", "manifest", "codebase", "icon"}
+
+    # (tag, attribute) pairs that load a resource as soon as the page is
+    # shown. A remote value moves to data-original-<attribute>.
+    REMOTE_LOADS = {"video": ("src", "poster"), "audio": ("src",),
+                    "source": ("src", "srcset"), "track": ("src",),
+                    "image": ("href", "xlink:href"), "link": ("href",),
+                    "img": ("srcset",)}
+
+    # A scheme ("http:x" is remote from a file:// page too) or a
+    # protocol-relative "//", after _norm_url.
+    _REMOTE = re.compile(r"^(?:[a-z][a-z0-9+.\-]*:|//)")
+
+    @staticmethod
+    def _norm_url(val):
+        """The URL as a browser reads its scheme: without control
+        characters or whitespace (so "java\\tscript:" is javascript:), with
+        "\\" read as "/", lower-cased."""
+        return re.sub(r"[\x00-\x20\x7f\s]+", "", str(val)).replace(
+            "\\", "/").lower()
+
+    @staticmethod
+    def _is_remote(norm):
+        return (bool(HTMLSanitizer._REMOTE.match(norm))
+                and not norm.startswith("data:"))
+
+    @staticmethod
+    def _srcset_is_remote(norm):
+        # Candidates are comma-separated, but data: URLs contain commas
+        # too, so any "//" or non-data scheme counts.
+        return "//" in norm or bool(
+            re.search(r"(?:^|,)(?!data:)[a-z][a-z0-9+.\-]*:", norm))
 
     @staticmethod
     def sanitize(html, config):
@@ -2236,18 +2280,28 @@ class HTMLSanitizer:
         for tag in soup.find_all(["form", "input", "button", "textarea", "select"]):
             tag.decompose()
 
+        # <base> would point every relative URL at a remote host.
+        for tag in soup.find_all("base"):
+            tag.decompose()
+
         # strip tracking and event handlers
         if config.get("strip_tracking", True):
             for tag in soup.find_all(True):
                 for attr in list(tag.attrs.keys()):
                     if attr.lower().startswith("on"):
                         del tag[attr]
-                    if attr in ("src", "href", "action"):
-                        val = str(tag.get(attr, ""))
-                        if val.strip().lower().startswith("javascript:"):
+                        continue
+                    if attr.lower() in HTMLSanitizer.URL_ATTRS:
+                        val = HTMLSanitizer._norm_url(tag.get(attr, ""))
+                        if (val.startswith(("javascript:", "vbscript:"))
+                                or (val.startswith("data:")
+                                    and not val.startswith("data:image/"))):
                             del tag[attr]
-                        if val.strip().lower().startswith("data:") and "script" in val.lower():
-                            del tag[attr]
+                    elif attr.lower() == "style":
+                        text = str(tag[attr])
+                        for pattern in HTMLSanitizer.TRACKING_PATTERNS:
+                            text = re.sub(pattern, "/* REMOVED */", text, flags=re.I)
+                        tag[attr] = text
 
             # remove tracking pixels
             for img in soup.find_all("img"):
@@ -2257,9 +2311,21 @@ class HTMLSanitizer:
                     img.decompose()
                     continue
                 src = img.get("src", "")
-                if src.startswith("http"):
+                if HTMLSanitizer._is_remote(HTMLSanitizer._norm_url(src)):
                     img["src"] = "[EXTERNAL_IMAGE_REMOVED]"
                     img["data-original-src"] = src
+
+            # media, SVG images and stylesheets that load on view
+            for tag in soup.find_all(list(HTMLSanitizer.REMOTE_LOADS)):
+                for attr in HTMLSanitizer.REMOTE_LOADS[tag.name]:
+                    if not tag.has_attr(attr):
+                        continue
+                    norm = HTMLSanitizer._norm_url(tag[attr])
+                    if (HTMLSanitizer._srcset_is_remote(norm)
+                            if attr == "srcset"
+                            else HTMLSanitizer._is_remote(norm)):
+                        tag["data-original-" + attr.replace(":", "-")] = tag[attr]
+                        del tag[attr]
 
             # strip meta refresh
             for meta in soup.find_all("meta"):
@@ -2278,6 +2344,23 @@ class HTMLSanitizer:
                 rel = " ".join(link.get("rel", []))
                 if "stylesheet" not in rel.lower():
                     link.decompose()
+
+        # The policy goes last, as the first child of <head>, so that no
+        # element the page carries comes before it.
+        html_tag = soup.find("html")
+        if html_tag is None:
+            html_tag = soup.new_tag("html")
+            for node in list(soup.contents):
+                if not isinstance(node, Doctype):
+                    html_tag.append(node.extract())
+            soup.append(html_tag)
+        head = html_tag.find("head", recursive=False)
+        if head is None:
+            head = soup.new_tag("head")
+            html_tag.insert(0, head)
+        head.insert(0, soup.new_tag(
+            "meta", attrs={"http-equiv": "Content-Security-Policy",
+                           "content": HTMLSanitizer.CSP}))
 
         # Operator fingerprint removed: no timestamped comment injected.
         # Saved pages must not reveal when/which operator touched them.

@@ -44,6 +44,22 @@
   does not shrink by itself; RUNBOOK describes a manual VACUUM with the
   stack stopped.
 
+### Security
+- Saved HTML copies (`loot/pages`) no longer make network requests when
+  you open them. The sanitizer now puts a Content-Security-Policy first
+  in `<head>` (adding a `<head>` if the page has none): only inline
+  styles and `data:` images, media and fonts, no scripts, frames, forms or
+  `<base>`. It also removes `<base>`, reads URL attributes the way a browser
+  does (control characters and whitespace removed, so `java\tscript:` is
+  caught) and drops `javascript:`, `vbscript:` and every `data:` URL that is
+  not an image. Remote loads, protocol-relative `//host` ones included, are
+  taken out of `<img>`, `<video>`, `<audio>`, `<source>`, `<track>`, SVG
+  `<image>`, stylesheet links and `srcset` (the URL is kept in a
+  `data-original-*` attribute), and `url(//host)` (with or without quotes
+  or whitespace inside the parentheses) / `@import "//host"` are removed
+  from `<style>` and `style=""`. Pages saved before this release
+  are not rewritten and keep their remote references.
+
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
   `async-timeout` is no longer installed (python-socks only needs it on
@@ -208,6 +224,10 @@
   read the same config as the dashboard.
 
 ### Internal
+- New `darkwatch/tests/test_sanitizer.py` covers the saved-page sanitizer,
+  including a headless-Chromium check that a sanitized page opened from
+  `file://` makes no request (skipped without a Playwright Chromium;
+  `DARKWATCH_TEST_CHROMIUM` names another binary).
 - New `tests/retention/check.sh` (run in CI) tests `ops/retention.sh` and
   the cron install (`ops/lib/retention-cron.sh`) with docker and crontab
   stubbed; `darkwatch/tests/test_retention.py` covers the database steps,
