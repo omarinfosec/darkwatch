@@ -163,3 +163,36 @@ def test_extract_links_keeps_onion_hosts(href):
 def test_extract_links_drops_non_onion_hosts(href):
     c = dw.DarkWebCrawler.__new__(dw.DarkWebCrawler)
     assert c.extract_links(_page(href, "/ok"), TARGET + "/") == {f"{TARGET}/ok"}
+
+
+def test_html_copy_is_saved_only_for_new_content(tmp_path):
+    """/a and /b serve the same content: scan_page skips the second one as
+    a duplicate, and no HTML copy is written for it either (one used to be written for
+    every fetched page, so an unchanged page added a file on every check)."""
+    leak = "<html><body><p>leak dump</p></body></html>"
+    site = {TARGET: '<html><body><p>home</p><a href="/a">a</a>'
+                    '<a href="/b">b</a></body></html>',
+            f"{TARGET}/a": leak, f"{TARGET}/b": leak}
+    c = _crawler(site)
+    c.db = dw.Database(str(tmp_path / "dw.db"))
+    c.db.add_url(TARGET)
+    url_id = c.db.conn.execute("SELECT id FROM urls").fetchone()[0]
+    # The real save_page / scan_page, without YARA, screenshots or sanitizing.
+    del c.save_page, c.scan_page
+    c.save_pages = True
+    c.loot_dir = str(tmp_path / "loot")
+    os.makedirs(os.path.join(c.loot_dir, "pages"))
+    c.security_cfg = {"sanitize_saved_html": False}
+    c.save_screenshots = False
+    c.data_extractor = dw.DataExtractor()
+    empty = {"keywords": [], "categories": []}
+    c.scanner = type("Y", (), {"scan_parallel": lambda self, a, b: (empty, empty)})()
+    assert c.crawl_site(url_id, TARGET) == (3, 0)
+    assert c.db.conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0] == 2
+    saved = os.listdir(os.path.join(c.loot_dir, "pages"))
+    assert len(saved) == 2
+    # extract_links does not keep link order: whichever of /a and /b came
+    # first is saved, the other is not.
+    stem = "http___" + "a" * 56 + "_onion"
+    assert sum(name.startswith((stem + "_a_", stem + "_b_"))
+               for name in saved) == 1

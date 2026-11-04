@@ -75,6 +75,12 @@ for label, path in (("screenshot", shot), ("thumbnail", thumb)):
     print(f"{label}: {os.path.basename(path)} ({os.path.getsize(path)} bytes)")
 '
 
+# What ops/retention.sh runs in the container (docker exec -w /app ...): the
+# CLI parses and the database steps run, here on a fresh database.
+run "darkwatch: retention CLI" \
+    -w /app -e DARKWATCH_CONFIG=/app/config.json \
+    "$DARKWATCH_IMAGE" python darkwatch.py --retention --dry-run
+
 # main.py refuses to import without a token; any value will do here.
 run "setup: import main" \
     -e SETUP_AUTH_TOKEN=x "$SETUP_IMAGE" python -c 'import main'

@@ -221,7 +221,7 @@ sudo ./ops/egress-lockdown.sh --status     # darkwatch container has no direct i
 sudo docker compose ps                     # what's running
 sudo docker compose logs -f darkwatch      # tail one service
 sudo docker compose restart tunnel1        # restart a specific service
-sudo ./ops/retention.sh                    # enforce loot/ retention windows (schedule nightly: RUNBOOK → Cron setup)
+sudo ./ops/retention.sh                    # enforce retention now (deploy installs the nightly cron job: RUNBOOK → Retention)
 ```
 
 Full operator runbook including incident playbooks, maintenance schedule, and environment cheat sheet: [ops/RUNBOOK.md](ops/RUNBOOK.md).

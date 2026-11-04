@@ -2706,7 +2706,8 @@ def route_urls_bulk_monitor():
 def route_url_delete(url_id):
     if not _crawler.db.url_exists(url_id):
         abort(404)
-    _crawler.db.delete_url(url_id)
+    # Rows, then (best effort) the URL's screenshots and media files.
+    _crawler.delete_url(url_id)
     _refresh_tg_live_channels()
     return jsonify({"deleted": url_id})
 

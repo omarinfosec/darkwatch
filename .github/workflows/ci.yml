@@ -81,6 +81,8 @@ jobs:
         run: sudo bash tests/ops/check.sh
       - name: verify-egress.sh (stubbed docker)
         run: sudo bash tests/verify-egress/check.sh
+      - name: retention.sh + retention cron install (stubbed docker, crontab)
+        run: bash tests/retention/check.sh
       - name: docker compose config
         run: |
           data="$(mktemp -d)"

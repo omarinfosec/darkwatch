@@ -182,7 +182,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 
 | Cadence    | Task                                                       |
 |------------|------------------------------------------------------------|
-| Nightly    | `ops/retention.sh` purges old `loot/` content (cron job)    |
+| Nightly    | `ops/retention.sh` purges old `loot/` files and database rows ([Retention](#retention), cron job installed by deploy) |
 | Weekly     | `ops/verify-egress.sh` (manual)                             |
 | Weekly     | Review `fail2ban-client status sshd` for SSH brute-force    |
 | Weekly     | Check `Dependency audit` workflow (pip-audit of `darkwatch/requirements.lock`, `setup/requirements.lock`, `requirements-dev.txt`) + Dependabot PRs |
@@ -194,15 +194,70 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 
 ---
 
-## Cron setup
+## Retention
 
-Install on first deploy:
+`ops/deploy.sh` (and `ops/install.sh`) install the nightly job as
+`/etc/cron.d/darkwatch-retention` (03:17, as root, log in
+`/var/log/darkwatch-retention.log`) and rewrite it on every deploy. They also
+remove an `ops/retention.sh` line from root's crontab, which older versions of
+this runbook had you add by hand; other crontab jobs are kept. Check it:
 ```bash
-sudo crontab -l 2>/dev/null > /tmp/cron.bak || true
-echo '0 3 * * * /opt/darkwebapp/ops/retention.sh >> /var/log/darkwatch-retention.log 2>&1' >> /tmp/cron.bak
-sudo crontab /tmp/cron.bak
-rm /tmp/cron.bak
+grep -c retention.sh /etc/cron.d/darkwatch-retention       # 1
+sudo crontab -l 2>/dev/null | grep -c retention.sh || true  # 0
 ```
+A host without `/etc/cron.d` (no cron installed) gets a deploy warning
+instead: run `sudo ./ops/retention.sh` from your own scheduler.
+
+Each run first prunes files under `loot/`, then applies the database steps
+inside the running darkwatch container (`darkwatch.py --retention`). Windows
+are in days; set them in `/var/lib/darkwebapp/env`:
+
+| Variable | Default | What goes |
+|---|---|---|
+| `RETENTION_SCREENSHOT_DAYS` | 90 | screenshots and thumbnails |
+| `RETENTION_PAGE_DAYS` | 90 | saved HTML copies (`loot/pages`) |
+| `RETENTION_REPORT_DAYS` | 365 | reports |
+| `RETENTION_TG_MEDIA_DAYS` | 180 | downloaded Telegram media; never the avatars in `tg-media/channels/` and `tg-media/users/` |
+| `RETENTION_MONITOR_EVENTS_DAYS` | 180 | monitor history rows (`monitor_events`) |
+| `RETENTION_TEXT_SNAPSHOT_DAYS` | 365 | page text kept for rescans (`pages.text_snapshot`, set to NULL); the newest snapshot of each page stays |
+
+`0` turns a database step off (the two database defaults come from the
+`retention` section of darkwatch's config). For the file windows
+(`SCREENSHOT`, `PAGE`, `REPORT`, `TG_MEDIA`) `0` is **not** "off": it removes
+every such file older than a day. The database step also clears the
+screenshot, thumbnail and media paths whose file is gone, so the dashboard
+stops offering them, and checkpoints the WAL. Page and finding rows are never
+deleted: findings keep their page, title and extracted IOCs.
+
+```bash
+sudo ./ops/retention.sh --dry-run    # list what would go; changes nothing
+sudo ./ops/retention.sh              # run now
+```
+- **Nothing it deletes or sets to NULL can be undone.** The only way back is
+  a backup taken before (see [Back up and restore](#back-up-and-restore); for
+  v0.4.0 include `darkwatch/loot`).
+- If darkwatch is not running, the database step is skipped with a warning
+  and the run still exits 0; the next run catches up. If the database step
+  fails, the files are still pruned and the run exits 3.
+- Deleting a URL in the dashboard also removes its screenshots, thumbnails,
+  downloaded Telegram media and channel avatar. Its saved HTML copies are not
+  tracked per URL and age out with `RETENTION_PAGE_DAYS`.
+
+### Shrinking the database file (VACUUM, manual)
+Retention frees space inside `darkwatch.db` for new rows; the file itself
+does not shrink. To shrink it, with the stack stopped and at least the
+database's size free on the disk, after a [backup](#back-up-and-restore):
+```bash
+cd /opt/darkwebapp
+du -h /var/lib/darkwebapp/darkwatch/data/darkwatch.db; df -h /var/lib/darkwebapp
+sudo docker compose stop darkwatch setup
+sudo sqlite3 /var/lib/darkwebapp/darkwatch/data/darkwatch.db 'PRAGMA wal_checkpoint(TRUNCATE); VACUUM;'
+sudo chown 999:999 /var/lib/darkwebapp/darkwatch/data/darkwatch.db*
+sudo docker compose start darkwatch
+```
+Never run VACUUM while darkwatch is running: it needs an exclusive lock for
+the whole rewrite, and the dashboard and scans would fail meanwhile. Nothing
+schedules it.
 
 ---
 

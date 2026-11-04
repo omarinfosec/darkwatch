@@ -24,6 +24,26 @@
   `TOR_CONTROL_PASSWORD` reaches darkwatch's config (see
   `ops/RUNBOOK.md`).
 
+- **Retention now also prunes the database, and deploy schedules it.**
+  Back up first, including `darkwatch/loot` (RUNBOOK, "Back up and
+  restore"): the deletes and NULLs below cannot be undone, and that backup
+  is the only way back. `ops/retention.sh` additionally removes downloaded
+  Telegram media older than 180 days (`loot/tg-media`, avatars excluded)
+  and then, inside the running darkwatch container, deletes monitor history
+  (`monitor_events`) older than 180 days and sets page text snapshots older
+  than 365 days to NULL, keeping the newest snapshot of each page so a
+  rescan still covers it. Page and finding rows are never deleted. Run
+  `sudo ./ops/retention.sh --dry-run` to see what the first run will
+  remove; change the windows with the `RETENTION_*` variables in
+  `/var/lib/darkwebapp/env` (RUNBOOK, "Retention"). `ops/deploy.sh` now
+  installs the nightly job as `/etc/cron.d/darkwatch-retention` and removes
+  the `ops/retention.sh` line the old RUNBOOK had you add to root's
+  crontab, keeping your other jobs. After deploying, `grep -c retention.sh
+  /etc/cron.d/darkwatch-retention` prints 1 and `sudo crontab -l
+  2>/dev/null | grep -c retention.sh || true` prints 0. The database file
+  does not shrink by itself; RUNBOOK describes a manual VACUUM with the
+  stack stopped.
+
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
   `async-timeout` is no longer installed (python-socks only needs it on
@@ -161,7 +181,40 @@
   check before a scan asks afresh. The dashboard labels
   these checks "Tunnel 1 (Tor circuits)" and "Telegram SOCKS reachable".
 
+- Storage growth. A crawl saved an HTML copy (`loot/pages`) of every
+  fetched page, also when its content was already stored, so each monitor
+  check of an unchanged page added a file; it now saves one only for new
+  content. A rescan read every stored page text at once while holding the
+  database lock; it now reads 200 pages per lock acquisition. Deleting a
+  URL now also removes its screenshots, thumbnails, downloaded Telegram
+  media and channel avatar (best effort; saved HTML copies are not tracked
+  per URL and age out with retention). New `darkwatch.py --retention
+  [--dry-run]` applies the database retention (config section
+  `retention`; `--monitor-events-days` and `--text-snapshot-days` override
+  it, 0 turns a step off) and logs a count per step: old monitor events,
+  old text snapshots, screenshot/thumbnail/media paths whose file is gone
+  (set to NULL, so the dashboard stops offering a thumbnail that would
+  answer 404) and a `wal_checkpoint(TRUNCATE)`.
+- `ops/retention.sh` prunes the files first and runs the database step
+  only when the darkwatch container is running; otherwise it warns and
+  still exits 0. A failed database step only warns and exits 3, after the
+  files were pruned. A window that is not a whole number stops it before
+  anything is deleted. It takes `--dry-run` and reads its windows from the
+  env file. A file that disappears before it is hashed (a URL deleted in
+  the dashboard meanwhile) is logged with `sha256=unknown` instead of
+  aborting the run.
+- `darkwatch.py --config` now defaults to `$DARKWATCH_CONFIG` (else
+  `config.json`), as `web.py` already did, so the CLI and `--retention`
+  read the same config as the dashboard.
+
 ### Internal
+- New `tests/retention/check.sh` (run in CI) tests `ops/retention.sh` and
+  the cron install (`ops/lib/retention-cron.sh`) with docker and crontab
+  stubbed; `darkwatch/tests/test_retention.py` covers the database steps,
+  the batched rescan read, file removal on URL delete and `/api/findings`
+  after retention on a copy of a populated database. The image smoke test
+  (`tests/images/smoke.sh`) runs `darkwatch.py --retention --dry-run` in
+  the darkwatch image.
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new
   `tests/images/smoke.sh`, every container under `--network none` and a

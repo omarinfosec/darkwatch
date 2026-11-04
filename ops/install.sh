@@ -56,6 +56,9 @@ ask()  {
     [[ "$ans" =~ ^[Yy] ]]
 }
 
+# shellcheck source-path=SCRIPTDIR source=lib/retention-cron.sh
+source "$SCRIPT_DIR/lib/retention-cron.sh"
+
 [[ $EUID -eq 0 ]] || fail "must run as root (sudo ./ops/install.sh)"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -90,6 +93,9 @@ else
     log "creating $DATA_ROOT and seeding state"
 fi
 "$SCRIPT_DIR/bootstrap.sh"
+# Nightly ops/retention.sh. deploy.sh installs it too (existing VMs never
+# rerun install.sh); also here so --skip-deploy gets it.
+install_retention_cron "$REPO_ROOT" "$DATA_ROOT"
 
 # Extract the auto-generated SETUP_AUTH_TOKEN for printing at the end
 SETUP_TOKEN="$(grep -E '^SETUP_AUTH_TOKEN=' "$DATA_ROOT/env" 2>/dev/null | head -1 | cut -d= -f2-)" || true

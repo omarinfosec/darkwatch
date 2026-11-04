@@ -35,6 +35,8 @@ warn() { printf '\033[1;33m[deploy WARN]\033[0m %s\n' "$*" >&2; }
 fail() { printf '\033[1;31m[deploy ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 # shellcheck source-path=SCRIPTDIR source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source-path=SCRIPTDIR source=lib/retention-cron.sh
+source "$SCRIPT_DIR/lib/retention-cron.sh"
 
 # ─── Must run as root (docker socket + /var/lib/darkwebapp/env) ─────────────
 if [[ $EUID -ne 0 ]]; then
@@ -272,6 +274,11 @@ WantedBy=docker.service
         log "installed darkwatch-egress-lockdown.service (applies the rule at boot, before Docker)"
     fi
 fi
+
+# Nightly ops/retention.sh (/etc/cron.d/darkwatch-retention). Here and not
+# only in install.sh, which existing VMs never rerun; it also drops the
+# crontab line older RUNBOOKs had operators add. Only warns on failure.
+install_retention_cron "$REPO_ROOT" "$DATA_ROOT"
 
 # ─── Bring stack up ──────────────────────────────────────────────────────────
 # Tunnel sidecars wait for their WireGuard container to report a handshake;

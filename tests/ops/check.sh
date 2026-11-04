@@ -48,9 +48,12 @@ echo "iptables $*" >> "$DOCKER_LOG"
 [[ "$*" == "-C FORWARD -j DOCKER-USER" && -n "${STUB_NO_FORWARD_JUMP:-}" ]] && exit 1
 exit 0
 EOF
+# No root crontab; writing one would be a bug here (the retention cron goes
+# to DW_CRON_DIR and the legacy-line cleanup has nothing to remove).
+printf '#!/bin/sh\n[ "$1" = -l ] || echo "crontab $*" >> "$DOCKER_LOG"\nexit 1\n' > "$work/bin/crontab"
 # The host side of the probe (positive control): online unless STUB_HOST_OFFLINE.
 printf '#!/bin/sh\n[ -z "$STUB_HOST_OFFLINE" ] || exit 28\n' > "$work/bin/curl"
-chmod 755 "$work/bin/docker" "$work/bin/systemctl" "$work/bin/iptables" "$work/bin/curl"
+chmod 755 "$work/bin/docker" "$work/bin/systemctl" "$work/bin/iptables" "$work/bin/curl" "$work/bin/crontab"
 export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 
 # A fresh tree per case: ops/ (lockdown + verify stubbed), .env.example and
@@ -58,7 +61,7 @@ export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 # check (the self-update case at the end makes its own checkout).
 new_tree() {
     T="$work/case$((++case_n))"
-    mkdir -p "$T/repo/tunnels/killswitch" "$T/units"
+    mkdir -p "$T/repo/tunnels/killswitch" "$T/units" "$T/cron.d"
     cp -a "$repo/ops" "$repo/.env.example" "$T/repo/"
     cp -a "$repo/tunnels/killswitch/10-killswitch.sh" "$T/repo/tunnels/killswitch/"
     printf '#!/bin/sh\necho "lockdown stub"\necho "lockdown-stub $*" >> "$DOCKER_LOG"\n' > "$T/repo/ops/egress-lockdown.sh"
@@ -82,7 +85,7 @@ seed() {
 deploy() {   # extra args are passed to deploy.sh; sets rc
     : > "$DOCKER_LOG"
     set +e
-    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" \
+    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" DW_CRON_DIR="$T/cron.d" \
         "$T/repo/ops/deploy.sh" --skip-pull "$@" > "$work/out" 2>&1
     rc=$?
     set -e
@@ -163,6 +166,13 @@ grep -qE '^(Requires|After)=docker' "$unit" && die "unit must not require or fol
 grep -q '^systemctl reenable --quiet darkwatch-egress-lockdown.service' "$DOCKER_LOG" \
     || die "unit must be enabled with reenable"
 ok "unit runs before docker.service, after the host firewalls, WantedBy=docker.service"
+
+cron="$T/cron.d/darkwatch-retention"
+[[ -f "$cron" ]] || die "retention cron not installed into DW_CRON_DIR"
+grep -qx "DARKWEBAPP_DATA_ROOT=$D" "$cron" && grep -q " root /bin/bash $T/repo/ops/retention\.sh >> " "$cron" \
+    || die "retention cron: $(cat "$cron")"
+grep -q '^crontab' "$DOCKER_LOG" && die "deploy must not write a crontab when there is no legacy line"
+ok "deploy installs the retention cron (cron.d, this checkout's retention.sh, this data root)"
 
 [[ "$(grep -c '^TG_SOCKS_PASSWORD=' "$D/env")" == 1 ]] || die "TG_SOCKS_PASSWORD must appear once"
 pw="$(grep '^TG_SOCKS_PASSWORD=' "$D/env" | cut -d= -f2-)"
@@ -356,7 +366,8 @@ seed
 self_deploy() {   # like deploy(), but lets deploy.sh pull
     : > "$DOCKER_LOG"
     set +e
-    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" "$T/repo/ops/deploy.sh" "$@" > "$work/out" 2>&1
+    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" DW_CRON_DIR="$T/cron.d" \
+        "$T/repo/ops/deploy.sh" "$@" > "$work/out" 2>&1
     rc=$?
     set -e
 }
