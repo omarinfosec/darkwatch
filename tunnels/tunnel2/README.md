@@ -19,7 +19,8 @@ all when no proxy is configured, so it can't fall back to the host's IP.
 
 If no config is present, `deploy.sh` leaves the `tg` compose profile off:
 `tunnel2` and `tg-socks` aren't started, Telegram scraping is unavailable,
-and the dashboard's health panel shows the Telegram VPN check as failed.
+and the dashboard's health panel shows the "Telegram SOCKS reachable" check
+as failed.
 
 ## After adding the config
 

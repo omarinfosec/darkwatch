@@ -6073,10 +6073,18 @@ class DarkWebCrawler:
             findings = [f for f in findings if keyword.lower() in json.dumps(f).lower()]
         return findings
 
+    REPORT_MAX_FINDINGS = 1000
+
     def generate_report(self, min_score=0):
-        findings = self.db.get_findings(min_score=min_score, limit=1000)
+        # One row past the cap tells whether older findings were left out.
+        cap = self.REPORT_MAX_FINDINGS
+        findings = self.db.get_findings(min_score=min_score, limit=cap + 1)
+        truncated = len(findings) > cap
+        findings = findings[:cap]
         stats = self.db.get_stats()
-        report = {"generated_at": datetime.now().isoformat(), "statistics": stats, "findings": findings}
+        report = {"generated_at": datetime.now().isoformat(), "statistics": stats,
+                  "findings_included": len(findings), "truncated": truncated,
+                  "findings": findings}
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = os.path.join(self.reports_dir, f"report_{ts}.json")
@@ -6093,6 +6101,9 @@ class DarkWebCrawler:
             for k, v in stats.items():
                 f.write(f"  {k}: {v}\n")
             f.write("\n")
+            if truncated:
+                f.write(f"NOTE: report truncated: only the newest {cap} findings are "
+                        "included below. Use Export CSV for more.\n\n")
 
             for sev in ["critical", "high", "medium", "low"]:
                 sev_findings = [x for x in findings if x.get("severity") == sev]

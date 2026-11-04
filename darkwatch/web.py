@@ -7,6 +7,7 @@ to run a scan unless Tor, the VPN, the IP-leak check, and DNS-over-Tor
 all pass.
 """
 
+import collections
 import csv
 import errno
 import io
@@ -160,7 +161,16 @@ _crawl_lock = threading.Lock()
 _tg_lock = threading.Lock()
 _scan_thread = None
 _stop_event = threading.Event()
-_log_queue: "queue.Queue[str]" = queue.Queue(maxsize=10000)
+# Live log for /api/status: a ring buffer of (seq, line). A client passes the
+# last seq it saw (?since=), so every open dashboard gets every line; reading
+# drains nothing. Seqs start at the boot time in ms, so a cursor from before a
+# restart is older than every new line and reads as a gap.
+LOG_BUFFER_LINES = 2000
+LOG_TAIL_LINES = 200        # returned to a client with no cursor yet
+_log_buf = collections.deque(maxlen=LOG_BUFFER_LINES)
+_LOG_SEQ_START = int(time.time() * 1000)
+_log_seq = _LOG_SEQ_START
+_log_lock = threading.Lock()
 _progress = {"completed": 0, "total": 0}
 _scan_started_at = None
 _health_cache = {"data": None, "ts": 0.0}
@@ -235,25 +245,45 @@ _tg_live_consumer_thread = None
 _tg_live_stop = threading.Event()
 
 
-class QueueLogHandler(logging.Handler):
-    """Pushes formatted log records into an in-memory queue for /api/status."""
+class RingLogHandler(logging.Handler):
+    """Appends formatted log records to the /api/status ring buffer."""
 
     def emit(self, record):
+        global _log_seq
         try:
-            _log_queue.put_nowait(self.format(record))
-        except queue.Full:
-            # Drop the oldest to keep the most recent lines visible.
-            try:
-                _log_queue.get_nowait()
-                _log_queue.put_nowait(self.format(record))
-            except Exception:
-                pass
+            line = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        with _log_lock:
+            _log_seq += 1
+            _log_buf.append((_log_seq, line))
 
 
-_queue_handler = QueueLogHandler()
-_queue_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
-                                              datefmt="%H:%M:%S"))
-logging.getLogger("darkwatch").addHandler(_queue_handler)
+def _logs_since(since):
+    """Log lines newer than seq `since`, for /api/status.
+
+    Returns (lines, last_seq, gap). With no cursor (or one ahead of the
+    buffer, i.e. from another boot) it returns the last LOG_TAIL_LINES lines.
+    `gap` is True when lines between the cursor and the first line returned
+    are gone: the buffer overflowed, the process restarted, or (with no
+    cursor) older lines exist that are not returned."""
+    with _log_lock:
+        last = _log_seq
+        entries = list(_log_buf)
+    if since is None or since > last:
+        tail = entries[-LOG_TAIL_LINES:]
+        gap = since is not None or bool(tail and tail[0][0] > _LOG_SEQ_START + 1)
+        return [line for _, line in tail], last, gap
+    oldest = entries[0][0] if entries else last + 1
+    new = entries[max(0, since - oldest + 1):]
+    return [line for _, line in new], last, since < oldest - 1
+
+
+_log_handler = RingLogHandler()
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
+                                            datefmt="%H:%M:%S"))
+logging.getLogger("darkwatch").addHandler(_log_handler)
 
 
 # ─── Security gate ───────────────────────────────────────────────────────────
@@ -341,25 +371,10 @@ def _check_tor_alive():
     """Cheap SOCKS-port liveness probe — safe to poll every few seconds
     without hitting check.torproject.org (which rate-limits)."""
     cfg = _crawler.config["proxy"]
+    host, port = cfg.get("host", "tunnel1"), int(cfg.get("port", 9050))
     try:
-        with socket.create_connection((cfg["host"], cfg["port"]), timeout=2):
-            return {"ok": True, "detail": f"SOCKS {cfg['host']}:{cfg['port']} reachable (liveness only)"}
-    except Exception as e:
-        return {"ok": False, "detail": f"SOCKS unreachable: {e}"}
-
-
-def _check_vpn():
-    """Verify Tunnel 1 is on the docker network.
-
-    ICMP ping is unavailable — darkwatch runs with cap_drop ALL — so we probe
-    the Tor SOCKS port on tunnel1 instead (same path scans use).
-    """
-    cfg = _crawler.config["proxy"]
-    host = cfg.get("host", "tunnel1")
-    port = int(cfg.get("port", 9050))
-    try:
-        with socket.create_connection((host, port), timeout=3):
-            return {"ok": True, "detail": f"{host}:{port} reachable (Tunnel 1 / Tor SOCKS)"}
+        with socket.create_connection((host, port), timeout=2):
+            return {"ok": True, "detail": f"SOCKS {host}:{port} reachable (liveness only)"}
     except OSError as e:
         if getattr(e, "errno", None) in (-2, -3) or "name resolution" in str(e).lower():
             return {
@@ -369,7 +384,96 @@ def _check_vpn():
                     "sudo ./ops/deploy.sh on the VM"
                 ),
             }
-        return {"ok": False, "detail": f"VPN check failed: {e}"}
+        return {"ok": False, "detail": f"SOCKS unreachable: {e}"}
+
+
+TOR_CONTROL_TIMEOUT = 2    # seconds, connect and answer together
+# The quick check reuses a ControlPort answer this young. Tor logs every
+# control connection at notice level, and the quick check runs every 2 s per
+# open tab during a scan: one connection per TTL keeps the tor log readable.
+TOR_CIRCUIT_TTL = 10       # seconds
+_tor_circuit_cache = {"ts": None, "value": None}   # value: bool or the error
+_tor_circuit_lock = threading.Lock()
+
+
+def _tor_circuit_established():
+    """Ask Tor's ControlPort for `status/circuit-established`, the same
+    question as the tor container's healthcheck.
+
+    Returns True for "1" and False for "0". Raises OSError when the
+    ControlPort can't be reached or doesn't answer within
+    TOR_CONTROL_TIMEOUT, ValueError on any other answer (a wrong password).
+    A plain socket rather than stem: stem's Controller has no connect or
+    read timeout, and this runs on every quick health poll."""
+    c = _crawler
+    pw = (c.tor_control_password or "").replace("\\", "\\\\").replace('"', '\\"')
+    deadline = time.monotonic() + TOR_CONTROL_TIMEOUT
+    buf = b""
+    with socket.create_connection((c.tor_control_host, int(c.tor_control_port)),
+                                  timeout=TOR_CONTROL_TIMEOUT) as sock:
+        sock.sendall(f'AUTHENTICATE "{pw}"\r\n'
+                     'GETINFO status/circuit-established\r\nQUIT\r\n'.encode())
+        # Tor closes the connection after QUIT (or a failed AUTHENTICATE).
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("ControlPort answer timed out")
+            sock.settimeout(left)
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    lines = buf.decode("utf-8", "replace").splitlines()
+    if not lines or not lines[0].startswith("250"):
+        raise ValueError("ControlPort refused: "
+                         + (lines[0] if lines else "no answer"))
+    for line in lines[1:]:
+        if line.startswith("250-status/circuit-established="):
+            return line.split("=", 1)[1].strip() == "1"
+    raise ValueError("ControlPort answer has no circuit-established")
+
+
+def _tor_circuit_state(max_age=None):
+    """_tor_circuit_established(), or its exception, at most `max_age`
+    seconds (default TOR_CIRCUIT_TTL) old. The lock makes concurrent
+    pollers wait for one query."""
+    if max_age is None:
+        max_age = TOR_CIRCUIT_TTL
+    with _tor_circuit_lock:
+        ts = _tor_circuit_cache["ts"]
+        if ts is not None and time.monotonic() - ts < max_age:
+            return _tor_circuit_cache["value"]
+        try:
+            value = _tor_circuit_established()
+        except Exception as e:
+            value = e
+        _tor_circuit_cache.update(ts=time.monotonic(), value=value)
+        return value
+
+
+def _check_vpn(socks=None, max_age=None):
+    """Tunnel 1: has Tor built a circuit (so Tunnel 1 carries traffic)?
+
+    Asks Tor's ControlPort (_tor_circuit_established), reusing an answer up
+    to `max_age` seconds (default TOR_CIRCUIT_TTL) old. When the ControlPort can't answer (no password
+    configured, old tor image), falls back to the SOCKS port liveness probe,
+    which only shows that tunnel1 is up. Pass the result of a
+    _check_tor_alive() already made as `socks` to reuse it instead of
+    probing the SOCKS port a second time.
+    """
+    established = _tor_circuit_state(max_age)
+    if isinstance(established, Exception):
+        e = established
+        if socks is None:
+            socks = _check_tor_alive()
+        return {"ok": socks["ok"],
+                "detail": f"{socks['detail']}; Tor circuits not checked "
+                          f"(ControlPort: {e})"}
+    if established:
+        return {"ok": True, "detail": "Tor circuit established (ControlPort)"}
+    return {"ok": False,
+            "detail": "Tor has no circuit (status/circuit-established=0): "
+                      "Tunnel 1 down or Tor still bootstrapping"}
 
 
 def _probe_direct(host, port):
@@ -526,7 +630,8 @@ def _run_health_checks():
     """Run all six checks concurrently, each with a per-check timeout."""
     checks = {
         "tor": _check_tor,
-        "vpn": _check_vpn,
+        # The full check (the scan gate) asks the ControlPort afresh.
+        "vpn": lambda: _check_vpn(max_age=0),
         "dns": _check_dns,
         "playwright": _check_playwright,
         "tg_vpn": _check_tg_vpn,
@@ -579,10 +684,11 @@ def _get_health(fresh=False):
 
 
 def _quick_health():
-    """Cheap liveness — SOCKS port + VPN ping. Safe to poll every few seconds
-    during a scan without incurring rate-limit or timeout flakiness from
-    check.torproject.org."""
-    results = {"tor": _check_tor_alive(), "vpn": _check_vpn()}
+    """Cheap liveness — one SOCKS probe + Tor's circuit state from the
+    ControlPort. Safe to poll every few seconds during a scan without
+    incurring rate-limit or timeout flakiness from check.torproject.org."""
+    socks = _check_tor_alive()
+    results = {"tor": socks, "vpn": _check_vpn(socks)}
     results["secure"] = results["tor"]["ok"] and results["vpn"]["ok"]
     results["checked_at"] = utcnow().isoformat() + "Z"
     return results
@@ -1176,8 +1282,7 @@ def route_ui_config():
 @app.route("/healthz")
 def route_healthz():
     # Container liveness only. Don't point the Docker healthcheck at
-    # /api/status: that endpoint drains the live-log queue, so every probe
-    # would steal log lines from the dashboard.
+    # /api/status: it counts rows in the database on every call.
     return "ok\n", 200, {"Content-Type": "text/plain"}
 
 
@@ -1194,13 +1299,9 @@ def route_health_quick():
 
 @app.route("/api/status")
 def route_status():
-    # Drain the log queue.
-    new_logs = []
-    while True:
-        try:
-            new_logs.append(_log_queue.get_nowait())
-        except queue.Empty:
-            break
+    # ?since=<log_seq from the previous answer>: only lines after it.
+    new_logs, log_seq, logs_gap = _logs_since(
+        _int_param(request.args.get("since"), None))
 
     with _state_lock:
         running = _scan_thread is not None and _scan_thread.is_alive()
@@ -1218,6 +1319,8 @@ def route_status():
         "running": running,
         "stats": _crawler.db.get_stats(),
         "new_logs": new_logs,
+        "log_seq": log_seq,
+        "logs_gap": logs_gap,
         "progress": progress,
         "elapsed_seconds": elapsed,
     })
@@ -1447,21 +1550,49 @@ def route_delete_findings():
     return jsonify({"deleted": n})
 
 
+FINDINGS_CSV_MAX = 100_000   # rows per export
+FINDINGS_CSV_PAGE = 1000     # rows read from the database at a time
+
+
 @app.route("/api/findings.csv")
 def route_findings_csv():
-    findings = _crawler.db.get_findings(min_score=0, limit=5000)
-    buf = io.StringIO()
+    """Every finding, newest first, streamed a page at a time so memory
+    stays flat. Past FINDINGS_CSV_MAX rows the export stops and says so in
+    the X-Findings-Truncated header, never in a row: the file is data only.
+    (It stopped silently at 5000 rows.)"""
+    db = _crawler.db
+    total = db.get_stats()["total_findings"]
     cols = ["found_at", "severity", "score", "rule_name", "rule_type",
             "page_url", "matched_strings", "snippet"]
-    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
-    writer.writeheader()
-    for f in findings:
-        writer.writerow(_csv_row(f, cols))
+
+    def generate():
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        writer.writeheader()
+        sent, before_id = 0, None
+        while sent < FINDINGS_CSV_MAX:
+            limit = min(FINDINGS_CSV_PAGE, FINDINGS_CSV_MAX - sent)
+            page = db.get_findings(min_score=0, before_id=before_id, limit=limit)
+            for f in page:
+                writer.writerow(_csv_row(f, cols))
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate()
+            sent += len(page)
+            if len(page) < limit:
+                break
+            before_id = page[-1]["id"]
+        if buf.getvalue():
+            yield buf.getvalue()
+
     return Response(
-        buf.getvalue(),
+        generate(),
         mimetype="text/csv",
         headers={"Content-Disposition":
-                 f'attachment; filename="findings_{utcnow():%Y%m%d_%H%M%S}.csv"'})
+                 f'attachment; filename="findings_{utcnow():%Y%m%d_%H%M%S}.csv"',
+                 "X-Findings-Total": str(total),
+                 "X-Findings-Truncated":
+                     "true" if total > FINDINGS_CSV_MAX else "false"})
 
 
 @app.route("/api/urls")
@@ -2196,7 +2327,7 @@ def route_tg_search_deep():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"error": "q is required"}), 400
-    max_hops = max(0, min(3, int(request.args.get("max_hops") or 2)))
+    max_hops = max(0, min(3, _int_param(request.args.get("max_hops"), 2)))
     since = request.args.get("since") or None
     mode = (request.args.get("mode") or "safe").lower()
     if mode not in ("safe", "thorough"): mode = "safe"
@@ -2432,7 +2563,7 @@ def route_tg_chain(identifier):
     normalizes internally."""
     if not _tg.configured():
         return jsonify({"error": "telegram not configured"}), 400
-    max_hops = max(1, min(8, int(request.args.get("max_hops") or 5)))
+    max_hops = max(1, min(8, _int_param(request.args.get("max_hops"), 5)))
     with _tg_lock:
         chain = _tg.follow_channel_chain(identifier, max_hops=max_hops)
     return jsonify({"starting": identifier, "hops": len(chain),

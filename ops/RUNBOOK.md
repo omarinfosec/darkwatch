@@ -234,6 +234,14 @@ sudo docker compose logs tunnel1 | tail -30
 sudo docker exec tunnel1 wg show wg0
 ```
 
+### Dashboard: "Tunnel 1 (Tor circuits)" is red
+The dashboard asks Tor's ControlPort (`tunnel1:9051`) whether Tor has built a circuit, the same question as the tor container's healthcheck. "Tor has no circuit" means Tor is up but can't reach the network through Tunnel 1: see the tunnel playbook above, or wait a minute after a restart while Tor bootstraps. When the ControlPort doesn't answer (a wrong `TOR_CONTROL_PASSWORD`, an old tor image), the check falls back to the SOCKS port and its detail says "Tor circuits not checked"; scans are not blocked by that. The dashboard reuses an answer for up to 10 seconds, so a fix can take that long to show.
+```bash
+sudo docker compose ps tor
+# Tor logs each control connection (the check and the healthcheck): hide them
+sudo docker compose logs --tail=300 tor | grep -v 'New control connection'
+```
+
 ### "I committed a secret by mistake"
 1. Stop. Don't push.
 2. `git reset --soft HEAD~1` to uncommit (keeps changes staged).

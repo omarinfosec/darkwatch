@@ -17,6 +17,12 @@
   not. If you roll back, stop darkwatch, copy the file back with `cp -p`
   before starting the old image, or log in to Telegram again with the QR
   code.
+- Scans, scheduled crawls and the mid-scan check now wait until Tor
+  reports a circuit, so after a tor restart they are held until Tor has
+  bootstrapped. If the dashboard's "Tunnel 1 (Tor circuits)" detail says
+  "Tor circuits not checked", Tor's ControlPort did not answer: check that
+  `TOR_CONTROL_PASSWORD` reaches darkwatch's config (see
+  `ops/RUNBOOK.md`).
 
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);
@@ -118,6 +124,42 @@
   lock, so it does not hold up a sign-in, search or scrape, and the
   channel's cursor is read after the delay, so a scrape during the delay
   is taken into account.
+- The dashboard picks up a scan it did not start. A scan started in
+  another tab, or running when the page was reloaded, showed as idle with
+  no progress or log until it ended; the dashboard now checks on load and
+  every 30 seconds and switches to the scan view. A failed status poll no
+  longer ends the scan view with "Scan complete", and a request that
+  can't reach the dashboard shows an error instead of failing silently
+  (lists already on screen are kept).
+- Every open dashboard gets every live log line. `/api/status` handed
+  each line to whichever tab polled first, so two tabs each saw part of
+  the log. The last 2000 lines are now kept in memory with a sequence
+  number: `/api/status?since=<log_seq>` returns the lines after it, plus
+  `log_seq` and `logs_gap` (true when lines between were dropped);
+  without `since` it returns the last 200 lines. The log panel says
+  "earlier lines not shown" when there is a gap.
+- A toast closes after 3.5 seconds during a scan too; the scan clock
+  restarted its timer every second, so it stayed up until the scan ended.
+- A non-numeric `max_hops` on `/api/telegram/search/deep` and
+  `/api/telegram/chain/<id>` returns 400 instead of a 500.
+- Truncation is visible. A report holds at most the newest 1000 findings;
+  its JSON now has `findings_included` and `truncated`, and the TXT
+  summary says when findings were left out. The findings CSV export
+  (`/api/findings.csv`) stopped silently at 5000 rows; it now streams up
+  to 100,000 and reports `X-Findings-Total` and `X-Findings-Truncated`
+  headers. The file itself holds only findings.
+- The Tunnel 1 ("VPN") health check only probed Tor's SOCKS port, which
+  accepts connections with Tunnel 1 down, and the quick check (polled
+  every 30 seconds, every 2 seconds during a scan, and by the monitor
+  scheduler before it crawls) made that same probe twice. The check now
+  asks Tor's ControlPort for `status/circuit-established` (2 s timeout),
+  like the tor container's healthcheck, and fails when Tor has no
+  circuit, so scans and scheduled crawls wait while Tor bootstraps. When
+  the ControlPort doesn't answer it falls back to the SOCKS probe and
+  says so. The quick check makes one SOCKS probe and reuses a ControlPort
+  answer for 10 seconds (Tor logs every control connection); the full
+  check before a scan asks afresh. The dashboard labels
+  these checks "Tunnel 1 (Tor circuits)" and "Telegram SOCKS reachable".
 
 ### Internal
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the

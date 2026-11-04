@@ -32,10 +32,18 @@ function externalLink(sample, host) {
 }
 
 async function api(path, opts = {}) {
-    const r = await fetch(path, {
-        headers: { "Content-Type": "application/json" },
-        ...opts,
-    });
+    let r;
+    try {
+        r = await fetch(path, {
+            headers: { "Content-Type": "application/json" },
+            ...opts,
+        });
+    } catch {
+        // Connection failed (dashboard restarting, network down): answer
+        // like an HTTP error so callers handle it instead of throwing.
+        return { ok: false, status: 0,
+                 body: { error: "Network error: dashboard unreachable" } };
+    }
     const body = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, body };
 }
@@ -367,10 +375,10 @@ function SecurityModal({ health, onClose, onRecheck, rechecking }) {
     }
     const items = [
         ["tor", "Tor exit confirmed"],
-        ["vpn", "VPN tunnel (Tor-side)"],
+        ["vpn", "Tunnel 1 (Tor circuits)"],
         ["ip_leak", "No IP leak"],
         ["dns", "DNS over Tor"],
-        ["tg_vpn", "VPN tunnel (Telegram-side)"],
+        ["tg_vpn", "Telegram SOCKS reachable"],
         ["playwright", "Playwright (screenshots)"],
     ];
     return (
@@ -498,10 +506,10 @@ function SecurityChecklist({ health }) {
     if (!health) return <div className="text-xs text-gray-500">Checking security…</div>;
     const rows = [
         ["tor",     "Tor exit (IsTor)"],
-        ["vpn",     "VPN / SOCKS path"],
+        ["vpn",     "Tunnel 1 (Tor circuits)"],
         ["ip_leak", "No IP leak"],
         ["dns",     ".onion reachability"],
-        ["tg_vpn",     "Telegram VPN (optional)"],
+        ["tg_vpn",     "Telegram SOCKS reachable (optional)"],
         ["playwright", "Playwright (optional)"],
     ];
     return (
@@ -542,7 +550,7 @@ function LogViewer({ logs, truncated, paused, onClear, onTogglePause }) {
                 <span className="text-xs text-gray-500 uppercase">Live log</span>
                 {truncated && (
                     <span className="text-[10px] text-yellow-400 mono">
-                        … oldest lines discarded (capped at 500)
+                        … earlier lines not shown
                     </span>
                 )}
                 <span className="ml-auto flex items-center gap-2">
@@ -4750,25 +4758,53 @@ function App() {
     const [securityModalOpen, setSecurityModalOpen] = useState(false);
     const [lightbox, setLightbox] = useState(null);
     const [toast, setToast] = useState("");
+    // Stable, so Toast's 3.5 s timer isn't restarted by every re-render
+    // (the 1 s scan clock kept a toast up for the whole scan).
+    const closeToast = useCallback(() => setToast(""), []);
     const [uiConfig, setUiConfig] = useState(null);
     const [findingsLoading, setFindingsLoading] = useState(false);
     const [hasReport, setHasReport] = useState(false);
 
     const statusTimer = useRef(null);
     const healthTimer = useRef(null);
+    // Last log line seq seen; /api/status?since= returns only newer lines.
+    const logSeq = useRef(null);
     const tickTimer = useRef(null);
 
     // ─── Data fetches ────────────────────────────────────────────────────────
 
+    // Returns whether a scan is running, or null when the status could not
+    // be read (a failed poll must not end the scan view).
     const fetchStatus = useCallback(async () => {
         try {
-            const { ok, body } = await api("/api/status");
-            if (!ok) return false;
+            const since = logSeq.current;
+            const { ok, body } = await api(
+                "/api/status" + (since != null ? `?since=${since}` : ""));
+            if (!ok) return null;
             setStats(body.stats || {});
             setProgress(body.progress || { completed: 0, total: 0 });
-            if (body.new_logs?.length) {
+            // Polls can overlap (a slow answer, the 30 s reattach check), so
+            // compare with the cursor as it is now, not as it was sent: keep
+            // only lines newer than it, and never move it back. The returned
+            // lines always end at log_seq. A log_seq below the cursor we sent
+            // means a new server process: take its lines as they are.
+            let newLogs = body.new_logs || [];
+            const cur = logSeq.current;
+            if (body.log_seq != null) {
+                const restarted = since != null && body.log_seq < since;
+                if (cur != null && body.log_seq <= cur && !restarted) {
+                    newLogs = [];               // stale: already shown
+                } else {
+                    if (cur != null && !restarted) {
+                        newLogs = newLogs.slice(-(body.log_seq - cur));
+                    }
+                    logSeq.current = body.log_seq;
+                    if (body.logs_gap) setLogsTruncated(true);
+                }
+            }
+            if (newLogs.length) {
                 setLogs(prev => {
-                    const merged = [...prev, ...body.new_logs];
+                    const merged = [...prev, ...newLogs];
                     if (merged.length > 500) {
                         setLogsTruncated(true);
                         return merged.slice(-500);
@@ -4777,9 +4813,9 @@ function App() {
                 });
             }
             if (body.elapsed_seconds != null) setScanTimer(body.elapsed_seconds);
-            return body.running;
+            return !!body.running;
         } catch {
-            return false;
+            return null;
         }
     }, []);
 
@@ -4794,7 +4830,8 @@ function App() {
             const cursor = opts.append ? findingsCursor : null;
             const params = new URLSearchParams({ limit: String(limit) });
             if (cursor) params.set("before_id", String(cursor));
-            const { body } = await api(`/api/findings?${params}`);
+            const { ok, body } = await api(`/api/findings?${params}`);
+            if (!ok) return;
             const list = Array.isArray(body?.findings) ? body.findings
                        : Array.isArray(body) ? body : [];
             setFindings(prev => opts.append ? [...prev, ...list] : list);
@@ -4812,7 +4849,8 @@ function App() {
 
     const fetchUrls = useCallback(async (opts = {}) => {
         const offset = opts.append ? urlsOffset + URLS_PAGE : 0;
-        const { body } = await api(`/api/urls?limit=${URLS_PAGE}&offset=${offset}`);
+        const { ok, body } = await api(`/api/urls?limit=${URLS_PAGE}&offset=${offset}`);
+        if (!ok) return;
         // Back-compat: older server returned a plain array.
         const list = Array.isArray(body) ? body
                    : Array.isArray(body?.urls) ? body.urls : [];
@@ -4870,13 +4908,14 @@ function App() {
     }, []);
 
     const fetchTgStatus = useCallback(async () => {
-        const { body } = await api("/api/telegram/status");
-        setTgStatus(body);
+        const { ok, body } = await api("/api/telegram/status");
+        if (ok) setTgStatus(body);
     }, []);
 
     const fetchTgChannels = useCallback(async () => {
         // Reuse /api/urls with the source filter on the server side.
-        const { body } = await api("/api/urls?source=telegram&limit=500");
+        const { ok, body } = await api("/api/urls?source=telegram&limit=500");
+        if (!ok) return;
         const list = Array.isArray(body) ? body
                    : Array.isArray(body?.urls) ? body.urls : [];
         setTgChannels(list);
@@ -4929,14 +4968,30 @@ function App() {
         } catch { /* ignore */ }
     }, []);
 
+    // A scan this tab didn't start (another tab, before a page reload, or
+    // one whose polling stopped) gets the scan view and status polling.
+    // Does nothing while statusTimer is set, i.e. this tab already polls.
+    const startPollingRef = useRef(null);
+    const attachIfRunning = useCallback(async () => {
+        if (statusTimer.current) return;
+        const running = await fetchStatus();
+        if (running && !statusTimer.current) {
+            setScanning(true);
+            startPollingRef.current();
+        }
+    }, [fetchStatus]);
+
     // ─── Mount: initial load + health poll ───────────────────────────────────
 
     useEffect(() => {
-        fetchStatus();
+        attachIfRunning();
         fetchHealth();
         fetchUiConfig();
         fetchTgStatus();
-        healthTimer.current = setInterval(() => fetchQuickHealth(), 30000);
+        healthTimer.current = setInterval(() => {
+            fetchQuickHealth();
+            attachIfRunning();
+        }, 30000);
         const fullHealthTimer = setInterval(() => fetchHealth(true), 90000);
         const tgTimer = setInterval(() => fetchTgStatus(), 15000);
         return () => {
@@ -4944,7 +4999,7 @@ function App() {
             clearInterval(fullHealthTimer);
             clearInterval(tgTimer);
         };
-    }, [fetchStatus, fetchHealth, fetchQuickHealth, fetchUiConfig, fetchTgStatus]);
+    }, [attachIfRunning, fetchHealth, fetchQuickHealth, fetchUiConfig, fetchTgStatus]);
 
     // ─── Tab-change side effects ─────────────────────────────────────────────
 
@@ -4971,12 +5026,14 @@ function App() {
         stopPolling();
         statusTimer.current = setInterval(async () => {
             const running = await fetchStatus();
-            if (!running) {
+            // null: the poll failed; keep polling rather than call it done.
+            if (running === false) {
                 stopPolling();
                 setScanning(false);
                 setToast("Scan complete");
                 fetchFindings();
                 fetchUrls();
+                return;
             }
             // Mid-scan watchdog
             const h = await fetchQuickHealth();
@@ -4987,6 +5044,7 @@ function App() {
         }, 2000);
         tickTimer.current = setInterval(() => setScanTimer(t => t + 1), 1000);
     };
+    startPollingRef.current = startPolling;
 
     useEffect(() => () => stopPolling(), []);
 
@@ -5086,8 +5144,8 @@ function App() {
     };
 
     const handleStop = async () => {
-        await api("/api/stop", { method: "POST" });
-        setToast("Stop signal sent");
+        const { ok, body } = await api("/api/stop", { method: "POST" });
+        setToast(ok ? "Stop signal sent" : body.error || "Stop failed");
     };
 
     const handleRecheckHealth = async () => {
@@ -5549,7 +5607,7 @@ function App() {
                 onIndex={i => setLightbox(l => l ? { ...l, index: i } : l)}
             />
 
-            <Toast message={toast} onClose={() => setToast("")} />
+            <Toast message={toast} onClose={closeToast} />
         </div>
     );
 }
