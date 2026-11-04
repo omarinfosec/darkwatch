@@ -10,7 +10,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 py="${PYTHON:-python3}"
 # CI runners block unprivileged user namespaces: UNSHARE="sudo unshare -n".
-unshare_cmd=(${UNSHARE:-unshare -rn})
+read -ra unshare_cmd <<<"${UNSHARE:-unshare -rn}"
 off="$("${unshare_cmd[@]}" "$py" "$here/run_ns.py" off)"
 on="$("${unshare_cmd[@]}" "$py" "$here/run_ns.py" on)"
 on_glibc="$("${unshare_cmd[@]}" "$py" "$here/run_ns.py" on-glibc)"

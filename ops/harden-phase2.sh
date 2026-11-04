@@ -147,7 +147,7 @@ lock_root_ssh() {
     fi
 
     local CFG=/etc/ssh/sshd_config
-    local STAMP="$(date +%s)"
+    local STAMP; STAMP="$(date +%s)"
     local BAK="${CFG}.bak.${STAMP}"
 
     log "backing up $CFG → $BAK"

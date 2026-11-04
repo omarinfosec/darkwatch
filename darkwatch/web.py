@@ -28,7 +28,7 @@ from flask import Flask, abort, jsonify, request, send_file, Response
 
 from darkwatch import (DarkWebCrawler, TelegramScraper, TelegramLiveListener,
                         load_config, setup_logging, onion_url_error,
-                        __version__, PLAYWRIGHT_AVAILABLE, TELETHON_AVAILABLE)
+                        utcnow, __version__, PLAYWRIGHT_AVAILABLE, TELETHON_AVAILABLE)
 from threat_intel import ThreatIntelFeed
 
 
@@ -560,7 +560,7 @@ def _run_health_checks():
     results["secure"] = all(
         results[k]["ok"] for k in ("tor", "vpn", "ip_leak", "dns")
     )
-    results["checked_at"] = datetime.utcnow().isoformat() + "Z"
+    results["checked_at"] = utcnow().isoformat() + "Z"
     return results
 
 
@@ -580,7 +580,7 @@ def _quick_health():
     check.torproject.org."""
     results = {"tor": _check_tor_alive(), "vpn": _check_vpn()}
     results["secure"] = results["tor"]["ok"] and results["vpn"]["ok"]
-    results["checked_at"] = datetime.utcnow().isoformat() + "Z"
+    results["checked_at"] = utcnow().isoformat() + "Z"
     return results
 
 
@@ -665,7 +665,7 @@ def _next_check_at(interval_min):
     base = interval_min * 60
     jitter = base * MONITOR_JITTER
     delay = max(60, base + random.uniform(-jitter, jitter))   # never < 60s
-    return (datetime.utcnow() + timedelta(seconds=delay)).isoformat()
+    return (utcnow() + timedelta(seconds=delay)).isoformat()
 
 
 def _monitor_tg_channel(url_id):
@@ -775,7 +775,7 @@ def _maybe_auto_rescan():
     if last:
         try:
             last_dt = datetime.fromisoformat(last)
-            due = (datetime.utcnow() - last_dt) >= timedelta(hours=hours)
+            due = (utcnow() - last_dt) >= timedelta(hours=hours)
         except Exception:
             due = True
     if not due:
@@ -810,7 +810,7 @@ def _monitor_loop():
             # extra bookkeeping here.
             _maybe_auto_rescan()
 
-            due = _crawler.db.get_monitored_due(datetime.utcnow().isoformat())
+            due = _crawler.db.get_monitored_due(utcnow().isoformat())
             if due:
                 # Hard security gate — same posture as manual scans.
                 health = _quick_health()
@@ -1156,7 +1156,7 @@ _rescan_last = {"started_at": None, "finished_at": None,
 
 def _run_rescan(url_id=None):
     global _rescan_last
-    _rescan_last = {"started_at": datetime.utcnow().isoformat(),
+    _rescan_last = {"started_at": utcnow().isoformat(),
                     "finished_at": None,
                     "scanned": 0, "findings": 0, "skipped": 0}
     try:
@@ -1169,7 +1169,7 @@ def _run_rescan(url_id=None):
         log.error(f"rescan failed: {e}")
         _rescan_last["error"] = str(e)
     finally:
-        _rescan_last["finished_at"] = datetime.utcnow().isoformat()
+        _rescan_last["finished_at"] = utcnow().isoformat()
 
 
 @app.route("/api/rescan", methods=["POST"])
@@ -1209,7 +1209,7 @@ _intel_last = {"started_at": None, "finished_at": None, "result": None}
 
 def _run_threat_intel_refresh():
     global _intel_last
-    _intel_last = {"started_at": datetime.utcnow().isoformat(),
+    _intel_last = {"started_at": utcnow().isoformat(),
                     "finished_at": None, "result": None}
     try:
         feeds_cfg = _config.get("threat_intel", {}).get("feeds")
@@ -1228,7 +1228,7 @@ def _run_threat_intel_refresh():
         log.error(f"threat_intel refresh error: {e}")
         _intel_last["result"] = {"error": str(e)}
     finally:
-        _intel_last["finished_at"] = datetime.utcnow().isoformat()
+        _intel_last["finished_at"] = utcnow().isoformat()
 
 
 @app.route("/api/threat-intel/refresh", methods=["POST"])
@@ -1322,7 +1322,7 @@ def route_findings_csv():
         buf.getvalue(),
         mimetype="text/csv",
         headers={"Content-Disposition":
-                 f'attachment; filename="findings_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"'})
+                 f'attachment; filename="findings_{utcnow():%Y%m%d_%H%M%S}.csv"'})
 
 
 @app.route("/api/urls")
@@ -1564,7 +1564,7 @@ def route_tg_channel_details(url_id):
     if fetched_at and not refresh:
         try:
             ft = datetime.fromisoformat(fetched_at.replace("Z", ""))
-            cache_fresh = (datetime.utcnow() - ft).total_seconds() < 3600
+            cache_fresh = (utcnow() - ft).total_seconds() < 3600
         except Exception:
             pass
     if cache_fresh:
@@ -2251,7 +2251,7 @@ def route_tg_export(url_id, fmt):
     # Cap to avoid nuking the server — operators who want more can call
     # Telegram directly or add pagination later.
     msgs = _crawler.db.list_tg_messages(url_id, limit=5000)
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = utcnow().strftime("%Y%m%d_%H%M%S")
     fname = f"{info['tg_username']}_{stamp}.{fmt}"
 
     if fmt == "json":
@@ -2313,7 +2313,7 @@ def route_tg_export(url_id, fmt):
                 f"{stem}/README.txt",
                 f"DarkWatch Telegram channel export\n"
                 f"Channel:  @{info.get('tg_username')}\n"
-                f"Exported: {datetime.utcnow().isoformat()}Z\n"
+                f"Exported: {utcnow().isoformat()}Z\n"
                 f"Messages: {len(msgs)}\n"
                 f"Contents:\n"
                 f"  messages.json — full metadata\n"
@@ -2340,7 +2340,7 @@ def route_url_set_monitor(url_id):
         return jsonify({"error": "invalid interval_min (allowed: 15, 30, 60, 120, 360)"}), 400
     # When enabling, schedule the FIRST check for "now" so the scheduler
     # picks it up on the next tick. Disabling clears the schedule.
-    next_at = datetime.utcnow().isoformat() if enabled else None
+    next_at = utcnow().isoformat() if enabled else None
     _crawler.db.set_monitor(url_id, enabled, interval_min=interval,
                              next_check_at=next_at)
     return jsonify({"id": url_id, "monitored": enabled,
@@ -2358,7 +2358,7 @@ def route_urls_bulk_monitor():
         return jsonify({"error": "ids must be a non-empty array"}), 400
     if interval not in (15, 30, 60, 120, 360):
         return jsonify({"error": "invalid interval_min"}), 400
-    next_at = datetime.utcnow().isoformat() if enabled else None
+    next_at = utcnow().isoformat() if enabled else None
     updated = 0
     for uid in ids:
         try: uid = int(uid)
@@ -2564,10 +2564,10 @@ def route_keywords_export(fmt):
     """Download the user keyword library as JSON or CSV. Lets operators
     back up their list or move it between DarkWatch instances."""
     rows = _crawler.db.list_keywords() or []
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = utcnow().strftime("%Y%m%d_%H%M%S")
     if fmt == "json":
         buf = json.dumps(
-            {"exported_at": datetime.utcnow().isoformat(),
+            {"exported_at": utcnow().isoformat(),
              "count": len(rows), "keywords": rows},
             indent=2, default=str)
         return Response(
@@ -2643,7 +2643,7 @@ def route_thumbnail(page_id):
 
 # Stagger already-due monitored URLs on boot so the first scheduler tick
 # doesn't fire N scans back-to-back after a container restart.
-_staggered = _crawler.db.stagger_due_monitors(datetime.utcnow())
+_staggered = _crawler.db.stagger_due_monitors(utcnow())
 if _staggered:
     log.info(f"Staggering {_staggered} due monitors on boot")
 

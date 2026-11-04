@@ -18,6 +18,37 @@
   `sudo bash tests/images/smoke.sh`.
 - The darkwatch Dockerfile copies every top-level `*.py` module instead of a
   fixed list, so a new module cannot be left out of the image.
+- The Release workflow runs the full CI workflow first (`ci.yml` is now
+  callable through `workflow_call`) and publishes only if it passes. A
+  manual run is only accepted on `main`; on any other branch both jobs are
+  skipped. A pushed tag must point at a commit on `main`
+  (`git merge-base --is-ancestor`), otherwise nothing is published. The
+  workflow's GITHUB_TOKEN is read-only except in the release job.
+- CI runs the test suites on Python 3.13 as well as 3.11 (the images'
+  version). The 3.11 checks keep their names (`Tests (darkwatch)`,
+  `Tests (setup)`); the new ones are `Tests (darkwatch, Python 3.13)` and
+  `Tests (setup, Python 3.13)`, which you can add to the required checks.
+  The `datetime.utcnow()` calls, deprecated since Python 3.12, are replaced
+  by a naive-UTC `utcnow()` helper in `darkwatch.py`; stored timestamps keep
+  their format.
+- New CI job `Secret scan (gitleaks)` scans the full git history with
+  gitleaks v8.30.1, built from the pinned module version whose `h1:` hash is
+  checked first. `.gitleaks.toml` extends gitleaks' default rules and only
+  allowlists `setup/tests/test_validators.py` (synthetic WireGuard keys).
+- New weekly workflow `Dependency audit` runs pip-audit 2.10.1 on each
+  requirements file separately (also on pull requests that change one, and
+  by hand).
+- Dependabot now also opens one weekly grouped PR for the pinned pip
+  requirements and one for the Dockerfile base images, limited to new
+  digests of the current tags (no major or minor version moves). The
+  third-party images in `docker-compose.yml` are pinned by digest only,
+  which Dependabot cannot track, so they are not covered yet.
+- shellcheck in CI now fails on warnings, not only errors, and also covers
+  `darkwatch/scan.sh`. The warnings it found are fixed with no change in
+  behaviour (`harden.sh --dry-run` output is identical).
+- New `tests/workflows/check.sh` (run in CI) checks the release, CI,
+  Dependabot and audit settings above and runs the release job's steps
+  against throwaway repositories with `gh` stubbed.
 
 ## v0.3.1 — 2026-11-04
 

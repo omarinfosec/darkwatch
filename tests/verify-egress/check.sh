@@ -182,7 +182,7 @@ has "host IP unknown" "could not fetch the host's own IP"
 ok "an unavailable host IP only warns"
 
 for c in "STUB_HOST_HTTP_ERR=1" "STUB_HOST_IP=<html>blocked</html>"; do
-    reset; export "$c"; verify
+    reset; export "${c:?}"; verify   # $c is a NAME=value pair
     expect_pass "host page ($c)"
     has "host page ($c)" "could not fetch the host's own IP"
     grep -qF "exit IP differs from the host's IP" "$work/out" && die "host page ($c): compared a non-IP"

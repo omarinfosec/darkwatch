@@ -212,6 +212,13 @@ def setup_logging(debug=False):
 log = logging.getLogger("darkwatch")
 
 
+def utcnow():
+    """Current UTC time as a naive datetime, like the deprecated
+    datetime.utcnow() (Python 3.12+): stored timestamps are naive UTC ISO
+    strings, compared as strings or against naive datetimes."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ─── Database ────────────────────────────────────────────────────────────────
 
 class Database:
@@ -5733,7 +5740,7 @@ class DarkWebCrawler:
             scanned += 1
             findings_total += page_findings
         if url_id is None:
-            self.db.ops_set("last_rescan_at", datetime.utcnow().isoformat())
+            self.db.ops_set("last_rescan_at", utcnow().isoformat())
         log.info(f"rescan_pages: scanned={scanned} findings={findings_total} "
                  f"skipped={skipped}")
         return {"scanned": scanned, "findings": findings_total, "skipped": skipped}

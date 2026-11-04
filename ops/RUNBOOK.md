@@ -165,8 +165,8 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 | Nightly    | `ops/retention.sh` purges old `loot/` content (cron job)    |
 | Weekly     | `ops/verify-egress.sh` (manual)                             |
 | Weekly     | Review `fail2ban-client status sshd` for SSH brute-force    |
+| Weekly     | Check `Dependency audit` workflow + Dependabot PRs          |
 | Monthly    | `docker scout cves` against pinned images; bump if needed   |
-| Monthly    | `pip-audit -r darkwatch/requirements.txt` (if local)        |
 | Monthly    | Review who can SSH to the VM and reach dashboard bind IP |
 | Quarterly  | Rotate Telegram session (regen api credentials, delete old) |
 | Quarterly  | Rotate WireGuard configs                                    |
