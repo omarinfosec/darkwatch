@@ -83,9 +83,28 @@
   gitleaks v8.30.1, built from the pinned module version whose `h1:` hash is
   checked first. `.gitleaks.toml` extends gitleaks' default rules and only
   allowlists `setup/tests/test_validators.py` (synthetic WireGuard keys).
-- New weekly workflow `Dependency audit` runs pip-audit 2.10.1 on each
-  requirements file separately (also on pull requests that change one, and
-  by hand).
+- Hash-locked Python dependencies. Each image's hand-pinned direct
+  dependencies moved from `requirements.txt` to `requirements.in`
+  (`darkwatch/`, `setup/`), and the new `ops/lock-deps.sh` resolves them
+  with a pinned uv (0.11.32, `uv pip compile --python-version 3.11
+  --python-platform linux --generate-hashes`) into `requirements.lock`:
+  every package, transitive ones included, at one version with the SHA-256
+  of each of its files. Both Dockerfiles and the CI test jobs install the
+  lock with `pip install --require-hashes`, so a file that does not match
+  its hash fails the build; CI installs `requirements-dev.txt` (no hashes)
+  in its own step. CI fails when a lock is behind its `requirements.in`
+  (`ops/lock-deps.sh --check`: every `name==version` there must be in the
+  lock), and `tests/lock-deps/check.sh` tests the script with uv stubbed.
+  The locks are resolved for x86_64 Linux; they carry the hashes of every
+  file of each version, but building the images on arm64 is untested.
+  stem and pyaes ship only source archives: those archives are
+  hash-checked, the setuptools pip fetches to build them is not. Dependabot
+  updates `requirements.in` only; run `./ops/lock-deps.sh` on its PR branch
+  (RUNBOOK, "Update Python dependencies").
+- New weekly workflow `Dependency audit` runs pip-audit 2.10.1 separately on
+  each image's `requirements.lock` (every package the image installs) and
+  on `requirements-dev.txt` (also on pull requests that change a
+  requirements file, and by hand).
 - Dependabot now also opens one weekly grouped PR for the pinned pip
   requirements and one for the Dockerfile base images, limited to new
   digests of the current tags (no major or minor version moves). The

@@ -35,14 +35,17 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: |
-            ${{ matrix.suite }}/requirements.txt
+            ${{ matrix.suite }}/requirements.lock
             requirements-dev.txt
-      - name: Install dependencies
+      # The same hash-locked set the image installs. requirements-dev.txt
+      # has no hashes, so it gets its own pip run: pip checks hashes for
+      # every requirement of a run once any one of them has a hash.
+      - name: Install dependencies (hash-locked)
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
         run: |
           python -m pip install --upgrade pip
-          pip install -r ${{ matrix.suite }}/requirements.txt
+          pip install --require-hashes -r ${{ matrix.suite }}/requirements.lock
       - name: Install test tools
         run: pip install -r requirements-dev.txt
       - name: Run tests
@@ -62,6 +65,8 @@ jobs:
           python-version: "3.11"
       - name: Install shellcheck (pinned)
         run: pip install shellcheck-py==0.11.0.1 && shellcheck --version
+      - name: requirements.lock files cover requirements.in
+        run: bash ops/lock-deps.sh --check
       - name: bash -n on all ops scripts
         run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
       - name: shellcheck (warnings and errors)
@@ -84,6 +89,8 @@ jobs:
             --profile tor --profile tg --profile setup config -q
       - name: compose checks (DNS isolation, env scoping, TOR_CONTROL_PASSWORD required)
         run: bash tests/compose/check.sh
+      - name: lock-deps.sh (stubbed uv)
+        run: bash tests/lock-deps/check.sh
       - name: release/CI workflow and Dependabot checks
         run: pip install pyyaml==6.0.3 && bash tests/workflows/check.sh
 

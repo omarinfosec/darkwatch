@@ -1,5 +1,7 @@
-# DarkWatch Python dependencies — pinned for reproducibility + audit.
-# Update via: pip install --upgrade ... && pip-compile / pip freeze.
+# DarkWatch image: direct Python dependencies, each pinned to one version.
+# The image installs requirements.lock, which pins these and everything they
+# pull in, with hashes. After editing this file run ./ops/lock-deps.sh and
+# commit both files; CI fails while the lock is behind.
 
 # ── HTTP, parsing, scanning ────────────────────────────────────────────────
 requests==2.34.2

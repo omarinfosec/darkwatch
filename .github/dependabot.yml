@@ -9,9 +9,12 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Pinned Python requirements of both images and the test tools; one
-  # weekly PR for all of them. Each requirements file is also audited
-  # weekly by .github/workflows/deps-audit.yml.
+  # Pinned Python requirements of both images (requirements.in) and the
+  # test tools; one weekly PR for all of them. Dependabot does not rewrite
+  # the images' requirements.lock files, so CI's lock check fails on its
+  # PR until ./ops/lock-deps.sh is run on the PR branch and the new locks
+  # are pushed. The locks and the test tools are also audited weekly by
+  # .github/workflows/deps-audit.yml.
   - package-ecosystem: pip
     directories: ["/darkwatch", "/setup", "/"]
     schedule:

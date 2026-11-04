@@ -1,15 +1,18 @@
 name: Dependency audit
 
-# pip-audit against the known-vulnerability database, once per
-# requirements file: each file is resolved on its own, as each image
-# installs it. Weekly, because a new advisory needs no commit to appear;
-# also on pull requests that change a requirements file.
+# pip-audit against the known-vulnerability database, once per file that
+# something installs: each image's hash-locked requirements.lock (every
+# package the image gets, transitive ones included, at the locked version)
+# and the test tools. Weekly, because a new advisory needs no commit to
+# appear; also on pull requests that change a requirements file.
 on:
   schedule:
     - cron: "41 6 * * 3"   # Wednesdays 06:41 UTC
   pull_request:
     paths:
       - "**/requirements*.txt"
+      - "**/requirements*.in"
+      - "**/requirements*.lock"
       - ".github/workflows/deps-audit.yml"
   workflow_dispatch:
 
@@ -24,8 +27,8 @@ jobs:
       fail-fast: false
       matrix:
         requirements:
-          - darkwatch/requirements.txt
-          - setup/requirements.txt
+          - darkwatch/requirements.lock
+          - setup/requirements.lock
           - requirements-dev.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

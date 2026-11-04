@@ -84,6 +84,25 @@ imports, an offline screenshot, `tor --version`; the same tests CI runs):
 sudo bash tests/images/smoke.sh
 ```
 
+### Update Python dependencies
+Each image pins its direct dependencies in `requirements.in`
+(`darkwatch/`, `setup/`) and installs `requirements.lock`, which
+`ops/lock-deps.sh` generates from it: every package, transitive ones
+included, at one version with the SHA-256 of each of its files. The
+Dockerfiles and CI install it with `pip install --require-hashes`, so a
+file that does not match its hash fails the build. On a dev machine with PyPI
+access (not on the VM):
+```bash
+$EDITOR darkwatch/requirements.in           # bump the pin
+./ops/lock-deps.sh                          # re-lock both images (pinned uv)
+./ops/lock-deps.sh --upgrade                # also move transitive deps to their newest versions
+git add darkwatch/requirements.in darkwatch/requirements.lock
+```
+CI fails while a lock is behind its `requirements.in` (`./ops/lock-deps.sh
+--check`); on a Dependabot pip PR, run `./ops/lock-deps.sh` on its branch
+and push the locks. The locks are resolved for CPython 3.11 on x86_64
+Linux, which the images use; arm64 hosts are untested.
+
 ### Stop everything
 ```bash
 sudo docker compose down
@@ -166,7 +185,7 @@ docker image inspect darkwatch:local -f '{{.Id}}'
 | Nightly    | `ops/retention.sh` purges old `loot/` content (cron job)    |
 | Weekly     | `ops/verify-egress.sh` (manual)                             |
 | Weekly     | Review `fail2ban-client status sshd` for SSH brute-force    |
-| Weekly     | Check `Dependency audit` workflow + Dependabot PRs          |
+| Weekly     | Check `Dependency audit` workflow (pip-audit of `darkwatch/requirements.lock`, `setup/requirements.lock`, `requirements-dev.txt`) + Dependabot PRs |
 | Monthly    | `docker scout cves` against pinned images; bump if needed   |
 | Monthly    | Review who can SSH to the VM and reach dashboard bind IP |
 | Quarterly  | Rotate Telegram session (regen api credentials, delete old) |

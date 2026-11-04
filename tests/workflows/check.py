@@ -108,17 +108,57 @@ ign = [i for i in dep["docker"].get("ignore", []) if i.get("dependency-name") ==
     or die("docker updates are not limited to digests")
 ok("dependabot: actions, grouped pip, docker digests only")
 
+# What gets installed: each image's requirements.lock (generated from the
+# requirements.in beside it) and the unhashed test tools in requirements*.txt.
+installed, inputs = [], []
+for d, dirs, fs in os.walk(REPO):
+    dirs[:] = [x for x in dirs if not x.startswith(".")]
+    for f in fs:
+        rel = os.path.relpath(os.path.join(d, f), REPO)
+        if re.fullmatch(r"requirements.*\.(txt|lock)", f):
+            installed.append(rel)
+        elif re.fullmatch(r"requirements.*\.in", f):
+            inputs.append(rel)
+installed.sort()
+sorted(inputs) == ["darkwatch/requirements.in", "setup/requirements.in"] or die(f"requirements.in files: {inputs}")
+for f in inputs:
+    f[:-3] + ".lock" in installed or die(f"{f} has no requirements.lock beside it")
+
 audit = load(".github/workflows/deps-audit.yml")
 "schedule" in triggers(audit) or die("deps-audit is not scheduled")
 reqs = audit["jobs"]["deps-audit"]["strategy"]["matrix"]["requirements"]
-want = []
-for d, dirs, fs in os.walk(REPO):
-    dirs[:] = [x for x in dirs if not x.startswith(".")]
-    want += [os.path.relpath(os.path.join(d, f), REPO)
-             for f in fs if re.fullmatch(r"requirements.*\.txt", f)]
-want.sort()
-sorted(reqs) == want or die(f"deps-audit covers {sorted(reqs)}, repo has {want}")
-ok("deps-audit: weekly, one leg per requirements file")
+sorted(reqs) == installed or die(f"deps-audit covers {sorted(reqs)}, repo installs {installed}")
+paths = triggers(audit)["pull_request"]["paths"]
+all(p in paths for p in ("**/requirements*.txt", "**/requirements*.in", "**/requirements*.lock")) \
+    or die(f"deps-audit pull_request paths: {paths}")
+ok("deps-audit: weekly, one leg per lock and test-tool file, on PRs that change any of them")
+
+
+# ─── Static: hash-locked installs ───────────────────────────────────────────
+for img in ("darkwatch", "setup"):
+    with open(os.path.join(REPO, img, "Dockerfile"), encoding="utf-8") as fp:
+        df = fp.read()
+    # Join continuation lines so a RUN split over several lines reads as one.
+    runs = [r for r in re.sub(r"\\\n\s*", " ", df).splitlines() if re.match(r"RUN .*pip install", r)]
+    len(runs) == 1 or die(f"{img}/Dockerfile: expected one pip install, got {runs}")
+    ("--require-hashes" in runs[0].split() and "-r requirements.lock" in runs[0]) \
+        or die(f"{img}/Dockerfile does not install the lock with --require-hashes: {runs[0]}")
+    re.search(r"(?m)^COPY requirements\.lock \.$", df) or die(f"{img}/Dockerfile does not copy requirements.lock")
+ok("both Dockerfiles install requirements.lock with --require-hashes")
+
+steps = ci["jobs"]["python-tests"]["steps"]
+runs = [s.get("run", "") for s in steps]
+lock_steps = [r for r in runs if "requirements.lock" in r]
+dev_steps = [r for r in runs if "requirements-dev.txt" in r]
+(len(lock_steps) == 1 and "pip install --require-hashes -r ${{ matrix.suite }}/requirements.lock" in lock_steps[0]) \
+    or die(f"python-tests does not install the lock with --require-hashes: {lock_steps}")
+(len(dev_steps) == 1 and dev_steps[0] != lock_steps[0]) \
+    or die("python-tests must install requirements-dev.txt in its own step")
+any("requirements.txt" in r for r in runs) and die("python-tests still installs a requirements.txt")
+shell_runs = [s.get("run", "") for s in ci["jobs"]["shell-and-compose"]["steps"]]
+"bash ops/lock-deps.sh --check" in shell_runs or die("CI does not check the locks against requirements.in")
+"bash tests/lock-deps/check.sh" in shell_runs or die("CI does not run tests/lock-deps/check.sh")
+ok("CI installs the lock (hash-checked) and the test tools in separate steps and checks lock staleness")
 
 
 # ─── Behaviour: run the release job's steps ─────────────────────────────────
