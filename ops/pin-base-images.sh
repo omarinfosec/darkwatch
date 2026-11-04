@@ -10,8 +10,9 @@
 #   sudo ./ops/pin-base-images.sh --apply     # rewrite Dockerfiles, no prompt
 #   sudo ./ops/pin-base-images.sh             # show diff, prompt
 #
-# After --apply, rebuild:
-#   docker compose build && docker compose --profile setup up -d --force-recreate
+# After --apply, commit the Dockerfiles, then rebuild and restart:
+#   sudo ./ops/deploy.sh       # rebuilds the darkwatch, tor and setup images
+#   docker compose --profile setup up -d --build setup   # Setup UI, if wanted
 #
 # Re-run monthly. Commit the resulting Dockerfile changes so the deploy
 # is reproducible.
@@ -134,7 +135,8 @@ apply_changes() {
         log "wrote $df"
     done
     log ""
-    log "next: docker compose build && docker compose --profile setup up -d --force-recreate"
+    log "next: commit, then sudo ./ops/deploy.sh (rebuilds darkwatch, tor and setup)"
+    log "      Setup UI: docker compose --profile setup up -d --build setup"
 }
 
 case "$MODE" in

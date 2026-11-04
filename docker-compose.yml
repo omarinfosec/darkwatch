@@ -57,9 +57,10 @@ services:
       # filename wg0.conf (=> interface wg0) without conflict.
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      # Also requires the kill switch to be in place, so the tor / tg-socks
-      # sidecars (which wait for "healthy") never run without it.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch (egress and inbound) to be in place, so
+      # the tor / tg-socks sidecars (which wait for "healthy") never run
+      # without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && iptables -C INPUT -j DW_KS_IN && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -121,9 +122,10 @@ services:
     healthcheck:
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      # Also requires the kill switch to be in place, so the tor / tg-socks
-      # sidecars (which wait for "healthy") never run without it.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch (egress and inbound) to be in place, so
+      # the tor / tg-socks sidecars (which wait for "healthy") never run
+      # without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && iptables -C INPUT -j DW_KS_IN && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -185,6 +187,18 @@ services:
     environment:
       - DARKWATCH_CONFIG=/app/config.json
     pids_limit: 1024
+    # DNS isolation. darkwatch only needs Docker's embedded DNS for service
+    # names (tunnel1, tunnel2), which still resolve. Without an explicit
+    # `dns:`, Docker forwards other names to the host's resolvers, and a
+    # loopback one (dnsmasq, unbound, bind on 127.0.0.1) is queried from the
+    # HOST namespace, past the egress lockdown. An explicit entry is dialled
+    # from darkwatch's own namespace, where nothing listens on 127.0.0.1:53,
+    # so clearnet lookups fail in milliseconds. Leave DARKWATCH_DNS unset
+    # unless DARKWATCH_EGRESS_LOCKDOWN=0 or alerts.allow_direct needs a real
+    # resolver. Not set on the tunnels: they need the host's DNS to resolve
+    # hostname Endpoints. ops/verify-egress.sh checks this (check 6).
+    dns:
+      - ${DARKWATCH_DNS:-127.0.0.1}
     networks:
       darknet:
         # Fixed address so ops/egress-lockdown.sh can block this container's
@@ -206,7 +220,7 @@ services:
 
   # ─── Setup UI (profile-gated; off by default) ──────────────────────────────
   # Bring up only when configuring credentials/tunnels:
-  #   docker compose --profile setup up -d setup
+  #   docker compose --profile setup up -d --build setup
   # Take down when done:
   #   docker compose --profile setup stop setup
   #
@@ -268,6 +282,13 @@ volumes:
 networks:
   darknet:
     driver: bridge
+    # IPv4 only: the egress lockdown is an iptables (IPv4) rule, so an IPv6
+    # address would give darkwatch a direct route around it. Explicit, so a
+    # daemon.json default-network-opts that turns IPv6 on can't apply here.
+    enable_ipv6: false
+    labels:
+      # deploy.sh recreates a darknet network that lacks this (pre-v0.3.1).
+      org.darkwatch.ipv4-only: "true"
     ipam:
       config:
         # Fixed subnet so the egress lockdown rule and DARKWATCH_IP are stable.

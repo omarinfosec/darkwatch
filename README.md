@@ -65,7 +65,7 @@ Two independent WireGuard tunnels (e.g. ProtonVPN in two regions, or any provide
 | **Tunnel 1** | `tor` | `tunnel1` | `tor` → SOCKS `:9050` | `.onion` crawl + render |
 | **Tunnel 2** | `tg` | `tunnel2` | `tg-socks` → SOCKS `:1080` | Telegram MTProto |
 
-`darkwatch` stays on the internal `darknet` bridge and reaches each SOCKS proxy by container hostname. It never uses host networking. Tor and `tg-socks` inherit their tunnel container's network namespace, so **all** traffic on that path exits through that tunnel's WireGuard peer only — the two research paths never share an exit IP. A kill switch in each tunnel rejects anything that isn't going through WireGuard, so a dropped tunnel fails closed instead of falling back to the host's IP, and a host firewall rule (`ops/egress-lockdown.sh`) keeps the `darkwatch` container itself off the internet except through those proxies.
+`darkwatch` stays on the internal `darknet` bridge and reaches each SOCKS proxy by container hostname. It never uses host networking. Tor and `tg-socks` inherit their tunnel container's network namespace, so **all** traffic on that path exits through that tunnel's WireGuard peer only — the two research paths never share an exit IP. A kill switch in each tunnel rejects anything that isn't going through WireGuard, so a dropped tunnel fails closed instead of falling back to the host's IP, and a host firewall rule (`ops/egress-lockdown.sh`) keeps the `darkwatch` container itself off the internet except through those proxies. `darkwatch` also gets `dns: 127.0.0.1`, so it resolves only those service names and its lookups are never answered by the host's resolver.
 
 ```mermaid
 flowchart TB
@@ -163,13 +163,15 @@ After install, day-to-day updates are always:
 cd /opt/darkwebapp && sudo ./ops/deploy.sh
 ```
 
+`deploy.sh` pulls, and restarts itself once when the pull brings new code. Back up first ([RUNBOOK → Back up and restore](ops/RUNBOOK.md#back-up-and-restore)). **Upgrading from v0.2.0 or v0.3.0:** their `deploy.sh` keeps running its own old code after the pull, so pull first: `sudo git -C /opt/darkwebapp pull --ff-only && sudo ./ops/deploy.sh`. If you already ran plain `deploy.sh`, run it again; the RUNBOOK lists what to check afterwards.
+
 ### What the installer prints at the end
 
 ```
 DarkWatch:       http://<bind-ip>:8080/
 
 Bring up the Setup UI to configure tunnels + Telegram from your browser:
-    docker compose --profile setup up -d setup
+    docker compose --profile setup up -d --build setup
     open http://<bind-ip>:8082/?token=<SETUP_AUTH_TOKEN>
     docker compose --profile setup stop setup
 ```
@@ -195,8 +197,8 @@ If neither tunnel is configured, `darkwatch` still starts — it just can't craw
 A profile-gated, bearer-token-protected web UI for placing your Telegram credentials and WireGuard tunnel configs without editing files on the VM. It's off by default (the privileges to write secrets and restart containers should not always be available), and lives at port 8082.
 
 ```bash
-# Enable
-sudo docker compose --profile setup up -d setup
+# Enable (--build picks up Setup UI code changes after a git pull)
+sudo docker compose --profile setup up -d --build setup
 
 # Use (token is in /var/lib/darkwebapp/env as SETUP_AUTH_TOKEN)
 open http://$DARKWATCH_BIND_IP:8082/?token=<SETUP_AUTH_TOKEN>
@@ -213,8 +215,8 @@ The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research
 ssh deploy@<vm>                            # not root — use the deploy user from harden-phase2
 cd /opt/darkwebapp
 
-sudo ./ops/deploy.sh                       # pull + build + up + healthcheck + egress verify
-sudo ./ops/verify-egress.sh                # confirm Tor + TG isolation, kill switches, lockdown
+sudo ./ops/deploy.sh                       # pull (+ restart on new code) + build + up + healthcheck + egress verify
+sudo ./ops/verify-egress.sh                # confirm Tor + TG isolation, kill switches, lockdown, DNS
 sudo ./ops/egress-lockdown.sh --status     # darkwatch container has no direct internet route
 sudo docker compose ps                     # what's running
 sudo docker compose logs -f darkwatch      # tail one service

@@ -38,15 +38,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: bash -n on all ops scripts
-        run: for f in ops/*.sh tor/entrypoint.sh darkwatch/scan.sh; do bash -n "$f"; done
+        run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
       - name: shellcheck (errors only)
-        run: shellcheck -S error ops/*.sh tor/*.sh tunnels/killswitch/*.sh tests/killswitch/*.sh
+        run: shellcheck -S error ops/*.sh ops/lib/*.sh tor/*.sh tunnels/killswitch/*.sh tests/*/*.sh
       - name: WireGuard kill switch (network namespace test)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null
           UNSHARE="sudo unshare -n" PYTHON=/usr/bin/python3 bash tests/killswitch/check.sh
+      - name: egress-lockdown.sh (network namespace test)
+        run: UNSHARE="sudo unshare -n" bash tests/egress-lockdown/check.sh
+      - name: deploy.sh / bootstrap.sh (stubbed docker)
+        run: sudo bash tests/ops/check.sh
+      - name: verify-egress.sh (stubbed docker)
+        run: sudo bash tests/verify-egress/check.sh
       - name: docker compose config
         run: |
           data="$(mktemp -d)" && touch "$data/env"
           DARKWEBAPP_DATA_ROOT="$data" docker compose \
             --profile tor --profile tg --profile setup config -q
+      - name: compose DNS isolation (darkwatch dns 127.0.0.1, no other service)
+        run: bash tests/compose/check.sh

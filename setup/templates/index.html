@@ -102,8 +102,8 @@
         WireGuard config that carries the dark-web crawl traffic. Egress through
         this tunnel reaches Tor entry guards. Paste the contents of your
         provider's <code>wg0.conf</code> below. It must contain
-        <code>[Interface]</code> with a <code>PrivateKey</code> and
-        <code>[Peer]</code> with a <code>PublicKey</code> + <code>Endpoint</code>.
+        <code>[Interface]</code> with a <code>PrivateKey</code> and a
+        <code>DNS</code> line, and <code>[Peer]</code> with a <code>PublicKey</code> + <code>Endpoint</code>.
         Saving restarts <code>tunnel1</code> + <code>tor</code> + <code>darkwatch</code>.
       </p>
       <form id="tunnel1-form" autocomplete="off">
@@ -133,7 +133,9 @@ PersistentKeepalive = 25"
       <p class="helper">
         WireGuard config that carries Telegram MTProto traffic. Use a
         <strong>different region / provider</strong> than Tunnel 1 — sharing
-        an exit IP across the two paths defeats the egress isolation.
+        an exit IP across the two paths defeats the egress isolation. The
+        config needs a <code>DNS</code> line: without one, Telegram names are
+        resolved through Docker, which may ask the host's own resolver.
         Saving restarts <code>tunnel2</code> + <code>tg-socks</code> + <code>darkwatch</code>.
       </p>
       <form id="tunnel2-form" autocomplete="off">

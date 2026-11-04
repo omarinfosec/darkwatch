@@ -19,6 +19,7 @@ TOKEN = main._expected_token()
 VALID_WG = """[Interface]
 PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 Address    = 10.2.0.2/32
+DNS        = 10.2.0.1
 
 [Peer]
 PublicKey  = WGPubKeyExample0000000000000000000000000000=
@@ -112,6 +113,15 @@ def test_wg_config_requires_full_tunnel():
     assert any("0.0.0.0/0" in e for e in main._validate_wg_config(split))
     both = VALID_WG.replace("AllowedIPs = 0.0.0.0/0", "AllowedIPs = 0.0.0.0/0, ::/0")
     assert main._validate_wg_config(both) == []
+
+
+def test_wg_config_requires_allowedips_line():
+    # No AllowedIPs routes nothing through the tunnel; deploy.sh's
+    # check_wg_conf rejects it too, so the Setup UI must not accept it.
+    missing = VALID_WG.replace("AllowedIPs = 0.0.0.0/0\n", "")
+    assert "AllowedIPs" not in missing
+    assert any("AllowedIPs must include 0.0.0.0/0" in e
+               for e in main._validate_wg_config(missing))
 
 
 def test_telegram_save_never_validates_without_tunnel(client, tmp_path, monkeypatch):
