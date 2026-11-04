@@ -14,6 +14,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import darkwatch as dw  # noqa: E402
+import dw_telegram  # noqa: E402
 
 FINDING = {"score": 100, "rule_name": "r", "severity": "high",
            "page_url": "http://x.onion/", "matched_strings": "m", "snippet": "s"}
@@ -137,7 +138,9 @@ class _FakeClient:
 
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
-    monkeypatch.setattr(dw, "TelegramClient", _FakeClient, raising=False)
+    # Patched where DarkMTProto looks it up: dw_telegram, not the darkwatch
+    # re-export facade.
+    monkeypatch.setattr(dw_telegram, "TelegramClient", _FakeClient, raising=False)
     eng = dw.DarkMTProto({"telegram": {
         "api_id": "1", "api_hash": "x", "session_path": str(tmp_path / "telegram"),
         "proxy_host": "tunnel2", "proxy_port": 1080}})

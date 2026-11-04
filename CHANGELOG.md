@@ -419,6 +419,15 @@
   importing `web` starts no background thread and `python web.py` starts
   them before serving; the image smoke test checks the latter in the built
   image.
+- `darkwatch/darkwatch.py` is split: the `Database` class (and `utcnow`)
+  moved to `darkwatch/dw_db.py`, the Telegram engine (`DarkMTProto` alias
+  `TelegramScraper`, `RateLimiter`, `EntityCache`, `CallPressure`,
+  `ClientProfile`, `TelegramLiveListener`) to `darkwatch/dw_telegram.py`.
+  No behaviour change: `darkwatch.py` re-exports these names, so
+  `from darkwatch import Database` and `darkwatch.DarkMTProto` keep working,
+  and the moved code still logs as `darkwatch`. The Dockerfile already
+  copies every top-level module; the image smoke test now also imports
+  `dw_db` and `dw_telegram`, and a new smoke test checks the re-exports.
 
 ## v0.3.1 — 2026-11-04
 

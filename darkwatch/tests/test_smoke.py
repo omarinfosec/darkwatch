@@ -19,6 +19,27 @@ def test_imports_clean():
     import threat_intel  # noqa: F401
 
 
+def test_split_modules_reexported():
+    """dw_db and dw_telegram were split out of darkwatch.py: every public
+    name they define stays reachable as the same object through darkwatch
+    (`from darkwatch import Database`, `dw.DarkMTProto`), and their log
+    lines keep the "darkwatch" logger name."""
+    import darkwatch
+    import dw_db
+    import dw_telegram
+
+    for mod in (dw_db, dw_telegram):
+        public = [n for n, v in vars(mod).items()
+                  if not n.startswith("_") and getattr(v, "__module__", None) == mod.__name__]
+        assert public, mod.__name__
+        for name in public:
+            assert getattr(darkwatch, name) is getattr(mod, name), name
+        assert mod.log.name == "darkwatch"
+    for name in ("TELETHON_AVAILABLE", "DARKMTPROTO_VERSION", "TelegramScraper"):
+        assert getattr(darkwatch, name) is getattr(dw_telegram, name), name
+    assert darkwatch.TelegramScraper is darkwatch.DarkMTProto
+
+
 def test_load_config_substitutes_env(monkeypatch):
     """${VAR} placeholders in config.json must resolve from os.environ."""
     from darkwatch import load_config
