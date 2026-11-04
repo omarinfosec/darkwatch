@@ -110,6 +110,36 @@ run "setup: docker compose plugin" \
 run "tor: tor --version" \
     --entrypoint tor "$TOR_IMAGE" --version
 
+# The image runs as debian-tor and the healthcheck needs bash, timeout and
+# grep. `id` lands in the log: ops/deploy.sh re-owns the tor-data volume when
+# the uid changes with the base image. A fresh tor-data volume is copied from
+# the image's /var/lib/tor, owner included, so the tor package must ship it
+# owned by debian-tor. One `command -v` per name: dash's exit status only
+# reflects the first of several.
+run "tor: debian-tor user and healthcheck.sh" \
+    --entrypoint /bin/sh "$TOR_IMAGE" -c '
+set -e
+id
+[ "$(id -un)" = debian-tor ]
+test -x /usr/local/bin/healthcheck.sh
+for c in bash timeout grep; do command -v "$c" >/dev/null; done
+test -w /etc/tor/run
+[ -d /var/lib/tor ] && [ -O /var/lib/tor ]
+'
+echo "── tor: HEALTHCHECK runs healthcheck.sh"
+if docker image inspect -f '{{json .Config.Healthcheck.Test}}' "$TOR_IMAGE" \
+        | grep -q '/usr/local/bin/healthcheck.sh'; then
+    echo "   ok"
+else
+    echo "   FAIL: the tor image's HEALTHCHECK does not run healthcheck.sh" >&2
+    fail=1
+fi
+
+# The entrypoint templates torrc (tor --hash-password) and tor accepts it,
+# without touching the network.
+run "tor: entrypoint writes a torrc tor accepts" \
+    -e TOR_CONTROL_PASSWORD=smoke "$TOR_IMAGE" tor -f /etc/tor/run/torrc --verify-config
+
 if [ "$fail" -ne 0 ]; then
     echo "image smoke tests FAILED" >&2
     exit 1

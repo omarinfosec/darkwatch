@@ -88,6 +88,18 @@
   command) calls before serving. Nothing changes for the shipped image. If
   you run the dashboard under a WSGI server that imports `web:app`, call
   `web.start_background_services()` once, from a single process.
+- **Tor image on Debian trixie.** The tor sidecar is now built on
+  `debian:trixie-slim` (pinned by digest) instead of bookworm, which is
+  LTS-only; Tor still comes from the Debian package. The tor package picks
+  the `debian-tor` uid when the image is built, and Tor refuses a data
+  directory it doesn't own, so `ops/deploy.sh` now checks the owner of the
+  `tor-data` volume (guard state) against the new image's `debian-tor` and,
+  when they differ, stops tor and re-owns the volume before starting the
+  stack. After deploying, check `docker compose ps tor` reports healthy,
+  `sudo ./ops/verify-egress.sh` passes, and `docker compose logs darkwatch |
+  grep 'Tor circuit rotated'` shows a rotation after a scan. Rolling back to
+  a release before this one needs the volume re-owned back by hand (see
+  `ops/RUNBOOK.md`, "Roll back a release").
 
 ### Security
 - The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
@@ -148,6 +160,9 @@
   (`pip install --only-binary=cryptg,yara-python`): a pin with no wheel for
   the build platform fails the build instead of trying a source build
   (cryptg's needs Rust, which the image does not have).
+- tor image and the darkwatch image's asset build stage (esbuild,
+  Tailwind): `debian:bookworm-slim` → `debian:trixie-slim`, pinned by
+  digest; Dependabot keeps refreshing the digest within trixie.
 
 ### Fixed
 - Forum-topic labels on Telegram messages keep working on Telethon 1.45,
@@ -309,6 +324,12 @@
   `get_url_source`, `latest_page_id`, `get_url_by_tg_channel_id`).
 
 ### Internal
+- `tests/images/smoke.sh` also checks that the tor image runs as
+  `debian-tor`, owns its `/var/lib/tor` (a fresh `tor-data` volume copies
+  that owner), has an executable `healthcheck.sh` (and the bash, timeout
+  and grep it needs) wired as its `HEALTHCHECK`, and that the entrypoint
+  writes a torrc `tor --verify-config` accepts. `tests/ops/check.sh` covers
+  the `tor-data` re-own step in `ops/deploy.sh`.
 - New `darkwatch/tests/test_sanitizer.py` covers the saved-page sanitizer,
   including a headless-Chromium check that a sanitized page opened from
   `file://` makes no request (skipped without a Playwright Chromium;

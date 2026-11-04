@@ -295,6 +295,29 @@ fi
 # crontab line older RUNBOOKs had operators add. Only warns on failure.
 install_retention_cron "$REPO_ROOT" "$DATA_ROOT"
 
+# ─── Tor state volume owner ──────────────────────────────────────────────────
+# The tor-data volume keeps the files of the image that first used it, owned
+# by that image's debian-tor. The tor package picks the uid when the image is
+# built, so a new base image can change it (v0.4.0 moves tor from bookworm to
+# trixie), and Tor refuses a DataDirectory it doesn't own. Hand the volume to
+# the new image's debian-tor before `up` recreates tor; a match is a no-op.
+TOR_VOLUME=darkwatch_tor-data   # compose project `name: darkwatch`
+TOR_IMAGE=darkwatch-tor:local
+if docker volume inspect "$TOR_VOLUME" >/dev/null 2>&1; then
+    tor_owner="$(docker run --rm --pull never --network none --user 0:0 --entrypoint /bin/sh \
+        -v "$TOR_VOLUME:/var/lib/tor" "$TOR_IMAGE" \
+        -c 'echo "$(stat -c %u:%g /var/lib/tor) $(id -u debian-tor):$(id -g debian-tor)"' \
+        2>/dev/null || true)"
+    read -r have_owner want_owner <<<"$tor_owner" || true
+    if [[ -n "${want_owner:-}" && "$have_owner" != "$want_owner" ]]; then
+        log "tor-data is owned by $have_owner, the tor image's debian-tor is $want_owner: re-owning it"
+        docker stop tor >/dev/null 2>&1 || true   # the old tor writes there until `up`
+        docker run --rm --pull never --network none --user 0:0 --entrypoint chown \
+            -v "$TOR_VOLUME:/var/lib/tor" "$TOR_IMAGE" -R debian-tor:debian-tor /var/lib/tor \
+            || warn "could not re-own the tor-data volume; tor will not start. Run: docker run --rm --user 0:0 --entrypoint chown -v $TOR_VOLUME:/var/lib/tor $TOR_IMAGE -R debian-tor:debian-tor /var/lib/tor"
+    fi
+fi
+
 # ─── Bring stack up ──────────────────────────────────────────────────────────
 # Tunnel sidecars wait for their WireGuard container to report a handshake;
 # if that never happens `up` fails. Show why instead of dying silently.
