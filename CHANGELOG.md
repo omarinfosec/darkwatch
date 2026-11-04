@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.3.1 — 2026-11-04
+
+Fix release. v0.3.0's deploy.sh stopped silently on default installs and
+never rebuilt the Setup UI; upgrade as described below.
 
 ### Upgrade notes
 - From v0.2.0 or v0.3.0, pull first and then deploy:
