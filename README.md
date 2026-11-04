@@ -163,6 +163,8 @@ After install, day-to-day updates are always:
 cd /opt/darkwebapp && sudo ./ops/deploy.sh
 ```
 
+`deploy.sh` pulls, and restarts itself once when the pull brings new code. Back up first ([RUNBOOK → Back up and restore](ops/RUNBOOK.md#back-up-and-restore)). **Upgrading from v0.2.0 or v0.3.0:** their `deploy.sh` keeps running its own old code after the pull, so pull first: `sudo git -C /opt/darkwebapp pull --ff-only && sudo ./ops/deploy.sh`. If you already ran plain `deploy.sh`, run it again; the RUNBOOK lists what to check afterwards.
+
 ### What the installer prints at the end
 
 ```
@@ -213,7 +215,7 @@ The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research
 ssh deploy@<vm>                            # not root — use the deploy user from harden-phase2
 cd /opt/darkwebapp
 
-sudo ./ops/deploy.sh                       # pull + build + up + healthcheck + egress verify
+sudo ./ops/deploy.sh                       # pull (+ restart on new code) + build + up + healthcheck + egress verify
 sudo ./ops/verify-egress.sh                # confirm Tor + TG isolation, kill switches, lockdown
 sudo ./ops/egress-lockdown.sh --status     # darkwatch container has no direct internet route
 sudo docker compose ps                     # what's running

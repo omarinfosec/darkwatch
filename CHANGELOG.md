@@ -3,12 +3,21 @@
 ## Unreleased
 
 ### Upgrade notes
-- From v0.3.0, pull first and then deploy without pulling:
-  `sudo git -C /opt/darkwebapp pull --ff-only`, then
-  `sudo ./ops/deploy.sh --skip-pull`. A v0.3.0 `deploy.sh` that does the pull
-  itself keeps running its own old code and exits silently after the build.
-  If you already ran it that way, run `deploy.sh` again and check that it
-  prints "deploy complete".
+- From v0.2.0 or v0.3.0, pull first and then deploy:
+  `sudo git -C /opt/darkwebapp pull --ff-only && sudo ./ops/deploy.sh` (from
+  `/opt/darkwebapp`).
+  A v0.2.0 or v0.3.0 `deploy.sh` that does the pull itself keeps running its
+  own old code (v0.3.0's exits silently after the build). If you already ran
+  plain `deploy.sh`, run it again and check that it prints "deploy complete".
+  Then verify: `systemctl is-enabled darkwatch-egress-lockdown` prints
+  `enabled`, `sudo grep -c '^TG_SOCKS_PASSWORD=.\+' /var/lib/darkwebapp/env`
+  prints 1, and `sudo docker image inspect darkwatch-setup:local -f
+  '{{.Created}}'` shows a time after you started this upgrade (not the
+  v0.2.0/v0.3.0 install date). From this release on,
+  `deploy.sh` restarts itself after a pull, so later upgrades need no extra
+  step.
+- Take a backup before upgrading; the RUNBOOK has new "Back up and restore"
+  and "Roll back a release" sections.
 - `deploy.sh` now refuses to run when the repo's `.env` is not a link to
   `/var/lib/darkwebapp/env` (a wrong target, a dangling link or a copied
   file). Fix it with `sudo ln -sfn /var/lib/darkwebapp/env /opt/darkwebapp/.env`.
@@ -20,6 +29,9 @@
   it takes longer; later builds come from the cache.
 
 ### Fixed
+- `deploy.sh` restarts itself once after a `git pull` that changes the code,
+  so the rest of the deploy runs the new script instead of the old one bash
+  had already loaded.
 - `deploy.sh` exited silently after the build when the env file had no
   `DARKNET_SUBNET=` line (the default), so the stack never started and the
   egress lockdown and its systemd unit were never installed.
@@ -48,7 +60,8 @@
 - `ops/lib/common.sh` holds the `env_val` helper shared by `deploy.sh`,
   `egress-lockdown.sh` and `verify-egress.sh`.
 - New `tests/ops/check.sh` runs `deploy.sh` and `bootstrap.sh` against
-  stubbed docker/systemctl in CI.
+  stubbed docker/systemctl in CI, including a self-update from a local git
+  remote.
 
 ## v0.3.0 — 2026-10-25
 

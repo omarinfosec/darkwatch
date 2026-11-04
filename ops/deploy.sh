@@ -193,9 +193,19 @@ if [[ -d .git ]]; then
 fi
 
 # ─── Pull latest source (unless skipped) ─────────────────────────────────────
+# Bash keeps running the deploy.sh it started with, so after a pull that
+# changes the code, restart once as the new script (--skip-pull and the env
+# flag stop a second restart).
 if (( ! SKIP_PULL )) && [[ -d .git ]]; then
     log "git pull --ff-only"
+    old_head="$(git rev-parse HEAD)"
     git pull --ff-only
+    new_head="$(git rev-parse HEAD)"
+    if [[ "$new_head" != "$old_head" && -z "${DARKWATCH_DEPLOY_REEXEC:-}" ]]; then
+        log "code updated (${old_head:0:7} -> ${new_head:0:7}): restarting the new deploy.sh"
+        export DARKWATCH_DEPLOY_REEXEC=1
+        exec bash "$SCRIPT_DIR/deploy.sh" --skip-pull "$@"   # bash: no exec bit needed
+    fi
 fi
 
 # ─── Pull / build images ─────────────────────────────────────────────────────

@@ -17,12 +17,18 @@ cd /opt/darkwebapp
 sudo ./ops/deploy.sh
 ```
 
-**Upgrading from v0.3.0:** pull first, then deploy without pulling. After it pulls, the v0.3.0 `deploy.sh` keeps running its own old code and exits silently after the build, without starting the stack or applying the egress lockdown:
+`deploy.sh` pulls first; when the pull brings new commits it restarts itself once (with `--skip-pull`), so the rest of the deploy runs the new code. Take a [backup](#back-up-and-restore) before every upgrade.
+
+**Upgrading from v0.2.0 or v0.3.0:** those versions' `deploy.sh` doesn't restart after its pull. It keeps running its own old code, and v0.3.0's exits silently after the build, without starting the stack or applying the egress lockdown. Pull first, then deploy:
 ```bash
-sudo git -C /opt/darkwebapp pull --ff-only
-sudo ./ops/deploy.sh --skip-pull
+sudo git -C /opt/darkwebapp pull --ff-only && sudo ./ops/deploy.sh
 ```
-If you already ran the old `deploy.sh`, run it again and check that it prints "deploy complete".
+If you already ran the old `deploy.sh`, run it again and check that it prints "deploy complete". Then verify:
+```bash
+systemctl is-enabled darkwatch-egress-lockdown                  # enabled
+sudo grep -c '^TG_SOCKS_PASSWORD=.\+' /var/lib/darkwebapp/env   # 1
+sudo docker image inspect darkwatch-setup:local -f '{{.Created}}' # after you started this upgrade, not the v0.2.0/v0.3.0 install date
+```
 
 `deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes, if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
 
@@ -76,6 +82,59 @@ sudo sqlite3 /var/lib/darkwebapp/darkwatch/data/darkwatch.db \
 ```bash
 sudo du -sh /var/lib/darkwebapp/*
 ```
+
+### Back up and restore
+Back up before every upgrade or rollback. Run these as root (the deploy user's sudo rights don't cover `tar`). Check that `/root` has room for the data first:
+```bash
+cd /opt/darkwebapp
+df -h /root
+du -sh /var/lib/darkwebapp/{env,secrets} /var/lib/darkwebapp/darkwatch/{data,investigations,yara-private}
+
+docker compose stop darkwatch setup
+tar -C /var/lib/darkwebapp -czf /root/dw-$(git describe --tags)-$(date +%F).tgz \
+    env secrets darkwatch/data darkwatch/investigations darkwatch/yara-private
+chmod 600 /root/dw-*.tgz
+docker compose start darkwatch       # start setup too only if you were using it
+```
+- Before upgrading to v0.4.0, add `darkwatch/loot` to the `tar` list: that backup is the only way to get back data that v0.4.0's retention removes.
+- `darkwatch/data` holds the database, `telegram.session` (the Telegram login: whoever has it can use the account) and `user.yar` (your keyword rules). `env` and `secrets` hold every password and WireGuard key. Keep the archive root-only and off shared storage.
+- **Never `cp` the live database.** It runs in WAL mode, and a plain copy of the running file can miss every committed row that is still in the `-wal` file.
+
+Hot alternative, database only, without stopping darkwatch:
+```bash
+docker exec darkwatch sqlite3 /app/data/darkwatch.db ".backup /app/data/pre-upgrade.db"
+mv /var/lib/darkwebapp/darkwatch/data/pre-upgrade.db /root/dw-pre-upgrade-$(date +%F).db
+chmod 600 /root/dw-pre-upgrade-*.db
+```
+This does not cover `env`, `secrets`, `telegram.session` or `user.yar`.
+
+Restore (discards everything collected after the backup):
+```bash
+cd /opt/darkwebapp
+docker compose stop darkwatch setup
+rm -f /var/lib/darkwebapp/darkwatch/data/darkwatch.db-wal /var/lib/darkwebapp/darkwatch/data/darkwatch.db-shm
+tar -C /var/lib/darkwebapp -xzpf /root/dw-<version>-<date>.tgz
+./ops/deploy.sh --skip-pull
+```
+To restore a hot `.backup` file instead, copy it over `/var/lib/darkwebapp/darkwatch/data/darkwatch.db` at the `rm` step, then `chown 999:999` it. Removing the `-wal` / `-shm` files matters either way: a leftover newer WAL could be replayed onto the restored database.
+
+### Roll back a release
+Take a [backup](#back-up-and-restore) first. As root, for example back to v0.3.0:
+```bash
+cd /opt/darkwebapp
+grep -c '^DARKNET_SUBNET=' /var/lib/darkwebapp/env   # must print 1 or more (see below)
+git checkout v0.3.0
+./ops/deploy.sh --skip-pull
+systemctl reenable darkwatch-egress-lockdown
+systemctl list-dependencies --reverse darkwatch-egress-lockdown
+docker inspect darkwatch -f '{{.Image}}'             # must equal the next line
+docker image inspect darkwatch:local -f '{{.Id}}'
+```
+- **`DARKNET_SUBNET=` must be in the env file.** Without it the v0.3.0 `deploy.sh` exits silently right after the build and leaves the newer code running. Append `DARKNET_SUBNET=172.31.250.0/24` (the default) if the `grep` prints 0.
+- Use `reenable`, not `enable`: it resets the unit's links to what the old unit file asks for, while `enable` would leave links a newer version added (such as a `docker.service.wants` link) in place. `list-dependencies --reverse` shows what still pulls the unit in.
+- If the two image IDs differ, darkwatch is still running the newer image: run `docker compose up -d darkwatch` and compare again.
+- Run `git checkout main` before the next upgrade. The checkout leaves a detached HEAD, and `git pull --ff-only` (and so `deploy.sh`) fails on it.
+- Database: v0.3.0 runs on a v0.3.1 database as is (the indexes v0.3.1 adds are not UNIQUE), so no restore is needed. Going back past v0.4.0's retention, which removes data, is only possible by restoring the backup taken before v0.4.0.
 
 ---
 

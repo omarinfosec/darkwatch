@@ -38,7 +38,8 @@ chmod 755 "$work/bin/docker" "$work/bin/systemctl"
 export PATH="$work/bin:$PATH" DOCKER_LOG="$work/docker.log"
 
 # A fresh tree per case: ops/ (lockdown + verify stubbed), .env.example and
-# the kill switch (deploy checks its exec bit). No .git, so no pull/clean check.
+# the kill switch (deploy checks its exec bit). No .git, so no pull/clean
+# check (the self-update case at the end makes its own checkout).
 new_tree() {
     T="$work/case$((++case_n))"
     mkdir -p "$T/repo/tunnels/killswitch" "$T/units"
@@ -229,5 +230,56 @@ deploy
 expect_ok "wg hooks"
 grep -q "PostUp hook" "$work/out" && grep -q "PreDown hook" "$work/out" || die "hooks should warn"
 ok "Pre/Post hooks only warn; commented-out lines are ignored"
+
+# ─── self-update: a pull that changes deploy.sh restarts it once ────────────
+# A git checkout at v1 pulls a v2 whose deploy.sh logs a marker. The rest of
+# the deploy must come from v2, and v1 must stop at the restart.
+new_tree
+export GIT_CONFIG_GLOBAL="$work/gitconfig" GIT_CONFIG_NOSYSTEM=1
+git config --global user.name test; git config --global user.email test@example.invalid
+git config --global init.defaultBranch main; git config --global safe.directory "*"  # CI: cp -a keeps the runner uid
+mv "$T/repo" "$T/origin"
+git -C "$T/origin" init -q && git -C "$T/origin" add -A && git -C "$T/origin" commit -qm v1
+git clone -q "$T/origin" "$T/repo"
+sed -i 's|^source "\$SCRIPT_DIR/lib/common.sh"$|&\nlog "deploy.sh v2 running (args: $*)"|' "$T/origin/ops/deploy.sh"
+grep -q 'deploy.sh v2 running' "$T/origin/ops/deploy.sh" || die "fixture: v2 marker not inserted"
+git -C "$T/origin" commit -qam v2
+seed
+self_deploy() {   # like deploy(), but lets deploy.sh pull
+    : > "$DOCKER_LOG"
+    set +e
+    DARKWEBAPP_DATA_ROOT="$D" DW_SYSTEMD_UNIT_DIR="$T/units" "$T/repo/ops/deploy.sh" "$@" > "$work/out" 2>&1
+    rc=$?
+    set -e
+}
+self_deploy --skip-build
+expect_ok "self-update"
+[[ "$(git -C "$T/repo" rev-parse HEAD)" == "$(git -C "$T/origin" rev-parse HEAD)" ]] || die "self-update: repo not pulled"
+grep -q "restarting the new deploy.sh" "$work/out" || die "self-update: no restart logged"
+[[ "$(grep -c 'deploy.sh v2 running (args: --skip-pull --skip-build)' "$work/out")" == 1 ]] \
+    || die "self-update: v2 must run exactly once, with --skip-pull and the original args"
+[[ "$(grep -c 'pre-flight: verifying' "$work/out")" == 2 ]] || die "self-update: expected v1 + one v2 run"
+[[ "$(grep -c 'deploy complete' "$work/out")" == 1 ]] || die "self-update: deploy completed more than once"
+grep -q '^compose.* build' "$DOCKER_LOG" && die "self-update: --skip-build was not passed on"
+[[ "$(grep -c '^compose.* up -d --remove-orphans' "$DOCKER_LOG")" == 1 ]] || die "self-update: compose up must run once"
+ok "a pull that changes the code restarts the new deploy.sh once, with --skip-pull and the original args"
+
+self_deploy
+expect_ok "up-to-date pull"
+grep -q "restarting" "$work/out" && die "up-to-date pull must not restart"
+[[ "$(grep -c 'deploy.sh v2 running (args: )' "$work/out")" == 1 ]] || die "up-to-date pull: v2 must run once"
+ok "a pull with no new commits does not restart"
+
+# A pulled deploy.sh without the exec bit (core.fileMode=false, copied tree)
+# must still restart: the restart runs it through bash.
+sed -i 's|deploy.sh v2 running|deploy.sh v3 running|' "$T/origin/ops/deploy.sh"
+chmod -x "$T/origin/ops/deploy.sh"
+git -C "$T/origin" commit -qam v3
+self_deploy --skip-build
+expect_ok "self-update without exec bit"
+[[ -x "$T/repo/ops/deploy.sh" ]] && die "fixture: pulled deploy.sh should not be executable"
+[[ "$(grep -c 'deploy.sh v3 running (args: --skip-pull --skip-build)' "$work/out")" == 1 ]] \
+    || die "self-update without exec bit: v3 must run exactly once"
+ok "the restart does not need deploy.sh's exec bit"
 
 echo "ops checks OK ($pass)"
