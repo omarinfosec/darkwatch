@@ -53,7 +53,9 @@
   channel has more than that, it logs a warning and the next check
   continues. Service messages (joins, pins, title changes) count toward a
   batch even though they are not stored, so a run of them no longer stalls
-  a channel's polling or ends a catch-up early. A manual scrape
+  a channel's polling or ends a catch-up early, and a manual scrape of 1000
+  or "all" no longer stops after its first 500-message batch when that
+  batch held one. A manual scrape
   (`/api/telegram/channels/<id>/scrape`) fetches the newest messages and
   moved the cursor to the newest one, past any messages between the old
   cursor and the oldest one scraped; it now moves the cursor only when it
@@ -69,9 +71,10 @@
   before, in another channel or earlier in the same one (such as a repeated
   "ok"), was skipped entirely: no message row for that channel and no
   findings. Each message is now stored and scanned once per channel, so each
-  channel gets its own findings; only the alert for a repost is not sent
-  again. A message fetched twice (by polling, the live listener or a
-  scrape) is still stored once.
+  channel gets its own findings. A repost alerts only for rules that matched
+  no earlier copy, so an alert is not sent twice, but a keyword added after
+  the first copy still alerts on the repost. A message fetched twice (by
+  polling, the live listener or a scrape) is still stored once.
 - The per-channel Telegram rescan (`/api/telegram/channels/<id>/rescan`,
   the Rescan button and a deep scrape) no longer deletes findings, like
   `/api/rescan` since v0.3.1: findings of rules that no longer match or were
@@ -81,9 +84,11 @@
 - Telegram failures no longer show as "no results":
   - A monitor check whose fetch fails (flood wait, expired session, a
     network error) records a timeline event with status 0 and the reason as
-    its note. A check that ran and found nothing records status 204 with
-    "no new messages", shown as a grey "idle" in the timeline. The URL's own
-    `status` is unchanged (200 when messages came in, 0 otherwise).
+    its note. A check that ran and stored nothing new records status 204
+    with "no new messages", shown as a grey "idle" in the timeline; messages
+    the live listener or a scrape already stored do not count as new. The
+    URL's own `status` is unchanged (200 when new messages were stored, 0
+    otherwise).
   - A manual scrape that fails after the first batch returns a `warning`
     ("partial scrape: N message(s) fetched, then stopped — <reason>"); what
     it fetched is stored.
@@ -99,7 +104,6 @@
   - The scraper's error fields (`last_fetch_error` and the new
     `last_search_error`) are read under the Telegram lock, so another
     Telegram call cannot clear them before the response is built.
-
 - Telegram monitoring no longer waits for crawls or for Tor. Monitored
   channels were checked by the `.onion` scheduler, so they were skipped
   while a manual scan ran, while a site crawl was in progress and whenever

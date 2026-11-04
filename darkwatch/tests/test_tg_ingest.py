@@ -87,6 +87,7 @@ class _FakeTg:
         self.calls = []
         self.last_fetch_error = None
         self.last_fetch_count = self.last_fetch_max_id = 0
+        self.last_fetch_min_id = 0
 
     def fetch_new_messages(self, channel_id, since_msg_id=None, limit=None,
                            username=None, before_msg_id=None):
@@ -98,6 +99,7 @@ class _FakeTg:
                     if not before_msg_id or i < before_msg_id][:limit]
         self.last_fetch_count = len(read)
         self.last_fetch_max_id = max(read, default=0)
+        self.last_fetch_min_id = min(read, default=0)
         return [_msg(i, f"post {i}") for i in read if i not in self.service]
 
 
@@ -292,11 +294,13 @@ def test_fetch_reports_how_far_it_read(monkeypatch):
     monkeypatch.setattr(eng, "_build_client", lambda: fake)
     out = eng.fetch_new_messages(123, since_msg_id=40, limit=3, username="@c")
     assert [m["msg_id"] for m in out] == [43]
-    assert (eng.last_fetch_count, eng.last_fetch_max_id) == (3, 43)
+    assert (eng.last_fetch_count, eng.last_fetch_max_id,
+            eng.last_fetch_min_id) == (3, 43, 41)
     # A failed fetch stored nothing, so it reports nothing read.
     fake.fail = RuntimeError("connection lost")
     assert eng.fetch_new_messages(123, since_msg_id=40, username="@c") == []
-    assert (eng.last_fetch_count, eng.last_fetch_max_id) == (0, 0)
+    assert (eng.last_fetch_count, eng.last_fetch_max_id,
+            eng.last_fetch_min_id) == (0, 0, 0)
 
 
 # ── Manual scrape ───────────────────────────────────────────────────────────
@@ -344,8 +348,9 @@ def test_scrape_that_misses_the_mark_leaves_it_for_polling(
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 50
     monkeypatch.setattr(web, "_monitor_stop", threading.Event())
     monkeypatch.setattr(web.random, "uniform", lambda a, b: 0)
-    # It fetches 51..200 again; the scraped half is not stored twice.
-    assert web._monitor_tg_channel(url_id) == (150, 0, None)
+    # It fetches 51..200 again; the scraped half is not stored twice nor
+    # counted as new.
+    assert web._monitor_tg_channel(url_id) == (50, 0, None)
     assert _count(crawler.db, "SELECT COUNT(*) FROM tg_messages") == 150
     assert _stored_ids(crawler.db, url_id) == list(range(51, 201))
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 200
@@ -415,6 +420,19 @@ def test_repost_in_two_channels_stores_both_and_alerts_once(tmp_path):
         "SELECT page_url FROM findings")) == \
         ["https://t.me/chan_a/1", "https://t.me/chan_b/4"]
     assert [x["page_url"] for x in crawler.alerts] == ["https://t.me/chan_a/1"]
+
+
+def test_repost_alerts_for_a_rule_added_after_the_first_copy(tmp_path):
+    crawler = _crawler(tmp_path)
+    db = crawler.db
+    a, b = _channel(db, "chan_a"), _channel(db, "chan_b")
+    crawler.scan_tg_message(a, "chan_a", _msg(1, "big leak"))
+    # The operator adds a keyword; the repost is the first copy it sees.
+    crawler.scanner.rules = ["leak_rule", "new_rule"]
+    assert crawler.scan_tg_message(b, "chan_b", _msg(4, "big leak")) == 2
+    assert [(x["rule_name"], x["page_url"]) for x in crawler.alerts] == [
+        ("leak_rule", "https://t.me/chan_a/1"),
+        ("new_rule", "https://t.me/chan_b/4")]
 
 
 def test_repeated_text_in_one_channel_is_stored(tmp_path):
@@ -497,6 +515,7 @@ class _FailingTg(_FakeTg):
             self.calls.append(kw.get("since_msg_id"))
             self.last_fetch_error = self.error
             self.last_fetch_count = self.last_fetch_max_id = 0
+            self.last_fetch_min_id = 0
             return []
         return super().fetch_new_messages(*a, **kw)
 
@@ -543,6 +562,20 @@ def test_monitor_with_new_messages_is_200(poll, web, monkeypatch):
     assert _url_status(crawler.db, url_id) == 200
 
 
+def test_monitor_messages_the_listener_stored_are_not_new(poll, web, monkeypatch):
+    crawler, run = poll
+    url_id = _channel(crawler.db, "heard", mark=20)
+    # The live listener stored 21-30 without moving the cursor.
+    for i in range(21, 31):
+        crawler.scan_tg_message(url_id, "heard", _msg(i, f"post {i}"))
+    monkeypatch.setattr(web, "_tg", _FakeTg(range(1, 31)))
+    web._monitor_one(url_id, "tg://heard")
+    assert _events(crawler.db, url_id) == [
+        {"status": 204, "pages": 0, "note": "no new messages"}]
+    assert _url_status(crawler.db, url_id) == 0
+    assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 30
+
+
 def test_monitor_flood_wait_mid_catch_up_keeps_the_first_batch(poll):
     crawler, run = poll
     url_id = _channel(crawler.db, "half", mark=1000)
@@ -566,6 +599,18 @@ def test_scrape_that_finishes_has_no_warning(scrape):
     body = run(url_id, _FakeTg(range(1, 2001)), 1000)
     assert body["fetched"] == 1000
     assert "warning" not in body
+
+
+def test_scrape_walks_past_service_messages(scrape):
+    crawler, run = scrape
+    url_id = _channel(crawler.db, "pins")
+    # 1501 is a pin and the lowest id of the first batch: that batch
+    # returns 499 posts, but the history goes on below it.
+    tg = _FakeTg(range(1, 2001), service=[1501])
+    body = run(url_id, tg, 1000)
+    assert body["fetched"] == 999 and "warning" not in body
+    assert _stored_ids(crawler.db, url_id) == \
+        [i for i in range(1001, 2001) if i != 1501]
 
 
 def test_scrape_flood_wait_on_batch_one_names_it(scrape):

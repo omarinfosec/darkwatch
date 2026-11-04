@@ -797,6 +797,18 @@ class Database:
             cur = self.conn.execute("SELECT id FROM pages WHERE content_hash = ?", (content_hash,))
             return cur.fetchone() is not None
 
+    def rules_found_for_content(self, content_hash):
+        """Names of the rules with a finding on any page whose content hash
+        is `content_hash`: the rules an earlier copy of a Telegram repost
+        already matched (and alerted for)."""
+        with self.lock:
+            cur = self.conn.execute(
+                "SELECT DISTINCT f.rule_name FROM pages p "
+                "JOIN findings f ON f.url_id = p.url_id "
+                "  AND f.page_url = p.page_url "
+                "WHERE p.content_hash = ?", (content_hash,))
+            return {r[0] for r in cur.fetchall()}
+
     def get_findings(self, min_score=0, limit=100, before_id=None,
                       severity=None, max_fp_score=None):
         """Paginated descending by id. `before_id` is a simple cursor —
@@ -2872,10 +2884,11 @@ class DarkMTProto:
         self.last_fetch_error = None
         # How far the last fetch_new_messages read, counting the service
         # messages it drops (joins, pins, title changes): they use up the
-        # `limit` too, so a caller walking a cursor forward needs these,
-        # not the returned list. Both 0 when the fetch failed.
+        # `limit` too, so a caller walking a cursor needs these, not the
+        # returned list. All 0 when the fetch failed.
         self.last_fetch_count = 0
         self.last_fetch_max_id = 0
+        self.last_fetch_min_id = 0
         # Same for search_in_channel: None after a search that ran (even
         # with no hits), the reason after one that failed, so callers can
         # tell "no matches" from "never searched".
@@ -3734,9 +3747,9 @@ class DarkMTProto:
              silently return [] in older Telethon versions.
 
         Skips empty messages (pure reactions / stickers — nothing to scan).
-        Skipped messages still count toward `limit`; `last_fetch_count`
-        and `last_fetch_max_id` say how many messages were read and the
-        highest id among them, skipped or not.
+        Skipped messages still count toward `limit`; `last_fetch_count`,
+        `last_fetch_max_id` and `last_fetch_min_id` say how many messages
+        were read and the highest and lowest id among them, skipped or not.
         Best-effort: returns [] on any Telethon error so the monitor loop
         never crashes. Writes a warning to the log on auth failure or
         resolution errors so the operator can see WHY it returned empty.
@@ -3749,6 +3762,7 @@ class DarkMTProto:
         self.last_fetch_error = None
         self.last_fetch_count = 0
         self.last_fetch_max_id = 0
+        self.last_fetch_min_id = 0
         # Prefer the @handle when we have it — resolve-by-username is far
         # more reliable than resolve-by-numeric-id across session resets.
         entity = self._entity_ref(channel_id, username)
@@ -3822,11 +3836,12 @@ class DarkMTProto:
                     # through history.
                     kwargs["max_id"] = int(before_msg_id)
                 out = []
-                read, max_id = 0, 0
+                read, max_id, min_id = 0, 0, 0
                 async for msg in c.iter_messages(**kwargs):
                     if msg is None: continue
                     read += 1
                     max_id = max(max_id, msg.id)
+                    min_id = min(min_id, msg.id) if min_id else msg.id
                     text = msg.message or ""
                     has_media = bool(getattr(msg, "media", None))
                     # KEEP media-only messages (photos/docs with no caption).
@@ -3874,7 +3889,8 @@ class DarkMTProto:
                     })
                 # Set only once the whole batch was read: after an error
                 # nothing was stored, so the cursor must not move.
-                self.last_fetch_count, self.last_fetch_max_id = read, max_id
+                self.last_fetch_count = read
+                self.last_fetch_max_id, self.last_fetch_min_id = max_id, min_id
                 return out
             finally:
                 try: await c.disconnect()
@@ -5494,14 +5510,15 @@ class DarkWebCrawler:
         except Exception as e:
             log.error(f"Failed to save page: {e}")
 
-    def _yara_match_text(self, url_id, page_url, text, suppress_alert=False,
+    def _yara_match_text(self, url_id, page_url, text, suppress_rules=(),
                          bump=True):
         """Run YARA rules against a piece of plain text and write findings.
         Runs text + lower-cased text in parallel, then de-dupes by rule
         name — keywords.yar isn't always `nocase` but auto-generated user
         rules are, so an all-caps leak message needs both views.
-        `suppress_alert` records findings without alerting (a repost of
-        text already seen, which alerted the first time). `bump=False` is
+        Findings of rules in `suppress_rules` are recorded without alerting
+        (rules an earlier copy of a reposted text matched, which alerted
+        then). `bump=False` is
         the rescan mode of add_finding: a match that is already recorded
         is neither counted nor alerted again.
         Returns the number of findings written (new ones when bump=False)."""
@@ -5532,9 +5549,9 @@ class DarkWebCrawler:
                 if severity in ("critical", "high"):
                     log.warning(f"  ALERT {severity.upper()} | {kw['rule']} "
                                 f"(score:{score} fp:{fp}) | {page_url}")
-                    if suppress_alert:
-                        log.info("  Alert suppressed (repost of text "
-                                 "already seen)")
+                    if kw["rule"] in suppress_rules:
+                        log.info("  Alert suppressed (repost of text that "
+                                 "already matched this rule)")
                     elif fp < 60:
                         self.alerter.send({
                             "rule_name": kw["rule"], "score": score,
@@ -5557,7 +5574,8 @@ class DarkWebCrawler:
         """Route a single Telegram message through the same pipeline as a
         web page: YARA scan, IOC extract, findings write. A message already
         stored for this channel is skipped; one whose text was seen before
-        (a repost) is stored and scanned without alerting again. Also
+        (a repost) is stored and scanned, alerting only for rules the
+        earlier copies did not match. Also
         persists rich message metadata (sender, views, reactions,
         fwd/reply, media flag) in tg_messages so the UI can render a
         proper channel timeline.
@@ -5590,8 +5608,11 @@ class DarkWebCrawler:
         hash_basis = text if text else f"{page_url}|media"
         content_hash = hashlib.sha256(hash_basis.encode("utf-8")).hexdigest()
         # A repost is still stored and scanned, so this channel gets its
-        # own message row and findings; only the alert is not repeated.
-        repost = self.db.page_seen(content_hash)
+        # own message row and findings. Only an alert an earlier copy
+        # already raised is not repeated: a rule added since then (that
+        # matched no earlier copy) still alerts on the repost.
+        earlier_rules = (self.db.rules_found_for_content(content_hash)
+                         if text else set())
 
         extracted = self.data_extractor.extract(text) if text else {}
 
@@ -5617,7 +5638,7 @@ class DarkWebCrawler:
         # (where text is the synthetic marker) we skip scanning to avoid
         # a burst of false "[photo]"-substring matches.
         finding_count = (self._yara_match_text(url_id, page_url, text,
-                                               suppress_alert=repost)
+                                               suppress_rules=earlier_rules)
                          if text else 0)
         if extracted:
             for ioc_type, iocs in extracted.items():

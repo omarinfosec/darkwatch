@@ -674,9 +674,11 @@ def _next_check_at(interval_min):
 
 def _monitor_tg_channel(url_id):
     """Incremental Telegram channel scrape: pull messages newer than
-    tg_last_msg_id and scan each. Returns (fetched, findings, error):
-    error is the reason the check failed or stopped short, None when it
-    ran to the end.
+    tg_last_msg_id and scan each. Returns (stored, findings, error):
+    stored counts the messages this check stored, not those it fetched
+    that were stored already (by the live listener or a scrape); error is
+    the reason the check failed or stopped short, None when it ran to the
+    end.
 
     Adds a randomized 0-15 s pre-fetch delay on top of the scheduler's
     existing ±25% next_check_at jitter, so the scheduler wake-up time and
@@ -734,9 +736,15 @@ def _tg_catch_up(url_id):
                         f"after {fetched} message(s): {error}")
             break
         for m in msgs:
-            findings += _crawler.scan_tg_message(url_id, username, m)
             if m["msg_id"] > latest:
                 latest = m["msg_id"]
+            # The live listener and a scrape store messages without moving
+            # the cursor, so a poll fetches them again; they are not new.
+            if _crawler.db.tg_message_seen(url_id, m["msg_id"]):
+                continue
+            findings += _crawler.scan_tg_message(url_id, username, m)
+            if _crawler.db.tg_message_seen(url_id, m["msg_id"]):
+                fetched += 1
         # The fetch drops service messages (joins, pins) after they used
         # up the limit, so the cursor and the caught-up test go by what it
         # read: a run of `limit` service messages would otherwise return
@@ -746,7 +754,6 @@ def _tg_catch_up(url_id):
         if latest > saved:
             _crawler.db.update_tg_last_msg_id(url_id, latest)
             saved = latest
-        fetched += len(msgs)
         # A short batch means caught up. Without a mark (first check) the
         # fetch is the newest batch, not a walk: older history is the
         # scrape endpoint's job.
@@ -778,10 +785,11 @@ def _monitor_one(url_id, url):
             # (Tor + Playwright) isn't relevant here. Takes _tg_lock
             # itself, after its pre-fetch delay.
             pages, findings, error = _monitor_tg_channel(url_id)
-            # urls.status keeps its meaning (200 = got messages, 0 = not).
-            # The event tells the two "0" cases apart: a failed fetch is
-            # status 0 with the reason as the note, a quiet channel is
-            # 204 "no new messages".
+            # urls.status keeps its meaning (200 = stored new messages,
+            # 0 = not). The event tells the two "0" cases apart: a failed
+            # fetch is status 0 with the reason as the note, a quiet
+            # channel (or one whose new messages the live listener already
+            # stored) is 204 "no new messages".
             _crawler.db.update_scan(url_id, 200 if pages > 0 else 0)
             if error:
                 ev_status, note = 0, error[:200]
@@ -1833,8 +1841,9 @@ def route_tg_scrape(url_id):
         # expose max_id — simplest multi-batch impl: loop with offset
         # reduction by the last msg_id seen.
         earliest_seen = None
-        while fetched_total < total_cap:
-            remaining = total_cap - fetched_total
+        read_total = 0
+        while read_total < total_cap:
+            remaining = total_cap - read_total
             this_batch = min(batch_size, remaining)
             msgs = _tg.fetch_new_messages(
                 info["tg_channel_id"],
@@ -1844,7 +1853,15 @@ def route_tg_scrape(url_id):
                 before_msg_id=earliest_seen)
             # Read inside the lock: the next Telegram call resets it.
             fetch_error = _tg.last_fetch_error
-            if not msgs: break
+            # The fetch drops service messages (joins, pins) after they
+            # used up the limit, so the walk and the exhausted test go by
+            # what it read, as polling does: a short list is not the end
+            # of the history.
+            read = getattr(_tg, "last_fetch_count", len(msgs))
+            if not read: break
+            low = getattr(_tg, "last_fetch_min_id", 0) or 0
+            if low and (earliest_seen is None or low < earliest_seen):
+                earliest_seen = low
             for m in msgs:
                 found += _crawler.scan_tg_message(url_id, username, m)
                 if m["msg_id"] > (latest_id or 0):
@@ -1852,7 +1869,8 @@ def route_tg_scrape(url_id):
                 if earliest_seen is None or m["msg_id"] < earliest_seen:
                     earliest_seen = m["msg_id"]
             fetched_total += len(msgs)
-            if len(msgs) < this_batch:
+            read_total += read
+            if read < this_batch:
                 break   # channel history exhausted
         # The scrape fetches the newest messages, so it may not reach down
         # to the polling cursor. Raise the cursor only when it did (or
