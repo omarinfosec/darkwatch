@@ -31,6 +31,17 @@ function externalLink(sample, host) {
     return host ? `https://${host}` : "#";
 }
 
+// A 401 carrying WWW-Authenticate comes from the dashboard login
+// (DARKWATCH_AUTH_TOKEN): the session cookie is missing or expired, so go
+// and sign in again. The Telegram routes' own 401s don't carry the header.
+function isLoginRequired(r) {
+    return r.status === 401 && r.headers.has("WWW-Authenticate");
+}
+
+function toLogin() {
+    window.location.assign("/login");
+}
+
 async function api(path, opts = {}) {
     let r;
     try {
@@ -44,6 +55,7 @@ async function api(path, opts = {}) {
         return { ok: false, status: 0,
                  body: { error: "Network error: dashboard unreachable" } };
     }
+    if (isLoginRequired(r)) toLogin();
     const body = await r.json().catch(() => ({}));
     return { ok: r.ok, status: r.status, body };
 }
@@ -3601,6 +3613,9 @@ function TgSmartSearch({ disabled, channels, onOpenChannel,
             setError("stream interrupted");
             setBusy(false); setCurrentStage(0);
             es.close(); esRef.current = null;
+            // EventSource hides the status; a signed-out session shows up
+            // as a 401 on a cheap call, and api() then goes to /login.
+            api("/api/ui-config");
         };
     };
 

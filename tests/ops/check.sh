@@ -150,6 +150,37 @@ DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "
 grep -q "shorter than 32" "$work/out" && die "bootstrap: warned about a 32-character token"
 ok "bootstrap and deploy warn about a SETUP_AUTH_TOKEN under 32 characters without printing it"
 
+# The dashboard login (DARKWATCH_AUTH_TOKEN) is opt-in: deploy warns, without
+# failing, when port 8080 is published beyond loopback with no token, and
+# about a token under 32 characters. Never echoed.
+new_tree; seed
+deploy
+expect_ok "loopback bind, no dashboard token"
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: dashboard auth warning on a loopback bind"
+for bind in 10.8.0.5 0.0.0.0 "::"; do
+    sed -i "s|^DARKWATCH_BIND_IP=.*|DARKWATCH_BIND_IP=$bind|" "$D/env"
+    deploy
+    expect_ok "bind $bind, no dashboard token"
+    grep -qF "the dashboard is published on $bind:8080 with no login" "$work/out" || die "deploy: no warning for bind $bind without a token"
+done
+printf 'DARKWATCH_AUTH_TOKEN=\n' >> "$D/env"
+deploy
+grep -q "with no login" "$work/out" || die "deploy: an empty DARKWATCH_AUTH_TOKEN= line silenced the warning"
+dash_tok="$(printf 'd%.0s' {1..64})"
+printf 'DARKWATCH_AUTH_TOKEN="%s"\n' "$dash_tok" >> "$D/env"   # last line wins, quotes stripped
+deploy
+expect_ok "bind :: with a dashboard token"
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: warned although a 64-character dashboard token is set"
+sed -i '/^DARKWATCH_AUTH_TOKEN=/d' "$D/env"
+short_dash="dashtok0123456789abcdefghijklmn"   # 31 characters
+printf 'DARKWATCH_AUTH_TOKEN=%s \n' "$short_dash" >> "$D/env"
+sed -i "s|^DARKWATCH_BIND_IP=.*|DARKWATCH_BIND_IP=127.0.0.1|" "$D/env"
+deploy
+expect_ok "short dashboard token"
+grep -q "DARKWATCH_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "deploy: no warning for a short dashboard token"
+grep -qF "$short_dash" "$work/out" && die "deploy: printed the dashboard token"
+ok "deploy warns about a dashboard published beyond loopback without DARKWATCH_AUTH_TOKEN, and about a short one"
+
 # ─── default env (no DARKNET_SUBNET) reaches the end ────────────────────────
 new_tree; seed
 grep -q '^DARKNET_SUBNET=' "$D/env" && die "fixture: env should not set DARKNET_SUBNET"

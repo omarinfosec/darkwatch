@@ -109,6 +109,11 @@ done
 if (( ${#missing[@]} > 0 )); then
     fail "missing required env vars in $DATA_ROOT/env: ${missing[*]}"
 fi
+# The dashboard's login is opt-in. Warn, without failing, when it is reachable
+# beyond loopback without one (a private VPN may be the only way in).
+while IFS= read -r msg; do
+    warn "$msg"
+done < <(dashboard_auth_warnings)
 
 # WireGuard configs placed by hand skip the Setup UI's validation. The kill
 # switch assumes a full-tunnel config, so check the same rules here that

@@ -27,13 +27,16 @@ def web(tmp_path_factory):
     (d / "config.json").write_text(json.dumps(cfg))
     pytest.importorskip("flask")
     # Session-scoped, so the function-scoped monkeypatch fixture is not
-    # available. web.py reads both variables only at import (CONFIG_PATH,
-    # _ALLOWED_HOSTS), so the context restores them right after it.
+    # available. web.py reads these variables only at import (CONFIG_PATH,
+    # _ALLOWED_HOSTS, _AUTH_TOKEN), so the context restores them right
+    # after it.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("DARKWATCH_CONFIG", str(d / "config.json"))
         mp.setenv("DARKWATCH_BIND_IP", "10.8.0.5")
         # No local override file from the machine running the tests.
         mp.setenv("DARKWATCH_CONFIG_LOCAL", "")
+        # Login off, as by default; test_dashboard_auth turns it on.
+        mp.delenv("DARKWATCH_AUTH_TOKEN", raising=False)
         import web as web_mod
     # The import starts the monitor schedulers. Stop them: tests swap
     # web._crawler and web._tg for fakes, and a background tick would use

@@ -10,6 +10,9 @@ all pass.
 import collections
 import csv
 import errno
+import hashlib
+import hmac
+import html
 import io
 import json
 import logging
@@ -25,7 +28,7 @@ from datetime import datetime, timedelta
 
 import requests
 from urllib.parse import urlsplit
-from flask import Flask, abort, jsonify, request, send_file, Response
+from flask import Flask, abort, jsonify, redirect, request, send_file, Response
 
 from darkwatch import (DarkWebCrawler, TelegramScraper, TelegramLiveListener,
                         load_config, setup_logging, onion_url_error,
@@ -57,18 +60,20 @@ app = Flask(__name__,
             static_url_path="/static")
 
 # ─── Request guard (DNS rebinding + cross-site requests) ─────────────────────
-# The dashboard has no login; it relies on being reachable only via
-# localhost / an SSH tunnel. That alone doesn't stop a web page the operator
-# visits: DNS rebinding makes evil.example resolve to 127.0.0.1 (same-origin
-# with the dashboard, full API access), and plain cross-site form POSTs hit
-# body-less endpoints (/api/stop, /api/rescan, ...). So:
+# The dashboard has no login unless DARKWATCH_AUTH_TOKEN is set (below); it
+# relies on being reachable only via localhost / an SSH tunnel. That alone
+# doesn't stop a web page the operator visits: DNS rebinding makes
+# evil.example resolve to 127.0.0.1 (same-origin with the dashboard, full API
+# access), and plain cross-site form POSTs hit body-less endpoints
+# (/api/stop, /api/rescan, ...). So:
 #   - the Host header must name this dashboard (loopback, DARKWATCH_BIND_IP,
 #     the container name, or DARKWATCH_ALLOWED_HOSTS for a reverse proxy);
 #   - no request of any method may come from another site
 #     (Sec-Fetch-Site: cross-site). GETs matter too: a cross-site <img> or
 #     link can fire a live Telegram lookup (/api/telegram/user/...) or an
-#     export. The one exception is a top-level navigation to "/" (a link to
-#     the dashboard on another site), which only loads the page shell;
+#     export. The one exception is a top-level navigation to "/" or "/login"
+#     (a link to the dashboard on another site), which only loads the page
+#     shell or the sign-in form;
 #   - an Origin header, on any method, must name an allowed host; "null"
 #     (sandboxed iframe, file:// page) never does.
 # Browsers without Sec-Fetch-* and non-browser clients (curl, healthchecks,
@@ -94,7 +99,7 @@ def _request_guard():
     if _hostname(request.host) not in _ALLOWED_HOSTS:
         abort(403)
     if request.headers.get("Sec-Fetch-Site") == "cross-site" and not (
-            request.method == "GET" and request.path == "/"
+            request.method == "GET" and request.path in ("/", "/login")
             and request.headers.get("Sec-Fetch-Mode") == "navigate"
             and request.headers.get("Sec-Fetch-Dest") == "document"):
         abort(403)
@@ -104,6 +109,152 @@ def _request_guard():
                    or _hostname(urlsplit(origin).netloc) not in _ALLOWED_HOSTS):
         abort(403)
     return None
+
+
+# ─── Optional login (DARKWATCH_AUTH_TOKEN) ───────────────────────────────────
+# Off by default: with the variable unset the dashboard behaves as above.
+# Set (at least 32 characters, `openssl rand -hex 32`), every request except
+# /healthz (Docker healthcheck), /login and /static/ needs either
+#   - `Authorization: Bearer <token>` (curl, Prometheus), or
+#   - the session cookie /login sets: "<issued-at>.<HMAC(token, ...)>", never
+#     the token itself, valid 7 days and checked against the token on every
+#     request, so changing the token (and recreating darkwatch) signs every
+#     session out. HttpOnly and SameSite=Strict; not Secure, because the
+#     usual way in is plain http through an SSH tunnel.
+# A browser navigation to "/" without either goes to /login; anything else
+# gets 401 with `WWW-Authenticate: Bearer` (the dashboard's own Telegram
+# 401s don't carry it, which is how the UI tells the two apart). A token
+# under 32 characters fails closed: every protected request gets 401.
+AUTH_COOKIE = "dw_session"   # not the Setup UI's dw_setup_session: cookies ignore ports
+AUTH_MAX_AGE = 7 * 24 * 3600
+AUTH_MIN_TOKEN_LEN = 32
+_AUTH_TOKEN = os.environ.get("DARKWATCH_AUTH_TOKEN", "").strip()
+if _AUTH_TOKEN and len(_AUTH_TOKEN) < AUTH_MIN_TOKEN_LEN:
+    log.error("DARKWATCH_AUTH_TOKEN is shorter than %d characters; refusing "
+              "every dashboard request until it is replaced (openssl rand "
+              "-hex 32).", AUTH_MIN_TOKEN_LEN)
+
+
+def _token_ok(provided, expected):
+    if not provided or len(expected) < AUTH_MIN_TOKEN_LEN:
+        return False
+    return hmac.compare_digest(provided.encode(), expected.encode())
+
+
+def _session_mac(token, ts):
+    # Own prefix, so a Setup UI cookie made with the same token never passes.
+    return hmac.new(token.encode(), f"dw-dashboard-session:{ts}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _make_session(token, now=None):
+    ts = str(int(time.time() if now is None else now))
+    return f"{ts}.{_session_mac(token, ts)}"
+
+
+def _valid_session(cookie, token):
+    if not cookie or len(token) < AUTH_MIN_TOKEN_LEN:
+        return False
+    ts, _, mac = cookie.partition(".")
+    # ASCII digits only and a sane length: str.isdigit() also accepts
+    # characters like "²" that int() rejects, and int() refuses strings past
+    # 4300 digits; either would turn a forged cookie into a 500.
+    if not (ts.isascii() and ts.isdigit()) or len(ts) > 12 or not mac:
+        return False
+    # A minute of clock skew either way, never a cookie from the future.
+    if not -60 <= time.time() - int(ts) <= AUTH_MAX_AGE:
+        return False
+    return hmac.compare_digest(mac.encode(), _session_mac(token, ts).encode())
+
+
+def _authenticated(token):
+    scheme, _, provided = request.headers.get("Authorization", "").partition(" ")
+    if scheme.lower() == "bearer" and _token_ok(provided.strip(), token):
+        return True
+    return _valid_session(request.cookies.get(AUTH_COOKIE, ""), token)
+
+
+@app.before_request
+def _auth_guard():
+    """Runs after _request_guard (registration order), so a cross-site or
+    wrong-Host request is still a 403."""
+    token = _AUTH_TOKEN
+    if not token:
+        return None
+    path = request.path
+    if path in ("/healthz", "/login") or path.startswith("/static/"):
+        return None
+    if _authenticated(token):
+        return None
+    if request.method in ("GET", "HEAD") and path == "/":
+        return redirect("/login", code=302)
+    resp = jsonify({"error": "login required"})
+    resp.status_code = 401
+    resp.headers["WWW-Authenticate"] = 'Bearer realm="darkwatch"'
+    return resp
+
+
+_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DarkWatch — sign in</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg" />
+<style>
+  body {{ background: #030712; color: #f3f4f6; font: 14px system-ui, sans-serif;
+         display: flex; min-height: 100vh; margin: 0; align-items: center;
+         justify-content: center; }}
+  form {{ background: #111827; border: 1px solid #1f2937; border-radius: 8px;
+         padding: 24px; width: 340px; }}
+  h1 {{ font-size: 16px; margin: 0 0 12px; }}
+  p {{ color: #9ca3af; margin: 0 0 12px; line-height: 1.4; }}
+  input {{ box-sizing: border-box; width: 100%; padding: 8px; margin: 0 0 12px;
+          background: #030712; color: #f3f4f6; border: 1px solid #374151;
+          border-radius: 4px; font: inherit; }}
+  button {{ width: 100%; padding: 8px; background: #2D7FDB; color: #fff;
+           border: 0; border-radius: 4px; font: inherit; cursor: pointer; }}
+  .err {{ color: #f87171; }}
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>DarkWatch</h1>
+  <p>Paste <code>DARKWATCH_AUTH_TOKEN</code> from
+     <code>/var/lib/darkwebapp/env</code>. You stay signed in for 7 days.</p>
+  {error}
+  <input type="password" name="token" autocomplete="current-password"
+         autofocus required aria-label="Token" />
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>
+"""
+
+
+def _login_page(error="", status=200):
+    err = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    return Response(_LOGIN_PAGE.format(error=err), status=status,
+                    mimetype="text/html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def route_login():
+    token = _AUTH_TOKEN
+    if not token:   # login is off: nothing to sign in to
+        return redirect("/", code=303)
+    if request.method == "GET":
+        return _login_page()
+    if not _token_ok((request.form.get("token") or "").strip(), token):
+        # The client IP only, never the value typed (it may be a near miss
+        # of the real token). No rate limiter: the token is >= 32 characters.
+        log.warning("dashboard sign-in failed from %s", request.remote_addr)
+        return _login_page("Invalid token: check DARKWATCH_AUTH_TOKEN in "
+                           "/var/lib/darkwebapp/env.", status=401)
+    resp = redirect("/", code=303)
+    resp.set_cookie(AUTH_COOKIE, _make_session(token), max_age=AUTH_MAX_AGE,
+                    path="/", httponly=True, samesite="Strict", secure=False)
+    return resp
 
 
 @app.after_request

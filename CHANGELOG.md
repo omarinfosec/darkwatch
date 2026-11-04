@@ -59,6 +59,15 @@
   modified file. Add `config.d` to your backups (RUNBOOK, "Local config
   overrides").
 
+- **Dashboard login (optional).** If `DARKWATCH_BIND_IP` is not a loopback
+  address and `DARKWATCH_AUTH_TOKEN` is unset, `ops/deploy.sh` now warns
+  that the dashboard has no login; it also warns about a token shorter than
+  32 characters.
+  Turn it on with `echo "DARKWATCH_AUTH_TOKEN=$(openssl rand -hex 32)" |
+  sudo tee -a /var/lib/darkwebapp/env` before deploying, then sign in at
+  `/login`; a Prometheus scraper of `/metrics` then needs the token as a
+  bearer token. See README, "Dashboard login".
+
 - **Setup UI: sign in again after the upgrade.** Session cookies from
   earlier releases are no longer accepted, and new ones last 12 hours
   instead of 7 days. A `SETUP_AUTH_TOKEN` shorter than 32 characters is now
@@ -91,6 +100,20 @@
   or whitespace inside the parentheses) / `@import "//host"` are removed
   from `<style>` and `style=""`. Pages saved before this release
   are not rewritten and keep their remote references.
+- Optional dashboard login. Set `DARKWATCH_AUTH_TOKEN` (at least 32
+  characters, `openssl rand -hex 32`) in `/var/lib/darkwebapp/env` and every
+  dashboard request needs it, as `Authorization: Bearer <token>` or the
+  session cookie the new `/login` page sets: HttpOnly, `SameSite=Strict`,
+  valid 7 days, not `Secure` (the usual way in is plain http through an SSH
+  tunnel), holding a timestamp signed with the token rather than the token.
+  `/healthz`, `/login` and `/static/` stay open; `/metrics` needs the Bearer
+  header. Without a valid session the dashboard sends the browser to
+  `/login`, also when a request or the deep-search stream fails with 401. A
+  shorter token fails closed (every request gets 401, logged), and failed
+  sign-ins are logged with the client IP only. Unset, as by default, nothing
+  changes. `ops/deploy.sh` now warns, without failing, when
+  `DARKWATCH_BIND_IP` is not a loopback address and no token is set, or when
+  the token is too short (never printing it).
 
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);

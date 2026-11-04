@@ -26,3 +26,27 @@ setup_token_short() {
     t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
     [[ -n "$t" && ${#t} -lt 32 ]]
 }
+
+# dashboard_auth_warnings — prints one line per problem with the dashboard
+# login (DARKWATCH_AUTH_TOKEN, off by default; darkwatch/web.py), nothing when
+# all is well: no token while DARKWATCH_BIND_IP publishes port 8080 beyond
+# loopback, or a token under the 32 characters web.py requires (it then
+# answers 401). The token is read from the env file only, the last
+# assignment, as compose's env_file does; never printed.
+dashboard_auth_warnings() {
+    local bind t=""
+    bind="$(env_val DARKWATCH_BIND_IP 127.0.0.1)"
+    if [[ -r "$DATA_ROOT/env" ]]; then
+        t="$(grep -E '^DARKWATCH_AUTH_TOKEN=' "$DATA_ROOT/env" | tail -1 | cut -d= -f2-)" || true
+    fi
+    t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+    if [[ "$t" =~ ^\"(.*)\"$ || "$t" =~ ^\'(.*)\'$ ]]; then t="${BASH_REMATCH[1]}"; fi
+    if [[ -z "$t" ]]; then
+        case "$bind" in
+            127.*|::1|"[::1]"|localhost) ;;
+            *) echo "the dashboard is published on $bind:8080 with no login: anyone who can reach that address can use it. Set DARKWATCH_AUTH_TOKEN in $DATA_ROOT/env (openssl rand -hex 32), or set DARKWATCH_BIND_IP=127.0.0.1 and use an SSH tunnel" ;;
+        esac
+    elif (( ${#t} < 32 )); then
+        echo "DARKWATCH_AUTH_TOKEN is shorter than 32 characters; the dashboard will answer 401 until you replace it (openssl rand -hex 32)"
+    fi
+}
