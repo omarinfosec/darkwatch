@@ -2867,6 +2867,10 @@ class DarkMTProto:
         # not the returned list. Both 0 when the fetch failed.
         self.last_fetch_count = 0
         self.last_fetch_max_id = 0
+        # Same for search_in_channel: None after a search that ran (even
+        # with no hits), the reason after one that failed, so callers can
+        # tell "no matches" from "never searched".
+        self.last_search_error = None
 
     # ── Engine glue (thin delegations to support classes) ──────────────
     def _record_call(self, channel_id):
@@ -4120,19 +4124,22 @@ class DarkMTProto:
         """Run a native Telegram message search inside a specific channel.
         Much more powerful than DB LIKE because it can surface messages
         we've never scraped. Best-effort: returns [] on any error so the
-        UI layer can fall back to local results.
+        UI layer can fall back to local results; `last_search_error`
+        says why, and is None after a search that ran.
 
         `username` (optional): when set, resolved as @handle — more
         reliable than the numeric channel_id across session rebuilds.
         `min_date_iso` (optional) caps results to messages on/after that date.
         """
         self._record_call(channel_id)
+        self.last_search_error = None
         entity = self._entity_ref(channel_id, username)
         async def _go():
             c = self._build_client()
             await c.connect()
             try:
                 if not await c.is_user_authorized():
+                    self.last_search_error = "not authenticated (session expired)"
                     log.warning("[tg] search_in_channel: not authenticated")
                     return []
                 kwargs = {"entity": entity, "search": query,
@@ -4176,9 +4183,11 @@ class DarkMTProto:
         try:
             return self._run_coro(_go)
         except FloodWaitError as e:
+            self.last_search_error = f"flood wait: {e.seconds}s"
             log.warning(f"TG search flood-wait {e.seconds}s on channel {channel_id}")
             return []
         except Exception as e:
+            self.last_search_error = f"{type(e).__name__}: {e}"
             log.warning(f"TG search failed for {channel_id}: {e}")
             return []
 

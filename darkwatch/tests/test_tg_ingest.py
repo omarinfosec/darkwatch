@@ -1,9 +1,11 @@
 """Telegram ingest completeness: the polling cursor walks forward without
 gaps, the live listener keeps media-only posts and does not move the
-cursor, each channel stores its own copy of a repost (alerting once), and
-a per-channel rescan only adds findings."""
+cursor, each channel stores its own copy of a repost (alerting once), a
+per-channel rescan only adds findings, and failed fetches and searches are
+reported as failures instead of "nothing new"."""
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -121,7 +123,7 @@ def test_poll_catches_up_in_batches_without_gaps(poll):
     crawler, run = poll
     url_id = _channel(crawler.db, "busy", mark=1000)
     tg = _FakeTg(range(1, 1251), limit=100)
-    assert run(url_id, tg) == (250, 0)
+    assert run(url_id, tg) == (250, 0, None)
     assert _stored_ids(crawler.db, url_id) == list(range(1001, 1251))
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 1250
     # Each batch resumes from the previous batch's highest id.
@@ -172,7 +174,7 @@ def test_poll_moves_past_a_run_of_service_messages(poll):
     url_id = _channel(crawler.db, "joins", mark=100)
     # A join wave: 101..200 fill a whole batch and are all filtered out.
     tg = _FakeTg([201, 202], limit=100, service=range(101, 201))
-    assert run(url_id, tg) == (2, 0)
+    assert run(url_id, tg) == (2, 0, None)
     assert _stored_ids(crawler.db, url_id) == [201, 202]
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 202
     assert tg.calls == [100, 200]
@@ -202,7 +204,7 @@ def test_poll_without_read_counts_falls_back_to_the_messages(poll):
     tg = _FakeTg(range(1, 31), limit=100)
     tg.fetch_new_messages = lambda *a, **kw: [_msg(i, "x") for i in (11, 12)]
     del tg.last_fetch_count, tg.last_fetch_max_id
-    assert run(url_id, tg) == (2, 0)
+    assert run(url_id, tg) == (2, 0, None)
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 12
 
 
@@ -342,7 +344,7 @@ def test_scrape_that_misses_the_mark_leaves_it_for_polling(
     monkeypatch.setattr(web, "_monitor_stop", threading.Event())
     monkeypatch.setattr(web.random, "uniform", lambda a, b: 0)
     # It fetches 51..200 again; the scraped half is not stored twice.
-    assert web._monitor_tg_channel(url_id) == (150, 0)
+    assert web._monitor_tg_channel(url_id) == (150, 0, None)
     assert _count(crawler.db, "SELECT COUNT(*) FROM tg_messages") == 150
     assert _stored_ids(crawler.db, url_id) == list(range(51, 201))
     assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 200
@@ -477,3 +479,228 @@ def test_channel_rescan_only_adds_findings(tmp_path):
         "SELECT rule_name, occurrence_count FROM findings")) == rows
     assert [a["rule_name"] for a in crawler.alerts[alerts_before:]] == \
         ["new_rule"]
+
+
+# ── Failures are not "no results" ───────────────────────────────────────────
+
+class _FailingTg(_FakeTg):
+    """_FakeTg whose fetch number `fail_on` (1-based) fails like the real
+    one on a flood wait: returns [] with last_fetch_error set."""
+    def __init__(self, ids, fail_on, error="flood wait: 30s", **kw):
+        super().__init__(ids, **kw)
+        self.fail_on, self.error = fail_on, error
+
+    def fetch_new_messages(self, *a, **kw):
+        self.last_fetch_error = None
+        if len(self.calls) + 1 == self.fail_on:
+            self.calls.append(kw.get("since_msg_id"))
+            self.last_fetch_error = self.error
+            self.last_fetch_count = self.last_fetch_max_id = 0
+            return []
+        return super().fetch_new_messages(*a, **kw)
+
+
+def _events(db, url_id):
+    return [dict(zip(("status", "pages", "note"), r)) for r in db.conn.execute(
+        "SELECT status, pages, note FROM monitor_events WHERE url_id = ? "
+        "ORDER BY id", (url_id,))]
+
+
+def _url_status(db, url_id):
+    return _count(db, "SELECT COALESCE(status, 0) FROM urls WHERE id = ?", url_id)
+
+
+def test_monitor_flood_wait_is_a_failed_check_with_the_reason(poll, web, monkeypatch):
+    crawler, run = poll
+    url_id = _channel(crawler.db, "limited", mark=10)
+    monkeypatch.setattr(web, "_tg", _FailingTg(range(1, 31), fail_on=1))
+    web._monitor_one(url_id, "tg://limited")
+    assert _events(crawler.db, url_id) == [
+        {"status": 0, "pages": 0, "note": "flood wait: 30s"}]
+    assert _url_status(crawler.db, url_id) == 0
+    assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 10
+
+
+def test_monitor_quiet_channel_is_204_and_leaves_url_status(poll, web, monkeypatch):
+    crawler, run = poll
+    url_id = _channel(crawler.db, "quiet", mark=30)
+    monkeypatch.setattr(web, "_tg", _FakeTg(range(1, 31)))
+    web._monitor_one(url_id, "tg://quiet")
+    assert _events(crawler.db, url_id) == [
+        {"status": 204, "pages": 0, "note": "no new messages"}]
+    # urls.status keeps its 200-or-0 meaning; 204 is for the timeline only.
+    assert _url_status(crawler.db, url_id) == 0
+
+
+def test_monitor_with_new_messages_is_200(poll, web, monkeypatch):
+    crawler, run = poll
+    url_id = _channel(crawler.db, "busy2", mark=20)
+    monkeypatch.setattr(web, "_tg", _FakeTg(range(1, 31)))
+    web._monitor_one(url_id, "tg://busy2")
+    assert _events(crawler.db, url_id) == [
+        {"status": 200, "pages": 10, "note": None}]
+    assert _url_status(crawler.db, url_id) == 200
+
+
+def test_monitor_flood_wait_mid_catch_up_keeps_the_first_batch(poll):
+    crawler, run = poll
+    url_id = _channel(crawler.db, "half", mark=1000)
+    tg = _FailingTg(range(1, 1251), fail_on=2, limit=100)
+    assert run(url_id, tg) == (100, 0, "flood wait: 30s")
+    assert crawler.db.get_tg_channel(url_id)["tg_last_msg_id"] == 1100
+
+
+def test_scrape_flood_wait_on_batch_two_warns_partial(scrape):
+    crawler, run = scrape
+    url_id = _channel(crawler.db, "deep")
+    body = run(url_id, _FailingTg(range(1, 2001), fail_on=2), 1000)
+    assert body["fetched"] == 500
+    assert "partial scrape" in body["warning"]
+    assert "flood wait: 30s" in body["warning"]
+
+
+def test_scrape_that_finishes_has_no_warning(scrape):
+    crawler, run = scrape
+    url_id = _channel(crawler.db, "whole")
+    body = run(url_id, _FakeTg(range(1, 2001)), 1000)
+    assert body["fetched"] == 1000
+    assert "warning" not in body
+
+
+def test_scrape_flood_wait_on_batch_one_names_it(scrape):
+    crawler, run = scrape
+    url_id = _channel(crawler.db, "none")
+    body = run(url_id, _FailingTg(range(1, 201), fail_on=1), 100)
+    assert body["fetched"] == 0
+    assert body["warning"] == "no messages returned — flood wait: 30s"
+
+
+class _SearchTg:
+    """DarkMTProto search surface: channels in `failing` fail with a
+    flood wait (last_search_error set, [] returned), others return one
+    hit."""
+    def __init__(self, failing=(), authenticated=True, configured=True):
+        self.failing = set(failing)
+        self.authenticated = authenticated
+        self._configured = configured
+        self.last_search_error = None
+        self.searched = []
+
+    def configured(self):
+        return self._configured
+
+    def status(self):
+        return {"authenticated": self.authenticated}
+
+    def set_mode(self, mode):
+        return 50
+
+    def _spend(self, n=1):
+        return True
+
+    def budget_remaining(self):
+        return 50
+
+    extract_channel_mentions = staticmethod(lambda text: set())
+
+    def search_in_channel(self, channel_id, q, limit=50, min_date_iso=None,
+                          username=None):
+        self.searched.append(username)
+        if username in self.failing:
+            self.last_search_error = "flood wait: 30s"
+            return []
+        self.last_search_error = None
+        return [{"channel_id": channel_id, "msg_id": 1, "text": q,
+                 "exact_match": True, "date_iso": "2026-11-01T00:00:00"}]
+
+
+@pytest.fixture
+def search(web, tmp_path, monkeypatch):
+    crawler = _crawler(tmp_path)
+    monkeypatch.setattr(web, "_crawler", crawler)
+
+    def get(tg, path):
+        monkeypatch.setattr(web, "_tg", tg)
+        r = web.app.test_client().get(path, base_url="http://127.0.0.1:8080")
+        assert r.status_code == 200, r.data
+        return r
+    return crawler, get
+
+
+def _deep_done(resp):
+    frames = resp.get_data(as_text=True).strip().split("\n\n")
+    for f in frames:
+        event, data = f.split("\n", 1)
+        if event == "event: done":
+            return json.loads(data[len("data: "):])
+    raise AssertionError("no done event")
+
+
+def test_search_all_reports_failed_channels(search):
+    crawler, get = search
+    ok, bad = _channel(crawler.db, "okchan"), _channel(crawler.db, "badchan")
+    body = get(_SearchTg(failing={"badchan"}),
+               "/api/telegram/search?q=leak&scope=all").get_json()
+    assert body["hits"] == 1
+    assert body["errors"] == [{"channel": "badchan", "url_id": bad,
+                               "error": "flood wait: 30s"}]
+
+
+def test_search_channel_reports_its_failure(search):
+    crawler, get = search
+    url_id = _channel(crawler.db, "badchan")
+    body = get(_SearchTg(failing={"badchan"}),
+               f"/api/telegram/search?q=leak&scope=channel&channel_id={url_id}"
+               ).get_json()
+    assert body["hits"] == 0
+    assert body["errors"][0]["error"] == "flood wait: 30s"
+
+
+def test_search_without_failures_has_no_errors_key(search):
+    crawler, get = search
+    url_id = _channel(crawler.db, "okchan")
+    for q in ("scope=all",
+              f"scope=channel&channel_id={url_id}"):
+        body = get(_SearchTg(), f"/api/telegram/search?q=leak&{q}").get_json()
+        assert body["hits"] == 1 and "errors" not in body
+
+
+def test_deep_search_marks_failed_channels(search):
+    crawler, get = search
+    _channel(crawler.db, "okchan")
+    bad = _channel(crawler.db, "badchan")
+    done = _deep_done(get(_SearchTg(failing={"badchan"}),
+                          "/api/telegram/search/deep?q=leak&max_hops=0"))
+    status = {d["handle"]: d["status"] for d in done["discovered"]}
+    assert status == {"okchan": "searched", "badchan": "error"}
+    assert done["errors"] == [{"channel": "badchan", "url_id": bad,
+                               "error": "flood wait: 30s"}]
+
+
+def test_deep_search_without_failures_has_no_errors_key(search):
+    crawler, get = search
+    _channel(crawler.db, "okchan")
+    done = _deep_done(get(_SearchTg(),
+                          "/api/telegram/search/deep?q=leak&max_hops=0"))
+    assert done["total_hits"] == 1 and "errors" not in done
+
+
+def test_deep_search_skips_live_stages_when_not_signed_in(search):
+    crawler, get = search
+    _channel(crawler.db, "okchan")
+    tg = _SearchTg(authenticated=False)
+    done = _deep_done(get(tg, "/api/telegram/search/deep?q=leak&max_hops=0"))
+    assert tg.searched == []
+    # A cached failed sign-in check may be a tunnel blip, so the note
+    # must not claim the login expired.
+    assert done["note"] == ("skipped live stages — Telegram session not "
+                            "signed in or unreachable (see Telegram tab)")
+
+
+def test_deep_search_skips_live_stages_when_not_configured(search):
+    crawler, get = search
+    _channel(crawler.db, "okchan")
+    tg = _SearchTg(configured=False)
+    done = _deep_done(get(tg, "/api/telegram/search/deep?q=leak&max_hops=0"))
+    assert tg.searched == []
+    assert done["note"] == "skipped live stages — Telegram not configured"

@@ -78,6 +78,27 @@
   deleted stay, rows it matches again keep their `occurrence_count` and
   `last_seen_at`, its `findings` count is the number of new rows, and only
   new rows alert.
+- Telegram failures no longer show as "no results":
+  - A monitor check whose fetch fails (flood wait, expired session, a
+    network error) records a timeline event with status 0 and the reason as
+    its note. A check that ran and found nothing records status 204 with
+    "no new messages", shown as a grey "idle" in the timeline. The URL's own
+    `status` is unchanged (200 when messages came in, 0 otherwise).
+  - A manual scrape that fails after the first batch returns a `warning`
+    ("partial scrape: N message(s) fetched, then stopped — <reason>"); what
+    it fetched is stored.
+  - `/api/telegram/search` (`channel` and `all` scopes) and the deep search
+    return an `errors` list (`channel`, `url_id`, `error`) when a channel
+    search failed, and leave it out otherwise; the deep search marks such a
+    channel `status: "error"`. The dashboard shows them.
+  - The deep search runs its live stages only when Telegram is configured
+    and signed in; before, a configured but signed-out session searched
+    every channel and reported 0 hits. Its note says which check failed:
+    "Telegram not configured", or "Telegram session not signed in or
+    unreachable" (the sign-in check also fails while the tunnel is down).
+  - The scraper's error fields (`last_fetch_error` and the new
+    `last_search_error`) are read under the Telegram lock, so another
+    Telegram call cannot clear them before the response is built.
 
 ### Internal
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
@@ -162,11 +183,11 @@
   passed through). The dashboard test fixture no longer leaks
   `DARKWATCH_CONFIG` and `DARKWATCH_BIND_IP` into later test modules.
 - New `darkwatch/tests/test_tg_ingest.py` covers the Telegram cursor,
-  catch-up cap, service messages, manual scrape, live listener, reposts and
-  per-channel rescan. The dashboard test fixture moved to
-  `darkwatch/tests/conftest.py` and is session-scoped, so test modules
-  share the one import of `web`; it still sets its environment only around
-  that import.
+  catch-up cap, service messages, manual scrape, live listener, reposts,
+  per-channel rescan, and how fetch and search failures are reported.
+  The dashboard test fixture moved to `darkwatch/tests/conftest.py` and is
+  session-scoped, so test modules share the one import of `web`; it still
+  sets its environment only around that import.
 
 ## v0.3.1 — 2026-11-04
 
