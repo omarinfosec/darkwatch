@@ -207,7 +207,7 @@ open http://$DARKWATCH_BIND_IP:8082/?token=<SETUP_AUTH_TOKEN>
 sudo docker compose --profile setup stop setup
 ```
 
-The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research path)**, **Tunnel 2 (Telegram research path)** — pre-populated with whatever's already configured. Each Save validates inputs and restarts the affected services. There's also a **Settings ↗** link in the main DarkWatch dashboard navigation that opens the Setup UI in a new tab.
+The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research path)**, **Tunnel 2 (Telegram research path)** — pre-populated with whatever's already configured. Each Save validates inputs and recreates the affected services from the current env file. The Setup UI never builds images: if Tunnel 1 is saved before `deploy.sh` has built the tor image, the config is kept and the UI asks you to run `sudo ./ops/deploy.sh`. There's also a **Settings ↗** link in the main DarkWatch dashboard navigation that opens the Setup UI in a new tab.
 
 ## Day-to-day operations
 

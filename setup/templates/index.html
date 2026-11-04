@@ -105,6 +105,9 @@
         <code>[Interface]</code> with a <code>PrivateKey</code> and a
         <code>DNS</code> line, and <code>[Peer]</code> with a <code>PublicKey</code> + <code>Endpoint</code>.
         Saving restarts <code>tunnel1</code> + <code>tor</code> + <code>darkwatch</code>.
+        The <code>tor</code> image is built by <code>sudo ./ops/deploy.sh</code>, not here;
+        if it hasn't been built yet, the config is still saved and you run
+        <code>deploy.sh</code> on the VM to start Tunnel 1.
       </p>
       <form id="tunnel1-form" autocomplete="off">
         <label>
@@ -241,6 +244,8 @@ PersistentKeepalive = 25"
             const msg = data.error || (data.errors || []).join("; ") || "unknown error";
             out.textContent = "✗ " + msg;
             out.className = "result err";
+            // e.g. 409 tor image not built: the config was still written.
+            if (data.saved) setTimeout(refreshState, 800);
           }
         } catch (err) {
           out.textContent = "✗ network error: " + err.message;

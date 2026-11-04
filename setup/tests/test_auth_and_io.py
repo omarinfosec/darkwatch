@@ -155,3 +155,119 @@ def test_telegram_validation_uses_authenticated_proxy(client, tmp_path, monkeypa
                     headers={"Authorization": f"Bearer {TOKEN}"})
     assert r.status_code == 200, r.text
     assert called == [("socks5", "tunnel2", 1080, True, "darkwatch", "pw123")]
+
+
+class _FakeRun:
+    """Stands in for subprocess.run; records each call's argv and env."""
+
+    def __init__(self, inspect_rc=0, inspect_stderr=""):
+        self.inspect_rc = inspect_rc
+        self.inspect_stderr = inspect_stderr
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append((list(cmd), kwargs.get("env")))
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            return main.subprocess.CompletedProcess(
+                cmd, self.inspect_rc, stdout="", stderr=self.inspect_stderr)
+        return main.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+@pytest.fixture
+def compose_tree(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"; repo.mkdir()
+    (repo / "docker-compose.yml").write_text("services: {}\n")
+    env = tmp_path / "env"; env.write_text(f"SETUP_AUTH_TOKEN={TOKEN}\n")
+    secrets = tmp_path / "secrets"
+    monkeypatch.setattr(main, "REPO_ROOT", repo)
+    monkeypatch.setattr(main, "ENV_FILE", env)
+    monkeypatch.setattr(main, "TUNNEL1_CONF", secrets / "tunnel1" / "wg_confs" / "wg0.conf")
+    monkeypatch.setattr(main, "TUNNEL2_CONF", secrets / "tunnel2" / "wg_confs" / "wg0.conf")
+    return tmp_path
+
+
+def test_compose_env_drops_stale_container_env(compose_tree, monkeypatch):
+    # setup's process env holds env-file values from when it was created;
+    # compose would prefer them over the live --env-file.
+    for key in ("TG_SOCKS_PASSWORD", "DARKWATCH_IP", "DARKNET_SUBNET",
+                "DARKWATCH_BIND_IP", "TOR_CONTROL_PASSWORD", "TELEGRAM_API_HASH"):
+        monkeypatch.setenv(key, "stale")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("https_proxy", "http://proxy:3128")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    fake = _FakeRun()
+    monkeypatch.setattr(main.subprocess, "run", fake)
+
+    assert main._recreate_darkwatch() == (True, "darkwatch")
+    (cmd, env), = fake.calls
+    assert cmd[:2] == ["docker", "compose"]
+    for key in ("TG_SOCKS_PASSWORD", "DARKWATCH_IP", "DARKNET_SUBNET",
+                "DARKWATCH_BIND_IP", "TOR_CONTROL_PASSWORD", "TELEGRAM_API_HASH",
+                "SETUP_AUTH_TOKEN"):
+        assert key not in env
+    assert env["PATH"] == os.environ["PATH"]
+    assert env["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    assert env["https_proxy"] == "http://proxy:3128"
+    assert env["LC_ALL"] == "C.UTF-8"
+    assert env["DARKWEBAPP_DATA_ROOT"] == str(main.HOST_DATA_ROOT)
+    assert env["DARKWATCH_HOST_REPO_ROOT"] == str(main.HOST_REPO_ROOT)
+
+
+def test_tunnel1_save_without_tor_image_is_409_and_saved(client, compose_tree, monkeypatch):
+    monkeypatch.setenv("TG_SOCKS_PASSWORD", "stale")
+    fake = _FakeRun(inspect_rc=1, inspect_stderr=(
+        f"Error response from daemon: No such image: {main.TOR_IMAGE}\n"))
+    monkeypatch.setattr(main.subprocess, "run", fake)
+    r = client.post("/api/tunnel/1", data={"conf": VALID_WG},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["ok"] is False and body["saved"] is True
+    assert "sudo ./ops/deploy.sh" in body["error"]
+    assert main.TUNNEL1_CONF.read_text() == VALID_WG
+    # Only the inspect ran (with the filtered env); compose never started.
+    (cmd, env), = fake.calls
+    assert cmd == ["docker", "image", "inspect", main.TOR_IMAGE]
+    assert "TG_SOCKS_PASSWORD" not in env
+
+
+@pytest.mark.parametrize("stderr", [
+    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+    "Is the docker daemon running?\n",
+    "permission denied while trying to connect to the Docker daemon socket "
+    "at unix:///var/run/docker.sock\n",
+])
+def test_tunnel1_inspect_daemon_error_still_runs_compose(client, compose_tree,
+                                                        monkeypatch, stderr):
+    # Only "no such image" means the image is missing; a daemon error must
+    # reach compose so its real error is shown, not "run deploy.sh".
+    fake = _FakeRun(inspect_rc=1, inspect_stderr=stderr)
+    monkeypatch.setattr(main.subprocess, "run", fake)
+    r = client.post("/api/tunnel/1", data={"conf": VALID_WG},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200, r.text
+    compose = [cmd for cmd, _ in fake.calls if cmd[:2] == ["docker", "compose"]]
+    assert compose and compose[0][-2:] == ["tunnel1", "tor"]
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_tunnel_save_recreates_with_no_build(client, compose_tree, monkeypatch, n):
+    fake = _FakeRun()
+    monkeypatch.setattr(main.subprocess, "run", fake)
+    r = client.post(f"/api/tunnel/{n}", data={"conf": VALID_WG},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200, r.text
+    compose = [cmd for cmd, _ in fake.calls if cmd[:2] == ["docker", "compose"]]
+    assert len(compose) == 2
+    assert all("--no-build" in cmd for cmd in compose)
+    sidecar = "tor" if n == 1 else "tg-socks"
+    assert compose[0][-2:] == [f"tunnel{n}", sidecar]
+    inspects = [cmd for cmd, _ in fake.calls if cmd[:3] == ["docker", "image", "inspect"]]
+    assert inspects == ([["docker", "image", "inspect", main.TOR_IMAGE]] if n == 1 else [])
+
+
+def test_tor_image_name_matches_compose():
+    compose = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "docker-compose.yml")
+    with open(compose) as f:
+        assert f"image: {main.TOR_IMAGE}\n" in f.read()

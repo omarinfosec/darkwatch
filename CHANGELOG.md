@@ -81,6 +81,14 @@
   so with the lockdown on the gate takes about 2 s.
   With `DARKWATCH_EGRESS_LOCKDOWN=0` it keeps the old, weaker comparison of
   the Tor exit IP with the direct IP.
+- Saves in the Setup UI recreate containers with the current env file. The
+  Setup UI passed its own environment, loaded from the env file when the
+  Setup UI was created, to `docker compose`, which prefers it over
+  `--env-file`. A save could then put darkwatch back on an old
+  `DARKWATCH_IP` outside the lockdown rule, or start tg-socks and tor with an
+  old `TG_SOCKS_PASSWORD` or `TOR_CONTROL_PASSWORD`. It now passes only
+  `PATH`, `HOME`, locale, `TZ`, `TMPDIR`, `DOCKER_*`, the proxy variables and
+  its host paths.
 
 ### Fixed
 - `verify-egress.sh` checks that are real:
@@ -159,6 +167,11 @@
   daemon that enables IPv6 by default can't give darkwatch a route around the
   IPv4 lockdown rule. `egress-lockdown.sh` and `--status` warn when the
   network has IPv6 anyway.
+- Saving Tunnel 1 in the Setup UI before the tor image exists returns 409
+  with "the config is saved, run sudo ./ops/deploy.sh" instead of a compose
+  build error. Tunnel saves run `docker compose up --no-build`, since the
+  Setup UI cannot build images. Other image check failures, such as an
+  unreachable Docker daemon, still show the compose error.
 
 ### Internal
 - `tests/killswitch` fails when the kill switch script fails (it ignored the
