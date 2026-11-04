@@ -100,6 +100,21 @@
     `last_search_error`) are read under the Telegram lock, so another
     Telegram call cannot clear them before the response is built.
 
+- Telegram monitoring no longer waits for crawls or for Tor. Monitored
+  channels were checked by the `.onion` scheduler, so they were skipped
+  while a manual scan ran, while a site crawl was in progress and whenever
+  Tor or Tunnel 1 was down, even though Telegram goes through Tunnel 2. A
+  separate scheduler thread (`TelegramMonitor`) now checks them every
+  30 seconds like the `.onion` one. It checks only that the route
+  Telegram uses is up: Tor's SOCKS port with `telegram.use_tor`, the
+  `tg-socks` sidecar otherwise, nothing with `telegram.allow_direct` and
+  no `telegram.proxy_host`; it skips the check while Telegram is not
+  configured. The `.onion` scheduler works as before for everything else.
+  A check's 0-15 s random pre-fetch delay no longer holds the Telegram
+  lock, so it does not hold up a sign-in, search or scrape, and the
+  channel's cursor is read after the delay, so a scrape during the delay
+  is taken into account.
+
 ### Internal
 - New CI workflow `images` (`.github/workflows/images.yml`) builds the
   darkwatch, setup and tor images and smoke-tests them with the new

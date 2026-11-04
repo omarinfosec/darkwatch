@@ -1228,14 +1228,23 @@ class Database:
                  next_check_at, url_id))
             self.conn.commit()
 
-    def get_monitored_due(self, now_iso):
-        """Return all monitored URLs whose next_check_at is in the past."""
+    def get_monitored_due(self, now_iso, source=None, exclude_source=None):
+        """Return monitored URLs whose next_check_at is in the past.
+        `source` keeps only rows of that source; `exclude_source` drops
+        them (the .onion scheduler passes exclude_source="telegram", the
+        Telegram one source="telegram")."""
+        sql = ("SELECT id, url, monitor_interval_min "
+               "FROM urls WHERE monitored = 1 "
+               "AND (next_check_at IS NULL OR next_check_at <= ?)")
+        params = [now_iso]
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        if exclude_source is not None:
+            sql += " AND COALESCE(source, '') != ?"
+            params.append(exclude_source)
         with self.lock:
-            cur = self.conn.execute(
-                "SELECT id, url, monitor_interval_min "
-                "FROM urls WHERE monitored = 1 "
-                "AND (next_check_at IS NULL OR next_check_at <= ?)",
-                (now_iso,))
+            cur = self.conn.execute(sql, params)
             return [{"id": r[0], "url": r[1], "interval_min": r[2]}
                     for r in cur.fetchall()]
 

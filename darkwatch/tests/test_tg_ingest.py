@@ -1,8 +1,9 @@
 """Telegram ingest completeness: the polling cursor walks forward without
 gaps, the live listener keeps media-only posts and does not move the
 cursor, each channel stores its own copy of a repost (alerting once), a
-per-channel rescan only adds findings, and failed fetches and searches are
-reported as failures instead of "nothing new"."""
+per-channel rescan only adds findings, failed fetches and searches are
+reported as failures instead of "nothing new", and Telegram channels are
+checked by their own scheduler, gated on their own egress."""
 
 import asyncio
 import json
@@ -704,3 +705,183 @@ def test_deep_search_skips_live_stages_when_not_configured(search):
     done = _deep_done(get(tg, "/api/telegram/search/deep?q=leak&max_hops=0"))
     assert tg.searched == []
     assert done["note"] == "skipped live stages — Telegram not configured"
+
+
+# ── Telegram scheduler ──────────────────────────────────────────────────────
+
+class _MonitorTg(_FakeTg):
+    """_FakeTg as the Telegram scheduler sees it: configured or not, over
+    Tor or over Tunnel 2, and recording whether _tg_lock was held at
+    each fetch."""
+    def __init__(self, ids, web, configured=True, use_tor=False,
+                 proxy_host="tunnel2", allow_direct=False, **kw):
+        super().__init__(ids, **kw)
+        self.web, self._configured, self.use_tor = web, configured, use_tor
+        self.proxy_host = proxy_host
+        self.config = {"telegram": {"allow_direct": allow_direct}}
+        self.locked_at_fetch = []
+
+    def configured(self):
+        return self._configured
+
+    def fetch_new_messages(self, *a, **kw):
+        self.locked_at_fetch.append(self.web._tg_lock.locked())
+        return super().fetch_new_messages(*a, **kw)
+
+
+def _up(detail="up"):
+    return {"ok": True, "detail": detail}
+
+
+def _down(detail="down"):
+    return {"ok": False, "detail": detail}
+
+
+@pytest.fixture
+def tick(web, tmp_path, monkeypatch):
+    """One Telegram scheduler tick over a monitored channel @watched
+    (mark 10, ids 1..30) and a monitored .onion URL, both due. Tor and
+    Tunnel 2 are up unless the test says otherwise."""
+    crawler = _crawler(tmp_path)
+    monkeypatch.setattr(web, "_crawler", crawler)
+    monkeypatch.setattr(web, "_monitor_stop", threading.Event())
+    monkeypatch.setattr(web.random, "uniform", lambda a, b: 0)
+    monkeypatch.setattr(web, "_check_tor_alive", _up)
+    monkeypatch.setattr(web, "_check_tg_vpn", _up)
+    url_id = _channel(crawler.db, "watched", mark=10)
+    crawler.db.set_monitor(url_id, True, 60)
+    crawler.db.add_url("http://onionsite.onion", source="manual")
+    onion_id = _count(crawler.db, "SELECT id FROM urls WHERE url = ?",
+                      "http://onionsite.onion")
+    crawler.db.set_monitor(onion_id, True, 60)
+
+    def run(tg):
+        monkeypatch.setattr(web, "_tg", tg)
+        return web._tg_monitor_tick()
+    return crawler, url_id, onion_id, run
+
+
+def _next_check(db, url_id):
+    return db.conn.execute("SELECT next_check_at FROM urls WHERE id = ?",
+                           (url_id,)).fetchone()[0]
+
+
+def test_monitored_due_filters_by_source(tmp_path):
+    db = Database(str(tmp_path / "dw.db"))
+    tg_id = _channel(db, "chan")
+    db.add_url("http://a.onion")
+    onion_id = _count(db, "SELECT id FROM urls WHERE url = 'http://a.onion'")
+    for i in (tg_id, onion_id):
+        db.set_monitor(i, True, 60)
+    now = "2999-01-01T00:00:00"
+
+    def ids(**kw):
+        return sorted(u["id"] for u in db.get_monitored_due(now, **kw))
+    assert ids() == sorted([tg_id, onion_id])
+    assert ids(source="telegram") == [tg_id]
+    assert ids(exclude_source="telegram") == [onion_id]
+
+
+def test_tg_tick_runs_during_a_manual_scan_with_tor_down(tick, web, monkeypatch):
+    crawler, url_id, onion_id, run = tick
+    # A manual scan owns the crawler and Tor is down: the .onion
+    # scheduler would skip, Telegram over Tunnel 2 must not.
+    hold = threading.Event()
+    scan = threading.Thread(target=hold.wait, daemon=True)
+    scan.start()
+    monkeypatch.setattr(web, "_scan_thread", scan)
+    monkeypatch.setattr(web, "_check_tor_alive", _down)
+    try:
+        tg = _MonitorTg(range(1, 31), web, use_tor=False)
+        assert run(tg) == 1
+    finally:
+        hold.set()
+    assert tg.calls == [10]
+    assert _stored_ids(crawler.db, url_id) == list(range(11, 31))
+    assert _events(crawler.db, url_id) == [
+        {"status": 200, "pages": 20, "note": None}]
+    assert _next_check(crawler.db, url_id) is not None
+    # The .onion row is not the Telegram scheduler's.
+    assert _events(crawler.db, onion_id) == []
+    assert _next_check(crawler.db, onion_id) is None
+
+
+@pytest.mark.parametrize("use_tor,tor,tg_vpn", [
+    (True, _down, _up),     # over Tor: Tunnel 2 being up does not count
+    (False, _up, _down),    # over Tunnel 2: Tor being up does not count
+])
+def test_tg_tick_skips_when_its_egress_is_down(tick, web, monkeypatch,
+                                               use_tor, tor, tg_vpn):
+    crawler, url_id, onion_id, run = tick
+    monkeypatch.setattr(web, "_check_tor_alive", tor)
+    monkeypatch.setattr(web, "_check_tg_vpn", tg_vpn)
+    tg = _MonitorTg(range(1, 31), web, use_tor=use_tor)
+    assert run(tg) == 0
+    assert tg.calls == []
+    assert _events(crawler.db, url_id) == []
+    assert _next_check(crawler.db, url_id) is None
+
+
+@pytest.mark.parametrize("proxy_host,allow_direct,checked", [
+    ("", True, 1),          # direct by opt-in: nothing to probe
+    ("", False, 0),         # no route at all: the client would refuse
+    ("tunnel2", True, 0),   # a proxy is set, so it is still what counts
+])
+def test_tg_tick_with_allow_direct_does_not_need_tunnel2(
+        tick, web, monkeypatch, proxy_host, allow_direct, checked):
+    crawler, url_id, onion_id, run = tick
+    monkeypatch.setattr(web, "_check_tg_vpn", _down)
+    tg = _MonitorTg(range(1, 31), web, proxy_host=proxy_host,
+                    allow_direct=allow_direct)
+    assert run(tg) == checked
+    assert tg.calls == ([10] if checked else [])
+    assert (_next_check(crawler.db, url_id) is not None) == bool(checked)
+
+
+def test_tg_tick_skips_when_telegram_is_not_configured(tick, web, monkeypatch):
+    crawler, url_id, onion_id, run = tick
+    probed = []
+    monkeypatch.setattr(web, "_check_tg_vpn",
+                        lambda: probed.append(1) or _up())
+    tg = _MonitorTg(range(1, 31), web, configured=False)
+    assert run(tg) == 0
+    assert tg.calls == [] and probed == []
+    assert _next_check(crawler.db, url_id) is None
+
+
+def test_tg_lock_is_free_during_the_jitter(tick, web, monkeypatch):
+    crawler, url_id, onion_id, run = tick
+    monkeypatch.setattr(web.random, "uniform", lambda a, b: 5)
+    seen = []
+
+    class _Stop(threading.Event):
+        def wait(self, timeout=None):
+            seen.append(web._tg_lock.locked())
+            # A scrape during the delay raises the mark; the fetch after
+            # it must read the new one.
+            crawler.db.update_tg_last_msg_id(url_id, 25)
+            return False
+    monkeypatch.setattr(web, "_monitor_stop", _Stop())
+    tg = _MonitorTg(range(1, 31), web)
+    assert run(tg) == 1
+    assert seen == [False]
+    assert tg.locked_at_fetch == [True]
+    assert tg.calls == [25]
+    assert _stored_ids(crawler.db, url_id) == list(range(26, 31))
+
+
+def test_onion_scheduler_leaves_telegram_rows_alone(tick, web, monkeypatch):
+    crawler, url_id, onion_id, run = tick
+    checked = []
+    monkeypatch.setattr(web, "_monitor_one",
+                        lambda i, url: checked.append(i))
+    monkeypatch.setattr(web, "_maybe_auto_rescan", lambda: None)
+    monkeypatch.setattr(web, "_quick_health", lambda: {"secure": True})
+
+    class _OneTick(threading.Event):
+        def wait(self, timeout=None):
+            self.set()
+            return True
+    monkeypatch.setattr(web, "_monitor_stop", _OneTick())
+    web._monitor_loop()
+    assert checked == [onion_id]

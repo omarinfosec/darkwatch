@@ -33,4 +33,11 @@ def web(tmp_path_factory):
         mp.setenv("DARKWATCH_CONFIG", str(d / "config.json"))
         mp.setenv("DARKWATCH_BIND_IP", "10.8.0.5")
         import web as web_mod
+    # The import starts the monitor schedulers. Stop them: tests swap
+    # web._crawler and web._tg for fakes, and a background tick would use
+    # those fakes at the same time as the test does.
+    web_mod._monitor_stop.set()
+    for t in (web_mod._monitor_thread, web_mod._tg_monitor_thread):
+        if t is not None:
+            t.join(timeout=10)
     yield web_mod

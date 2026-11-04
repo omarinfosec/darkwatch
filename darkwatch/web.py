@@ -192,12 +192,15 @@ def _start_health_refresh_thread():
         target=_health_refresh_loop, name="health-refresh", daemon=True)
     _health_refresh_thread.start()
 
-# Monitoring scheduler — single background thread, ticks every MONITOR_TICK
-# seconds. Per-URL interval is stored on the urls table; the scheduler
+# Monitoring schedulers — one background thread for .onion URLs and one for
+# Telegram channels, each ticking every MONITOR_TICK seconds. Separate so a
+# manual scan or a Tor outage does not hold up Telegram (which has its own
+# tunnel and lock). Per-URL interval is stored on the urls table; the scheduler
 # applies a ±MONITOR_JITTER fraction of randomness when scheduling the
 # next check, so the operator's polling pattern can't be fingerprinted by
 # the target site.
 _monitor_thread = None
+_tg_monitor_thread = None   # Telegram channels: own scheduler, own gate
 _monitor_stop = threading.Event()
 MONITOR_TICK = 30          # seconds between scheduler wake-ups
 MONITOR_JITTER = 0.25      # fraction (±25% of interval)
@@ -671,20 +674,17 @@ def _next_check_at(interval_min):
 
 def _monitor_tg_channel(url_id):
     """Incremental Telegram channel scrape: pull messages newer than
-    tg_last_msg_id and scan each. Runs under _tg_lock (caller), so the
-    scraper's last_fetch_error read here belongs to this fetch.
-    Returns (fetched, findings, error): error is the reason the check
-    failed or stopped short, None when it ran to the end.
-
-    Catches up in batches of scrape_limit, oldest first, saving the
-    high-water mark after each batch, so a channel that posted more than
-    one batch since the last check loses nothing. At most
-    TG_CATCHUP_BATCHES per check; the rest follows on the next check.
+    tg_last_msg_id and scan each. Returns (fetched, findings, error):
+    error is the reason the check failed or stopped short, None when it
+    ran to the end.
 
     Adds a randomized 0-15 s pre-fetch delay on top of the scheduler's
     existing ±25% next_check_at jitter, so the scheduler wake-up time and
     the actual Telegram round-trip aren't perfectly correlated (harder to
-    fingerprint as an automated poll pattern)."""
+    fingerprint as an automated poll pattern). The delay waits outside
+    _tg_lock, so a login or search is not held up by it; the fetch takes
+    the lock and reads the channel's mark inside it, after the delay, so
+    a scrape that moved the mark meanwhile is seen."""
     info = _crawler.db.get_tg_channel(url_id)
     if not info:
         log.error(f"[monitor] tg channel {url_id} missing TG metadata")
@@ -697,6 +697,24 @@ def _monitor_tg_channel(url_id):
         # Operator stopped during jitter: nothing was fetched, so this
         # must not read as a quiet channel.
         return 0, 0, "stopped before the fetch"
+    with _tg_lock:
+        return _tg_catch_up(url_id)
+
+
+def _tg_catch_up(url_id):
+    """The fetch half of _monitor_tg_channel. Runs under _tg_lock
+    (caller), so the scraper's last_fetch_error read here belongs to this
+    fetch and the mark read here is current.
+
+    Catches up in batches of scrape_limit, oldest first, saving the
+    high-water mark after each batch, so a channel that posted more than
+    one batch since the last check loses nothing. At most
+    TG_CATCHUP_BATCHES per check; the rest follows on the next check."""
+    info = _crawler.db.get_tg_channel(url_id)
+    if not info:
+        # Deleted during the pre-fetch delay.
+        return 0, 0, "missing Telegram channel metadata"
+    username = info["tg_username"]
     log.info(f"[monitor] telegram @{username}")
     limit = _tg.scrape_limit
     saved = latest = info.get("tg_last_msg_id") or 0
@@ -757,9 +775,9 @@ def _monitor_one(url_id, url):
 
         if source == "telegram":
             # Separate path — scraper uses its own SOCKS tunnel; crawl_site
-            # (Tor + Playwright) isn't relevant here.
-            with _tg_lock:
-                pages, findings, error = _monitor_tg_channel(url_id)
+            # (Tor + Playwright) isn't relevant here. Takes _tg_lock
+            # itself, after its pre-fetch delay.
+            pages, findings, error = _monitor_tg_channel(url_id)
             # urls.status keeps its meaning (200 = got messages, 0 = not).
             # The event tells the two "0" cases apart: a failed fetch is
             # status 0 with the reason as the note, a quiet channel is
@@ -836,8 +854,10 @@ def _maybe_auto_rescan():
 
 
 def _monitor_loop():
-    """Background scheduler. Wakes every MONITOR_TICK seconds, runs any
-    URL whose next_check_at has passed, schedules the next check.
+    """Background scheduler for .onion URLs. Wakes every MONITOR_TICK
+    seconds, runs any URL whose next_check_at has passed, schedules the
+    next check. Telegram channels have their own scheduler
+    (_tg_monitor_loop).
 
     Skips ticks where:
       - A manual scan is running (don't fight for the crawler).
@@ -858,7 +878,8 @@ def _monitor_loop():
             # extra bookkeeping here.
             _maybe_auto_rescan()
 
-            due = _crawler.db.get_monitored_due(utcnow().isoformat())
+            due = _crawler.db.get_monitored_due(
+                utcnow().isoformat(), exclude_source="telegram")
             if due:
                 # Hard security gate — same posture as manual scans.
                 health = _quick_health()
@@ -880,13 +901,74 @@ def _monitor_loop():
     log.info("Monitor scheduler stopped")
 
 
+def _tg_monitor_gate():
+    """The egress the Telegram client dials must be up: Tor's SOCKS port
+    with telegram.use_tor, the tg-socks sidecar (Tunnel 2) otherwise.
+    With no proxy_host and telegram.allow_direct the client connects
+    directly, so there is nothing to probe. Returns (name, check result)."""
+    if _tg.use_tor:
+        return "tor", _check_tor_alive()
+    if (not _tg.proxy_host
+            and _tg.config.get("telegram", {}).get("allow_direct")):
+        return "direct", {"ok": True,
+                          "detail": "direct connection (telegram.allow_direct)"}
+    return "tg_vpn", _check_tg_vpn()
+
+
+def _tg_monitor_tick():
+    """One pass of the Telegram scheduler: check every monitored channel
+    whose next_check_at has passed, then schedule its next check.
+    Returns the number of channels checked.
+
+    Independent of the .onion scheduler: a manual scan or a long site
+    crawl does not hold it up, and Tor being down only matters when
+    Telegram goes through Tor. Skips the tick when Telegram is not
+    configured or its egress is down."""
+    if not _tg.configured():
+        return 0
+    due = _crawler.db.get_monitored_due(
+        utcnow().isoformat(), source="telegram")
+    if not due:
+        return 0
+    name, gate = _tg_monitor_gate()
+    if not gate.get("ok"):
+        log.warning(f"[monitor] {len(due)} Telegram channel(s) due but "
+                    f"{name} is down ({gate.get('detail')}) — skipping")
+        return 0
+    checked = 0
+    for u in due:
+        if _monitor_stop.is_set():
+            break
+        _monitor_one(u["id"], u["url"])
+        _crawler.db.schedule_next_check(
+            u["id"], _next_check_at(u["interval_min"]))
+        checked += 1
+    return checked
+
+
+def _tg_monitor_loop():
+    """Background scheduler for Telegram channels, ticking every
+    MONITOR_TICK seconds like _monitor_loop."""
+    log.info(f"Telegram monitor started (tick={MONITOR_TICK}s)")
+    while not _monitor_stop.is_set():
+        try:
+            _tg_monitor_tick()
+        except Exception as e:
+            log.error(f"[monitor] telegram loop error: {e}")
+        _monitor_stop.wait(MONITOR_TICK)
+    log.info("Telegram monitor stopped")
+
+
 def _start_monitor_thread():
-    global _monitor_thread
-    if _monitor_thread and _monitor_thread.is_alive():
-        return
-    _monitor_thread = threading.Thread(
-        target=_monitor_loop, name="MonitorScheduler", daemon=True)
-    _monitor_thread.start()
+    global _monitor_thread, _tg_monitor_thread
+    if not (_monitor_thread and _monitor_thread.is_alive()):
+        _monitor_thread = threading.Thread(
+            target=_monitor_loop, name="MonitorScheduler", daemon=True)
+        _monitor_thread.start()
+    if not (_tg_monitor_thread and _tg_monitor_thread.is_alive()):
+        _tg_monitor_thread = threading.Thread(
+            target=_tg_monitor_loop, name="TelegramMonitor", daemon=True)
+        _tg_monitor_thread.start()
 
 
 # ── Real-time live-listener wiring ─────────────────────────────────────────
