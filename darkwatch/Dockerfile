@@ -82,7 +82,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/.browsers
 RUN playwright install --with-deps firefox
 
-COPY darkwatch.py web.py threat_intel.py index.html config.json ./
+# Every top-level module, so a new one cannot be left out of the image
+# (tests/images/smoke.sh imports them).
+COPY *.py index.html config.json ./
 COPY --from=bundle /build/static/ ./static/
 COPY yara/ yara/
 

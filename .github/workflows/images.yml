@@ -1,0 +1,66 @@
+name: Images
+
+# Builds the darkwatch, setup and tor images and smoke-tests them
+# (tests/images/smoke.sh). Every pull request runs the job so the `images`
+# check always reports: a workflow-level `paths:` filter would leave a
+# required check pending forever on PRs that touch nothing it lists. Instead
+# the build is skipped when a PR changes no image input. The weekly run
+# catches breakage no commit causes (apt packages, PyPI, Playwright's
+# Firefox download).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"   # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2   # the PR merge commit and its base parent
+      - name: Did an image input change?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A pull_request checkout is the merge commit; its first parent is
+          # the base branch, so this diff is exactly what the PR changes.
+          # --no-renames lists both paths of a rename, so moving a file out
+          # of an image directory still triggers the build.
+          changed="$(git diff --name-only --no-renames HEAD^1 HEAD)"
+          printf '%s\n' "$changed"
+          if grep -qE '^(darkwatch|setup|tor|tests/images)/|^\.github/workflows/images\.yml$' <<<"$changed"; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No image input changed; skipping the build."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Same tags as docker-compose.yml, which smoke.sh uses by default.
+      - name: Build darkwatch
+        if: steps.changes.outputs.build == 'true'
+        run: docker build -t darkwatch:local darkwatch
+      - name: Build setup
+        if: steps.changes.outputs.build == 'true'
+        run: docker build -t darkwatch-setup:local setup
+      - name: Build tor
+        if: steps.changes.outputs.build == 'true'
+        run: docker build -t darkwatch-tor:local tor
+      - name: Smoke tests (offline containers)
+        if: steps.changes.outputs.build == 'true'
+        run: bash tests/images/smoke.sh

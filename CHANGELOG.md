@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Internal
+- New CI workflow `images` (`.github/workflows/images.yml`) builds the
+  darkwatch, setup and tor images and smoke-tests them with the new
+  `tests/images/smoke.sh`, every container under `--network none` and a
+  timeout: darkwatch imports `darkwatch`, `threat_intel` and `web` and takes
+  an offline screenshot (the test checks that the PNG and its thumbnail
+  exist and are non-empty, because a failed Firefox launch is only logged);
+  setup imports `main` and runs `docker compose version`; tor runs
+  `tor --version`. It runs on pushes to main, weekly, and on every pull
+  request, skipping the build when a PR changes nothing under `darkwatch/`,
+  `setup/`, `tor/` or `tests/images/` or `.github/workflows/images.yml`
+  (a rename counts under both its old and new path), so the `images` check
+  can be required. Run the smoke tests on a host after a build with
+  `sudo bash tests/images/smoke.sh`.
+- The darkwatch Dockerfile copies every top-level `*.py` module instead of a
+  fixed list, so a new module cannot be left out of the image.
+
 ## v0.3.1 — 2026-11-04
 
 Fix release. v0.3.0's deploy.sh stopped silently on default installs and

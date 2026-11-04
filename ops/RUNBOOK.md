@@ -78,6 +78,11 @@ sudo docker compose restart darkwatch
 ```bash
 sudo ./ops/deploy.sh   # builds darkwatch, tor and setup (skip with --skip-build)
 ```
+To check the built images without touching the running stack (offline
+imports, an offline screenshot, `tor --version`; the same tests CI runs):
+```bash
+sudo bash tests/images/smoke.sh
+```
 
 ### Stop everything
 ```bash
