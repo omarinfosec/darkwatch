@@ -52,6 +52,10 @@
 - The Setup UI rejects a WireGuard config without a `DNS =` line. Check that
   a hand-placed tunnel2 `wg0.conf` has one; `verify-egress.sh` warns when
   tunnel2 still resolves through Docker's embedded DNS.
+- The first start after upgrading adds three indexes on the `pages` table
+  (`content_hash`, `(url_id, scanned_at)`, `(url_id, page_url)`); this takes
+  about a second per 150k pages. They are not UNIQUE, so a rolled-back
+  release still runs against the database.
 
 ### Security
 - The tunnel kill switch also drops new connections that arrive through
@@ -172,6 +176,21 @@
   build error. Tunnel saves run `docker compose up --no-build`, since the
   Setup UI cannot build images. Other image check failures, such as an
   unreachable Docker daemon, still show the compose error.
+- A rescan (`/api/rescan`, the auto-rescan) no longer deletes findings. It
+  purged every finding on a page URL and re-derived them from each stored
+  snapshot's stripped text, so findings from older versions of a page and
+  from the raw-HTML pass (attributes, comments, `<meta>`) were lost for good.
+  A rescan now only adds findings: rows it matches again keep their
+  `occurrence_count` and `last_seen_at` (a raised rule score still raises
+  their score and severity, never lowers them), its `findings` count is
+  the number of new rows, and it never lowers a page's cached severity. Findings of
+  YARA rules that were deleted since are kept as well; delete them in the
+  dashboard if you no longer want them. Findings already lost to earlier
+  rescans cannot be recovered except from a backup.
+- The dashboard no longer freezes on large databases. `pages` had no
+  indexes, so `/api/urls`, the findings list and the dedup check run for
+  every scanned page and Telegram message each scanned the whole table
+  (`/api/urls` took 43 s at realistic Telegram volume; now under 200 ms).
 
 ### Internal
 - `tests/killswitch` fails when the kill switch script fails (it ignored the
@@ -190,6 +209,10 @@
 - New `tests/verify-egress/check.sh` runs `verify-egress.sh` against stubbed
   docker, iptables and curl in CI; new `tests/compose/check.sh` asserts in CI
   that darkwatch's `dns` is `127.0.0.1` and that no other service sets one.
+- `scan_tg_message` links the Telegram message to the page id `add_page`
+  returns instead of re-selecting it by content hash outside the database
+  lock. New `darkwatch/tests/test_db_integrity.py` checks the query plans
+  of the hot `pages` queries and the rescan behaviour.
 
 ## v0.3.0 — 2026-10-25
 

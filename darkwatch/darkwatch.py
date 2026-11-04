@@ -253,6 +253,18 @@ class Database:
                     scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (url_id) REFERENCES urls(id)
                 );
+                -- Lookup indexes for page_seen() (every scanned page and
+                -- Telegram message), the per-URL title/thumbnail subqueries
+                -- of /api/urls and the findings -> pages join. Without them
+                -- each is a full scan of `pages`. None is UNIQUE, so an
+                -- older release rolled back onto this database still
+                -- inserts its rows as before.
+                CREATE INDEX IF NOT EXISTS idx_pages_content_hash
+                    ON pages(content_hash);
+                CREATE INDEX IF NOT EXISTS idx_pages_url_scanned
+                    ON pages(url_id, scanned_at);
+                CREATE INDEX IF NOT EXISTS idx_pages_url_page
+                    ON pages(url_id, page_url);
                 CREATE TABLE IF NOT EXISTS findings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     url_id INTEGER,
@@ -542,13 +554,27 @@ class Database:
                 "WHERE id = ?", (screenshot_path, thumbnail_path, page_id))
             self.conn.commit()
 
-    def update_page_severity(self, page_id, severity, max_score):
+    def update_page_severity(self, page_id, severity, max_score,
+                             raise_only=False):
         """Cache the most serious finding on a page so filters/thumbnails
-        don't need a join."""
+        don't need a join. `raise_only=True` (rescans, which never remove
+        findings) keeps a higher cached severity or score."""
         with self.lock:
-            self.conn.execute(
-                "UPDATE pages SET primary_severity = ?, max_score = ? "
-                "WHERE id = ?", (severity, int(max_score or 0), page_id))
+            if raise_only:
+                rank = ("CASE {} WHEN 'critical' THEN 3 WHEN 'high' THEN 2 "
+                        "WHEN 'medium' THEN 1 WHEN 'low' THEN 0 ELSE -1 END")
+                self.conn.execute(
+                    "UPDATE pages SET primary_severity = CASE WHEN "
+                    + rank.format("?") + " > "
+                    + rank.format("primary_severity")
+                    + " THEN ? ELSE primary_severity END, "
+                    "max_score = MAX(COALESCE(max_score, 0), ?) "
+                    "WHERE id = ?",
+                    (severity, severity, int(max_score or 0), page_id))
+            else:
+                self.conn.execute(
+                    "UPDATE pages SET primary_severity = ?, max_score = ? "
+                    "WHERE id = ?", (severity, int(max_score or 0), page_id))
             self.conn.commit()
 
     def iter_pages_with_text(self, url_id=None):
@@ -566,17 +592,6 @@ class Database:
                     "FROM pages WHERE text_snapshot IS NOT NULL "
                     "  AND text_snapshot != ''")
             return cur.fetchall()
-
-    def purge_findings_for_page(self, url_id, page_url):
-        """Drop findings on a given page ahead of a rescan, so that fresh
-        rule output replaces — not accumulates on top of — stale hits.
-        Returns the number of rows removed."""
-        with self.lock:
-            cur = self.conn.execute(
-                "DELETE FROM findings WHERE url_id = ? AND page_url = ?",
-                (url_id, page_url))
-            self.conn.commit()
-            return cur.rowcount
 
     def record_url_error(self, url_id, category):
         """Tag a URL with its most recent error category for adaptive
@@ -703,11 +718,14 @@ class Database:
 
     def add_finding(self, url_id, page_url, rule_name, rule_type, score,
                      matched_strings, snippet, severity,
-                     ioc_hash=None, fp_score=0):
+                     ioc_hash=None, fp_score=0, bump=True):
         """Insert a finding or bump occurrence_count if a row with the same
         (url_id, page_url, rule_name, ioc_hash) already exists. Dedup keeps
-        the UI readable when the same IOC keeps surfacing across rescans
-        of the same page. Returns True if this was a fresh row."""
+        the UI readable when the same IOC keeps surfacing across scans
+        of the same page. `bump=False` leaves occurrence_count and
+        last_seen_at of an existing row untouched (an offline rescan
+        re-reads stored text, it does not see the IOC again) and only
+        raises its score/severity. Returns True if this was a fresh row."""
         now = datetime.now().isoformat()
         with self.lock:
             cur = self.conn.execute(
@@ -720,7 +738,7 @@ class Database:
                  matched_strings, snippet, severity,
                  ioc_hash or "", now, int(fp_score or 0)))
             fresh = cur.rowcount > 0
-            if not fresh:
+            if not fresh and bump:
                 # Same IOC on same page hit again — bump counter, refresh
                 # last-seen, and take the higher score (rule metadata can
                 # change between scans).
@@ -731,6 +749,17 @@ class Database:
                     "WHERE url_id = ? AND page_url = ? AND rule_name = ? "
                     "  AND COALESCE(ioc_hash,'') = ?",
                     (now, int(score or 0), int(fp_score or 0),
+                     url_id, page_url, rule_name, ioc_hash or ""))
+            elif not fresh:
+                # Rescan: apply a raised rule score (and its severity) so
+                # the row agrees with the page's cached severity. SET
+                # right-hand sides all read the old score.
+                self.conn.execute(
+                    "UPDATE findings SET severity = CASE WHEN ? > score "
+                    "  THEN ? ELSE severity END, score = MAX(score, ?) "
+                    "WHERE url_id = ? AND page_url = ? AND rule_name = ? "
+                    "  AND COALESCE(ioc_hash,'') = ?",
+                    (int(score or 0), severity, int(score or 0),
                      url_id, page_url, rule_name, ioc_hash or ""))
             self.conn.commit()
             return fresh
@@ -5409,19 +5438,11 @@ class DarkWebCrawler:
         extracted = self.data_extractor.extract(text) if text else {}
 
         # No screenshot for text messages; no form inventory; no html ctx.
-        self.db.add_page(
+        page_id = self.db.add_page(
             url_id, page_url, title, content_hash,
             extracted_data=extracted,
             screenshot_path=None, thumbnail_path=None,
             page_type="telegram_message")
-
-        # Look up the page row we just inserted so we can link it from
-        # tg_messages. SQLite doesn't have RETURNING on older versions;
-        # simplest path is a follow-up SELECT by content_hash.
-        row = self.db.conn.execute(
-            "SELECT id FROM pages WHERE content_hash = ? "
-            "ORDER BY id DESC LIMIT 1", (content_hash,)).fetchone()
-        page_id = row[0] if row else None
         if page_id is not None:
             try:
                 # Persist the synthetic text for media-only messages so the
@@ -5613,11 +5634,18 @@ class DarkWebCrawler:
     # ── Bulk rescan ──────────────────────────────────────────────────────
     def rescan_pages(self, url_id=None):
         """Re-run YARA across every stored page's `text_snapshot` for a
-        given URL (or all URLs). Purges prior findings on the page first
-        so results are a clean replacement, not an accumulation. Useful
-        after the operator adds new keywords / threat-intel rules.
+        given URL (or all URLs). Useful after the operator adds new
+        keywords / threat-intel rules.
 
-        Returns {scanned, findings, skipped}.
+        A rescan only adds findings; it never deletes or rewrites them.
+        The snapshot holds the stripped text of one version of the page,
+        so findings from older versions or from the HTML-only pass (attrs,
+        comments, <meta>) can't be re-derived from it. Findings of rules
+        that were deleted since stay too. Existing rows the rescan matches
+        again keep their occurrence_count and last_seen_at; a raised rule
+        score raises their score and severity.
+
+        Returns {scanned, findings, skipped}; `findings` counts new rows.
         """
         rows = self.db.iter_pages_with_text(url_id=url_id)
         scanned = 0
@@ -5627,7 +5655,6 @@ class DarkWebCrawler:
             if not text:
                 skipped += 1
                 continue
-            self.db.purge_findings_for_page(uid, page_url)
             text_hits, html_hits = self.scanner.scan_parallel(text.lower(), text)
             merged = self._merge_yara_hits(text_hits, html_hits)
             page_max_sev = "low"
@@ -5644,19 +5671,20 @@ class DarkWebCrawler:
                 ioc_h = _ioc_hash(matched_list)
                 fp = compute_fp_score(matched_list, snippet, None,
                                         context=kw.get("context", "text"))
-                self.db.add_finding(
-                    uid, page_url, kw["rule"],
-                    f"keyword:{kw.get('context','text')}",
-                    score, matched, snippet, severity,
-                    ioc_hash=ioc_h, fp_score=fp)
-                page_findings += 1
+                if self.db.add_finding(
+                        uid, page_url, kw["rule"],
+                        f"keyword:{kw.get('context','text')}",
+                        score, matched, snippet, severity,
+                        ioc_hash=ioc_h, fp_score=fp, bump=False):
+                    page_findings += 1
                 if self._SEVERITY_RANK.get(severity, 0) > \
                         self._SEVERITY_RANK.get(page_max_sev, 0):
                     page_max_sev = severity
                 if score > page_max_score:
                     page_max_score = score
-            if page_findings:
-                self.db.update_page_severity(page_id, page_max_sev, page_max_score)
+            if merged["keywords"]:
+                self.db.update_page_severity(page_id, page_max_sev,
+                                             page_max_score, raise_only=True)
             scanned += 1
             findings_total += page_findings
         if url_id is None:
