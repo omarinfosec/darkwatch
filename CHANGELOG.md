@@ -69,6 +69,18 @@
   keep the host's DNS, which hostname Endpoints need.
 - The Setup UI requires a `DNS =` line in WireGuard configs, so tg-socks
   resolves Telegram's names through the VPN instead of Docker's embedded DNS.
+- The dashboard's `ip_leak` gate fails when the egress lockdown is missing.
+  It passed whenever the direct IP lookup failed, and with darkwatch's DNS
+  isolated that lookup always fails, lockdown or not. With the lockdown on it
+  now opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` (2 s timeout,
+  no DNS, independent of the Tor check) and passes only when both time out
+  or fail with no route or `EPERM`. A completed connection fails the gate
+  with "run sudo ./ops/egress-lockdown.sh"; `ECONNREFUSED` fails it too and
+  says so, since the lockdown drops and never refuses. The detail shows each
+  probe's errno. Both probes run in parallel with the other health checks,
+  so with the lockdown on the gate takes about 2 s.
+  With `DARKWATCH_EGRESS_LOCKDOWN=0` it keeps the old, weaker comparison of
+  the Tor exit IP with the direct IP.
 
 ### Fixed
 - `verify-egress.sh` checks that are real:
