@@ -126,6 +126,30 @@ set +e; DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1;
 [[ $rc -ne 0 ]] && grep -q "not a link to" "$work/out" || die "bootstrap: a copied .env must be an error"
 ok "bootstrap fails on a .env that is not the link"
 
+# A hand-set SETUP_AUTH_TOKEN under 32 characters is kept but warned about,
+# by bootstrap and by deploy (upgrades don't re-run bootstrap). Never echoed.
+new_tree; seed
+grep -qE '^SETUP_AUTH_TOKEN=[0-9a-f]{64}$' "$D/env" || die "bootstrap: generated token is not 64 hex characters"
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap re-run failed"
+grep -q "shorter than 32" "$work/out" && die "bootstrap: warned about a 64-character token"
+deploy
+expect_ok "64-character token"
+grep -q "shorter than 32" "$work/out" && die "deploy: warned about a 64-character token"
+short_tok="handset0123456789abcdefghijklmn"   # 31 characters
+sed -i "s|^SETUP_AUTH_TOKEN=.*|SETUP_AUTH_TOKEN=$short_tok  |" "$D/env"
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap failed on a short token"
+grep -q "SETUP_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "bootstrap: no warning for a short token"
+grep -qF "$short_tok" "$work/out" && die "bootstrap: printed the token"
+grep -qF "SETUP_AUTH_TOKEN=$short_tok" "$D/env" || die "bootstrap: replaced a hand-set token"
+deploy
+expect_ok "short token"
+grep -q "SETUP_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die "deploy: no warning for a short token"
+grep -qF "$short_tok" "$work/out" && die "deploy: printed the token"
+sed -i "s|^SETUP_AUTH_TOKEN=.*|SETUP_AUTH_TOKEN=${short_tok}x|" "$D/env"   # exactly 32
+DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1 || die "bootstrap failed on a 32-character token"
+grep -q "shorter than 32" "$work/out" && die "bootstrap: warned about a 32-character token"
+ok "bootstrap and deploy warn about a SETUP_AUTH_TOKEN under 32 characters without printing it"
+
 # ─── default env (no DARKNET_SUBNET) reaches the end ────────────────────────
 new_tree; seed
 grep -q '^DARKNET_SUBNET=' "$D/env" && die "fixture: env should not set DARKNET_SUBNET"

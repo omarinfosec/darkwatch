@@ -89,6 +89,10 @@ ensure_secret() {
     fi
 }
 ensure_secret TG_SOCKS_PASSWORD   # tg-socks proxy login (Telegram tunnel)
+# Upgrades don't re-run bootstrap, so repeat its short-token warning here.
+if setup_token_short; then
+    warn "SETUP_AUTH_TOKEN is shorter than 32 characters; the Setup UI will answer 401 until you replace it (openssl rand -hex 32)"
+fi
 
 # Required env vars must be present in /var/lib/darkwebapp/env
 required_vars=(

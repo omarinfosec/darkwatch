@@ -10,14 +10,19 @@ Small FastAPI app that lets an operator paste:
 /data/secrets/tunnelN/wg_confs/wg0.conf with correct perms, and restarts
 the affected services via the docker socket.
 
-Auth: bearer token from $SETUP_AUTH_TOKEN. First visit via ?token=... or the
-login form sets an HttpOnly session cookie (7 days) so Settings ↗ from the
-main dashboard opens without pasting the token each time.
+Auth: bearer token from $SETUP_AUTH_TOKEN (at least 32 characters; a shorter
+one is treated as unset and every request gets 401). First visit via
+?token=... or the login form sets an HttpOnly session cookie (12 hours) so
+Settings ↗ from the main dashboard opens without pasting the token each
+time. The cookie holds a timestamp and an HMAC keyed by the token, never the
+token itself; rotating the token revokes every session.
 
 Bring up:    docker compose --profile setup up -d --build setup
 Bring down:  docker compose --profile setup stop setup
 """
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -25,6 +30,7 @@ import secrets
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -63,7 +69,11 @@ TOR_IMAGE = "darkwatch-tor:local"
 # ── Auth ─────────────────────────────────────────────────────────────────────
 _SETUP_CONTAINERS = ("darkwatch", "tunnel1", "tunnel2", "tor", "tg-socks", "setup")
 SESSION_COOKIE = "dw_setup_session"
-SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days — re-paste token after expiry
+SESSION_MAX_AGE = 12 * 3600  # 12 hours — re-paste token after expiry
+# bootstrap.sh generates 64 hex characters; anything under this is guessable
+# enough to be refused outright (there is no rate limiter).
+MIN_TOKEN_LEN = 32
+_short_token_logged = False
 
 
 def _read_env_var(key: str) -> str:
@@ -77,16 +87,32 @@ def _read_env_var(key: str) -> str:
 
 
 def _expected_token() -> str:
-    """Live token from /data/env so rotation survives without recreating setup."""
-    return _read_env_var("SETUP_AUTH_TOKEN")
+    """Live token from /data/env so rotation survives without recreating setup.
+    A token shorter than MIN_TOKEN_LEN counts as unset (fail closed): every
+    request then gets 401. Logged once, not on every request."""
+    global _short_token_logged
+    token = _read_env_var("SETUP_AUTH_TOKEN")
+    if len(token) < MIN_TOKEN_LEN:
+        if token and not _short_token_logged:
+            _short_token_logged = True
+            log.error("SETUP_AUTH_TOKEN is shorter than %d characters; refusing "
+                      "every request until it is replaced. Generate one with "
+                      "`openssl rand -hex 32`.", MIN_TOKEN_LEN)
+        return ""
+    _short_token_logged = False
+    return token
 
 
-if not _expected_token():
+# Only a missing token stops the process. A short one is refused per request
+# (logged by _expected_token below), so replacing it in the env file is
+# enough: the token is read live and setup has no restart policy.
+if not _read_env_var("SETUP_AUTH_TOKEN"):
     log.error("SETUP_AUTH_TOKEN is not set. Refusing to start (would be unauthenticated).")
     log.error("Bootstrap should have generated one in /var/lib/darkwebapp/env.")
     log.error("If env is missing the value, run:")
     log.error("  echo 'SETUP_AUTH_TOKEN='\"$(openssl rand -hex 32)\" | sudo tee -a /var/lib/darkwebapp/env")
     raise SystemExit(2)
+_expected_token()
 
 
 def _token_eq(provided: str, expected: str) -> bool:
@@ -117,12 +143,50 @@ def _same_origin(request: Request) -> bool:
     return urlsplit(source).netloc.lower() in hosts
 
 
-def _set_session_cookie(response) -> None:
+def _session_mac(token: str, ts: str) -> str:
+    return hmac.new(token.encode(), f"dw-setup-session:{ts}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _make_session(token: str, now: float | None = None) -> str:
+    """`<issued-at>.<HMAC(token, "dw-setup-session:<issued-at>")>`. The
+    cookie never carries the token, so a leaked cookie dies after 12 h and
+    with any token rotation."""
+    ts = str(int(time.time() if now is None else now))
+    return f"{ts}.{_session_mac(token, ts)}"
+
+
+def _valid_session(cookie: str, token: str) -> bool:
+    """Checked against the live token, so rotating it revokes all sessions."""
+    if not cookie or not token:
+        return False
+    ts, _, mac = cookie.partition(".")
+    # Length cap: int() of a few thousand digits raises (a 500, not a 401).
+    if not (0 < len(ts) <= 12 and ts.isascii() and ts.isdigit()) or not mac:
+        return False
+    age = time.time() - int(ts)
+    # A little clock skew is fine; a far-future stamp would outlive 12 h.
+    if not -60 <= age <= SESSION_MAX_AGE:
+        return False
+    return _token_eq(mac, _session_mac(token, ts))
+
+
+def _is_https(request: Request) -> bool:
+    """True for a direct TLS request or one a TLS-terminating proxy marks
+    with X-Forwarded-Proto: https (first hop, as nginx/Caddy send it)."""
+    if request.url.scheme == "https":
+        return True
+    xfp = request.headers.get("x-forwarded-proto", "")
+    return xfp.split(",")[0].strip().lower() == "https"
+
+
+def _set_session_cookie(response, request: Request) -> None:
     response.set_cookie(
         SESSION_COOKIE,
-        _expected_token(),
+        _make_session(_expected_token()),
         httponly=True,
         samesite="lax",
+        secure=_is_https(request),
         max_age=SESSION_MAX_AGE,
         path="/",
     )
@@ -142,8 +206,7 @@ def _is_authenticated(request: Request) -> bool:
         provided = auth[7:].strip()
         if provided and _token_eq(provided, expected):
             return True
-    cookie = request.cookies.get(SESSION_COOKIE, "")
-    if cookie and _token_eq(cookie, expected):
+    if _valid_session(request.cookies.get(SESSION_COOKIE, ""), expected):
         if request.method in ("GET", "HEAD"):
             return True
         return _same_origin(request)
@@ -202,7 +265,7 @@ async def index(request: Request):
         # Trade the URL token for the HttpOnly cookie and drop it from the
         # address bar / history straight away.
         response = RedirectResponse(url="/", status_code=303)
-        _set_session_cookie(response)
+        _set_session_cookie(response, request)
         return response
     state = _current_state(include_values=True)
     response = templates.TemplateResponse(
@@ -210,15 +273,20 @@ async def index(request: Request):
         "index.html",
         {"state": state, "token_present": True},
     )
-    if not request.cookies.get(SESSION_COOKIE):
-        _set_session_cookie(response)
+    if not _valid_session(request.cookies.get(SESSION_COOKIE, ""), _expected_token()):
+        _set_session_cookie(response, request)
     return response
 
 
 @app.post("/auth", response_class=HTMLResponse)
 async def auth_login(request: Request, token: str = Form(...)):
     provided = token.strip()
-    if not provided or not _token_eq(provided, _expected_token()):
+    expected = _expected_token()
+    if not expected or not provided or not _token_eq(provided, expected):
+        # Client IP only, never the submitted value (it may be a near-miss
+        # of the real token). No rate limiter: the token is >= 32 chars.
+        log.warning("setup: failed sign-in from %s",
+                    request.client.host if request.client else "unknown")
         return templates.TemplateResponse(
             request,
             "no_token.html",
@@ -226,7 +294,7 @@ async def auth_login(request: Request, token: str = Form(...)):
             status_code=status.HTTP_401_UNAUTHORIZED,
         )
     response = RedirectResponse(url="/", status_code=303)
-    _set_session_cookie(response)
+    _set_session_cookie(response, request)
     return response
 
 

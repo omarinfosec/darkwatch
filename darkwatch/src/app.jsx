@@ -485,7 +485,7 @@ function TabNav({ activeTab, onChange, findingsCount, urlsCount,
                 href={settingsHref}
                 target="_blank"
                 rel="noopener noreferrer"
-                title="Open Setup UI. Sign in once with your token; session lasts 7 days."
+                title="Open Setup UI. Sign in once with your token; session lasts 12 hours."
                 className="ml-auto px-3 sm:px-4 py-2 text-xs sm:text-sm
                            border-b-2 border-transparent text-gray-400
                            hover:text-brand-300 hover:border-brand-400/40

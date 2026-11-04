@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-os.environ.setdefault("SETUP_AUTH_TOKEN", "test-token-fixture")
+os.environ.setdefault("SETUP_AUTH_TOKEN", "t" * 64)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import telegram_validate as tv

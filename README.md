@@ -209,6 +209,8 @@ sudo docker compose --profile setup stop setup
 
 The UI has three sections — **Telegram credentials**, **Tunnel 1 (Tor research path)**, **Tunnel 2 (Telegram research path)** — pre-populated with whatever's already configured. Each Save validates inputs and recreates the affected services from the current env file. The Setup UI never builds images: if Tunnel 1 is saved before `deploy.sh` has built the tor image, the config is kept and the UI asks you to run `sudo ./ops/deploy.sh`. There's also a **Settings ↗** link in the main DarkWatch dashboard navigation that opens the Setup UI in a new tab.
 
+Signing in sets an HttpOnly session cookie that lasts 12 hours. It holds a timestamp signed with the token, not the token, and is marked `Secure` when the request arrived over HTTPS (directly or with `X-Forwarded-Proto: https` from your reverse proxy). Changing `SETUP_AUTH_TOKEN` in the env file signs every session out; no restart is needed. A token shorter than 32 characters is treated as unset: every request gets 401 and the container log says why. Failed sign-ins are logged with the client IP (never the value typed).
+
 ## Day-to-day operations
 
 ```bash

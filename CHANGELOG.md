@@ -59,7 +59,24 @@
   modified file. Add `config.d` to your backups (RUNBOOK, "Local config
   overrides").
 
+- **Setup UI: sign in again after the upgrade.** Session cookies from
+  earlier releases are no longer accepted, and new ones last 12 hours
+  instead of 7 days. A `SETUP_AUTH_TOKEN` shorter than 32 characters is now
+  treated as unset: every Setup UI request gets 401 and the setup container
+  logs why; `ops/deploy.sh` and `ops/bootstrap.sh` warn about it too
+  (without printing the value). The one `bootstrap.sh` generates is 64
+  characters; if you set a shorter one by hand, replace it with
+  `openssl rand -hex 32` (no restart needed).
+
 ### Security
+- The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
+  holds the issue time and an HMAC of it keyed by the token, is valid for
+  12 hours, and is checked against the token in the env file on every
+  request, so changing the token signs every session out. The cookie is
+  marked `Secure` when the request came over HTTPS, directly or with
+  `X-Forwarded-Proto: https` from a reverse proxy. Tokens shorter than 32
+  characters are refused (see Upgrade notes), and failed sign-ins on
+  `/auth` are logged with the client IP, never the value submitted.
 - Saved HTML copies (`loot/pages`) no longer make network requests when
   you open them. The sanitizer now puts a Content-Security-Policy first
   in `<head>` (adding a `<head>` if the page has none): only inline

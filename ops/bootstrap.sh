@@ -21,6 +21,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 log()  { printf '\033[1;36m[bootstrap]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[bootstrap WARN]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[bootstrap ERROR]\033[0m %s\n' "$*" >&2; }
 
 log "creating $DATA_ROOT"
@@ -55,6 +56,8 @@ install -d -m 0750 -o root -g "$DARKWATCH_GID" "$DATA_ROOT/config.d"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
 
 # env file sentinel — copy from .env.example if missing
 if [[ ! -f "$DATA_ROOT/env" ]]; then
@@ -115,6 +118,11 @@ if grep -qE '^SETUP_AUTH_TOKEN=$' "$DATA_ROOT/env" 2>/dev/null || \
     log "    's|^SETUP_AUTH_TOKEN=.*|SETUP_AUTH_TOKEN=@|' $DATA_ROOT/env"
     log "  ════════════════════════════════════════════════════════════════"
     log ""
+fi
+# A hand-set token survives the block above. setup/main.py refuses one under
+# 32 characters, so say so here rather than only in the setup container log.
+if setup_token_short; then
+    warn "SETUP_AUTH_TOKEN is shorter than 32 characters; the Setup UI will answer 401 until you replace it (openssl rand -hex 32)"
 fi
 
 # user.yar lives next to darkwatch.db (the code derives its path from
