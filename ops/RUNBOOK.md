@@ -45,9 +45,10 @@ Checks only the tunnels that are configured. Confirms: Tor sees Tor, Tor exit â‰
 ```bash
 sudo ./ops/egress-lockdown.sh --status          # darkwatch: no direct internet
 sudo docker exec tunnel1 iptables -S DW_KILLSWITCH   # tunnel kill switch
+sudo docker exec tunnel1 iptables -S DW_KS_IN        # inbound drop on wg0
 ```
 `verify-egress.sh` checks both. Two layers stop the host's real IP from leaking:
-- **Tunnel kill switch** (`tunnels/killswitch/10-killswitch.sh`): inside tunnel1/tunnel2, nothing may leave except through WireGuard, so if a tunnel drops, Tor and Telegram traffic is rejected instead of exiting via Docker's NAT. The tunnels only report healthy (and tor / tg-socks only start) once it is in place.
+- **Tunnel kill switch** (`tunnels/killswitch/10-killswitch.sh`): inside tunnel1/tunnel2, nothing may leave except through WireGuard, so if a tunnel drops, Tor and Telegram traffic is rejected instead of exiting via Docker's NAT. The tunnels only report healthy (and tor / tg-socks only start) once it is in place. It also drops new connections arriving through WireGuard, so the VPN side can't reach Tor's SOCKS and control ports. A hostname `Endpoint` is resolved once at tunnel start, before egress closes, and pinned in the container's `/etc/hosts` (`docker logs tunnel1 2>&1 | grep killswitch` shows it); if the VPN changes that address, recreate the tunnel with its sidecar (`sudo docker compose up -d --force-recreate tunnel1 tor`, or `tunnel2 tg-socks`).
 - **Egress lockdown** (`ops/egress-lockdown.sh`): a host firewall rule so the darkwatch container can only talk to the darknet subnet (the proxies). Alerts go out through the Telegram tunnel, falling back to Tor; set `alerts.allow_direct` in `config.json` only if you accept them leaving from the host.
 
 `deploy.sh` applies the lockdown before it starts the containers, and its `darkwatch-egress-lockdown` unit re-applies it at boot before `docker.service` starts them. After each deploy it probes `http://1.1.1.1` from darkwatch (the host is the positive control) and fails if darkwatch connects. After a reboot:
@@ -201,7 +202,7 @@ sudo docker compose ps
 darkwatch doesn't depend on the tunnels and its healthcheck (`/healthz`) is liveness only, so an unhealthy darkwatch is an app or startup error â€” read its logs.
 
 ### "deploy failed: tunnel1/tunnel2 is unhealthy"
-A tunnel is healthy only after a WireGuard handshake. No handshake means a wrong key/endpoint or a blocked UDP port; `deploy.sh` prints the tunnel's last logs.
+A tunnel is healthy only after a WireGuard handshake. No handshake means a wrong key/endpoint or a blocked UDP port; `deploy.sh` prints the tunnel's last logs. `[killswitch] could not resolve endpoint` there means the Endpoint hostname did not resolve when the tunnel started: fix DNS on the host and recreate the tunnel with its sidecar (`sudo docker compose up -d --force-recreate tunnel1 tor`), or use an IP Endpoint.
 ```bash
 sudo docker compose logs tunnel1 | tail -30
 sudo docker exec tunnel1 wg show wg0

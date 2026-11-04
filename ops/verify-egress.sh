@@ -153,6 +153,11 @@ for t in $( (( CHECK_TOR )) && echo tunnel1; (( CHECK_TG )) && echo tunnel2 ); d
     else
         bad "$t kill switch MISSING — traffic could leave via the host if the tunnel drops"
     fi
+    if docker exec "$t" iptables -C INPUT -j DW_KS_IN 2>/dev/null; then
+        ok "$t inbound drop active (nothing connects in through the tunnel)"
+    else
+        bad "$t inbound drop MISSING — the VPN side could reach the Tor / SOCKS ports; recreate $t"
+    fi
 done
 
 # ─── 6. DNS leak: darkwatch resolver should NOT be the host's resolver ──────

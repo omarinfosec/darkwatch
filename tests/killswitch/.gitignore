@@ -1,1 +1,2 @@
+# ip shim written by run_ns.py before it used a temp dir; drop after the next release
 .bin/

@@ -57,9 +57,10 @@ services:
       # filename wg0.conf (=> interface wg0) without conflict.
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      # Also requires the kill switch to be in place, so the tor / tg-socks
-      # sidecars (which wait for "healthy") never run without it.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch (egress and inbound) to be in place, so
+      # the tor / tg-socks sidecars (which wait for "healthy") never run
+      # without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && iptables -C INPUT -j DW_KS_IN && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -121,9 +122,10 @@ services:
     healthcheck:
       # Healthy only once a peer has completed a handshake. With no output
       # (wg0 missing) awk must exit non-zero, not fall through to success.
-      # Also requires the kill switch to be in place, so the tor / tg-socks
-      # sidecars (which wait for "healthy") never run without it.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
+      # Also requires the kill switch (egress and inbound) to be in place, so
+      # the tor / tg-socks sidecars (which wait for "healthy") never run
+      # without it.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -j DW_KILLSWITCH && iptables -C INPUT -j DW_KS_IN && wg show wg0 latest-handshakes | awk 'BEGIN{r=1} $$2>0{r=0} END{exit r}'"]
       interval: 30s
       timeout: 5s
       retries: 3

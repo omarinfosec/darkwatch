@@ -285,7 +285,7 @@ if ! dc $COMPOSE_PROFILES_ARGS up -d --remove-orphans; then
             docker logs --tail=20 "$svc" >&2 || true
         fi
     done
-    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong, the VPN endpoint is unreachable (no handshake), or the kill switch didn't load: check 'docker logs tunnelN 2>&1 | grep -E \"custom-init|killswitch\"', and that tunnels/killswitch/10-killswitch.sh is owned by root and executable."
+    fail "docker compose up failed. An unhealthy tunnel usually means the WG config is wrong, the VPN endpoint is unreachable (no handshake), or the kill switch didn't load: check 'docker logs tunnelN 2>&1 | grep -E \"custom-init|killswitch\"', and that tunnels/killswitch/10-killswitch.sh is owned by root and executable. '[killswitch] could not resolve endpoint' means the Endpoint hostname did not resolve at start: fix DNS on the host or use an IP Endpoint."
 fi
 
 # A running Setup UI keeps its old container (and code) until recreated.

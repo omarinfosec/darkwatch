@@ -37,8 +37,27 @@
   `systemctl show -p ExecMainStartTimestampMonotonic --value docker` (the
   RUNBOOK has a snippet). Docker's own `ActiveEnterTimestamp` comes after it
   has restarted the containers, so it cannot show the order.
+- The tunnel healthchecks changed, so the first deploy recreates tunnel1 and
+  tunnel2, which restarts tor and tg-socks once.
+
+### Security
+- The tunnel kill switch also drops new connections that arrive through
+  WireGuard (`DW_KS_IN` in `INPUT`, IPv4 and IPv6), so the VPN side can no
+  longer reach Tor's SOCKS and control ports. Replies to the tunnel's own
+  connections still get in. The tunnel healthchecks and `verify-egress.sh`
+  require it.
 
 ### Fixed
+- Tunnels with a hostname `Endpoint` (as the Setup UI's example shows) never
+  completed a handshake since v0.3.0: once the kill switch was on, the name
+  could not be resolved. The kill switch now resolves hostname Endpoints
+  while egress is still open and pins them in the container's `/etc/hosts`,
+  using the IPv4 address even for names that also have an IPv6 one (Alpine's
+  `getent hosts` returns only the IPv6 address, so it asks `nslookup -type=a`
+  first).
+  An Endpoint that doesn't resolve is logged as
+  `[killswitch] could not resolve endpoint` and the switch is applied anyway;
+  `deploy.sh`'s failure hint names that line.
 - `deploy.sh` restarts itself once after a `git pull` that changes the code,
   so the rest of the deploy runs the new script instead of the old one bash
   had already loaded.
@@ -84,6 +103,12 @@
   network has IPv6 anyway.
 
 ### Internal
+- `tests/killswitch` fails when the kill switch script fails (it ignored the
+  exit code, which hid an IPv6 failure caused by the `ip` shim returning IPv4
+  addresses), checks the IPv4 and IPv6 log lines, the Endpoint pinning (with
+  musl- and glibc-like resolvers) and a rerun, and adds a test with darknet
+  and VPN peers in their own namespaces. It no longer writes
+  `tests/killswitch/.bin/`; delete that directory if an older run left it.
 - `ops/lib/common.sh` holds the `env_val` helper shared by `deploy.sh`,
   `egress-lockdown.sh` and `verify-egress.sh`.
 - New `tests/ops/check.sh` runs `deploy.sh` and `bootstrap.sh` against
