@@ -327,6 +327,9 @@ else
     # consulted (e.g. Docker running with "iptables": false).
     iptables -C FORWARD -j DOCKER-USER 2>/dev/null \
         || warn "FORWARD has no jump to DOCKER-USER: the egress lockdown rule is not consulted"
+    # A real resolver is dropped by the lockdown, so lookups would stall.
+    [[ "$(env_val DARKWATCH_DNS 127.0.0.1)" == 127.0.0.1 ]] \
+        || fail "DARKWATCH_DNS is set while the egress lockdown is on: leave it unset in the env file (darkwatch's lookups would stall on a dropped resolver), then re-run deploy"
     log "probing darkwatch's direct internet access (http://1.1.1.1)"
     if docker exec darkwatch curl -s --max-time 5 -o /dev/null http://1.1.1.1 2>/dev/null; then
         fail "darkwatch reached http://1.1.1.1 DIRECTLY although the egress lockdown is on. Check: sudo ./ops/egress-lockdown.sh --status; sudo iptables -S FORWARD | grep DOCKER-USER"

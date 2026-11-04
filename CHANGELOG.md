@@ -84,7 +84,10 @@
     a leaking one. It now fails, unless `DARKWATCH_EGRESS_LOCKDOWN=0`, when
     darkwatch's resolv.conf shows a `host(` upstream or an `ExtServers` other
     than `[127.0.0.1]`, or when `example.com` resolves inside darkwatch. It
-    also fails when `tunnel1` / `tunnel2` don't resolve there, and warns when
+    (and `deploy.sh`, even without tunnels or with `--no-egress-check`)
+    fails when `DARKWATCH_DNS` is set to anything but 127.0.0.1 while the
+    lockdown is on, since the dropped resolver would stall darkwatch's
+    lookups without a leak to detect. It also fails when `tunnel1` / `tunnel2` don't resolve there, and warns when
     tunnel2 resolves through Docker's embedded DNS while Telegram is checked.
     With `DARKWATCH_EGRESS_LOCKDOWN=0` it (and `deploy.sh`) warns when
     `DARKWATCH_DNS` is unset, since darkwatch then can't resolve clearnet

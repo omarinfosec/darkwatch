@@ -211,6 +211,8 @@ if [[ "$LOCKDOWN" == "0" ]]; then
     [[ "$(env_val DARKWATCH_DNS 127.0.0.1)" != 127.0.0.1 ]] \
         || warn "DARKWATCH_EGRESS_LOCKDOWN=0 but DARKWATCH_DNS is unset: darkwatch can't resolve clearnet names, so the in-app IP-leak check fails and direct alerts don't send; set DARKWATCH_DNS to a resolver in the env file"
 else
+    [[ "$(env_val DARKWATCH_DNS 127.0.0.1)" == 127.0.0.1 ]] \
+        || bad "DARKWATCH_DNS is set while the egress lockdown is on: leave it unset (darkwatch's lookups would stall on a dropped resolver)"
     DW_RESOLV="$(docker exec darkwatch cat /etc/resolv.conf 2>/dev/null || true)"
     DW_EXT="$(printf '%s\n' "$DW_RESOLV" | sed -n 's/^# ExtServers: *//p' | head -1)"
     log "  darkwatch resolv.conf ExtServers: ${DW_EXT:-(no footer)}"

@@ -265,6 +265,17 @@ expect_ok "no FORWARD jump"
 grep -q "FORWARD has no jump to DOCKER-USER" "$work/out" || die "missing FORWARD jump must warn"
 ok "missing FORWARD -> DOCKER-USER jump warns"
 
+# With the lockdown on, a real DARKWATCH_DNS is dropped and stalls lookups;
+# deploy must fail on it itself (no tunnels here, so no verify-egress run).
+new_tree; seed; real_lockdown
+echo "DARKWATCH_DNS=9.9.9.9" >> "$D/env"
+deploy
+expect_fail "lockdown on with DARKWATCH_DNS" "DARKWATCH_DNS is set while the egress lockdown is on"
+new_tree; seed; real_lockdown
+DARKWATCH_DNS=9.9.9.9 deploy --no-egress-check
+expect_fail "lockdown on with DARKWATCH_DNS (process env)" "DARKWATCH_DNS is set while the egress lockdown is on"
+ok "lockdown on with a real DARKWATCH_DNS: deploy fails without the egress check"
+
 # ─── env file pre-flight ────────────────────────────────────────────────────
 new_tree; seed; rm "$D/env"
 deploy

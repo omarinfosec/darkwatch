@@ -207,6 +207,18 @@ expect_pass "no footer"
 has "no footer" "ExtServers: (no footer)"
 ok "no ExtServers footer (Docker 24/25): the lookup test decides"
 
+# No footer, and the dropped resolver makes the lookup time out (a warning):
+# a DARKWATCH_DNS other than 127.0.0.1 must still fail on its own.
+for how in file env; do
+    reset; resolv ""
+    if [[ $how == file ]]; then echo "DARKWATCH_DNS=9.9.9.9" >> "$D/env"; else export DARKWATCH_DNS=9.9.9.9; fi
+    STUB_GETENT_RC=124 verify
+    expect_fail "lockdown on + DNS ($how)" "DARKWATCH_DNS is set while the egress lockdown is on"
+done
+reset; echo "DARKWATCH_DNS=127.0.0.1" >> "$D/env"; verify
+expect_pass "lockdown on + DNS=127.0.0.1"
+ok "lockdown on: a DARKWATCH_DNS other than 127.0.0.1 fails even without a footer"
+
 reset; STUB_DW_RESOLVES=1 verify
 expect_fail "clearnet resolves" "darkwatch resolved example.com"
 ok "a clearnet name that resolves in darkwatch fails"
