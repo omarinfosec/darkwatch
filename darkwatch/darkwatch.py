@@ -15,7 +15,6 @@ import sys
 import copy
 import json
 import html as html_lib
-import socket
 import time
 import hashlib
 import logging
@@ -41,6 +40,7 @@ from dw_telegram import (
     CallPressure, ClientProfile, DarkMTProto, TelegramScraper,
     TelegramLiveListener,
 )
+import dw_tor
 
 # Names above that darkwatch.py itself does not use: listed so pyflakes
 # counts them as used.
@@ -59,13 +59,6 @@ try:
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
-
-try:
-    from stem import Signal
-    from stem.control import Controller
-    STEM_AVAILABLE = True
-except ImportError:
-    STEM_AVAILABLE = False
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -1709,6 +1702,10 @@ def classify_fetch_error(exc):
 
 # ─── Crawler ─────────────────────────────────────────────────────────────────
 
+# Seconds for one NEWNYM request: connect, authenticate and answer together.
+TOR_NEWNYM_TIMEOUT = 5
+
+
 class DarkWebCrawler:
     def __init__(self, config):
         self.config = config
@@ -1831,30 +1828,31 @@ class DarkWebCrawler:
 
     def rotate_tor_circuit(self):
         """Request a new Tor circuit via the ControlPort (NEWNYM).
-        Silently no-ops if stem or ControlPort is unavailable — scans must
-        not fail when operator hasn't enabled the ControlPort.
+        Best effort: returns False when the ControlPort is unavailable or
+        refuses — scans must not fail when operator hasn't enabled the
+        ControlPort. A refusal (a wrong password) or bad control settings
+        are logged as a warning.
         """
-        if not self.newnym_between_sites or not STEM_AVAILABLE:
+        if not self.newnym_between_sites:
             return False
         try:
-            # stem's from_port only accepts an IP literal ("Invalid IP
-            # address: tunnel1"), so resolve the container name first.
-            # This is Docker's internal DNS for a sidecar, not a target lookup.
-            addr = socket.gethostbyname(self.tor_control_host)
-            with Controller.from_port(
-                address=addr,
-                port=int(self.tor_control_port),
-            ) as ctrl:
-                if self.tor_control_password:
-                    ctrl.authenticate(password=self.tor_control_password)
-                else:
-                    ctrl.authenticate()
-                ctrl.signal(Signal.NEWNYM)
-            log.info("Tor circuit rotated (NEWNYM)")
-            return True
-        except Exception as e:
+            dw_tor.newnym(self.tor_control_host, self.tor_control_port,
+                          self.tor_control_password,
+                          timeout=TOR_NEWNYM_TIMEOUT)
+        except dw_tor.ControlPortError as e:
+            log.warning(f"NEWNYM skipped: {e}")
+            return False
+        except OSError as e:
             log.debug(f"NEWNYM skipped: ControlPort unavailable ({e})")
             return False
+        except (ValueError, TypeError) as e:
+            # A bad tor_control_host/port/password in config.json (a port
+            # that isn't a number, a null host) — a config error, not a
+            # reason to stop the scan.
+            log.warning(f"NEWNYM skipped: bad ControlPort settings ({e!r})")
+            return False
+        log.info("Tor circuit rotated (NEWNYM)")
+        return True
 
     def _get_session(self):
         session = requests.Session()

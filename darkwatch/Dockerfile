@@ -82,7 +82,8 @@ COPY requirements.lock .
 # sdist needs a Rust toolchain this image does not have, and yara-python's
 # compiles the bundled libyara; a pin with no cp311 wheel for the build
 # platform should fail here rather than fall back to an untested source
-# build. Not --only-binary=:all:, because stem ships only an sdist.
+# build. Not --only-binary=:all:, because pyaes (a Telethon dependency)
+# ships only an sdist.
 RUN pip install --no-cache-dir --require-hashes --only-binary=cryptg,yara-python \
         -r requirements.lock
 

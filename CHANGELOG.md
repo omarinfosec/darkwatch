@@ -163,6 +163,16 @@
 - tor image and the darkwatch image's asset build stage (esbuild,
   Tailwind): `debian:bookworm-slim` → `debian:trixie-slim`, pinned by
   digest; Dependabot keeps refreshing the digest within trixie.
+- stem (no release since 2020) is no longer installed. NEWNYM circuit
+  rotation between scan targets now uses the same small ControlPort client
+  as the dashboard's Tor circuit check (`darkwatch/dw_tor.py`): it resolves
+  `tor_control_host` first, as before, authenticates with
+  `tor_control_password` and checks every reply for `250`. Rotation is
+  still best effort and never fails a scan, but a request now gives up
+  after 5 seconds (stem's had no timeout, so an unanswering ControlPort
+  could hold a scan), and a refusal such as a wrong password (`515`) is
+  logged as a warning instead of at debug level, as are bad control
+  settings in `config.json` (a port that isn't a number, a null host).
 
 ### Fixed
 - Forum-topic labels on Telegram messages keep working on Telethon 1.45,
@@ -322,8 +332,23 @@
   connection without the database lock, racing the other threads that use
   it. They now go through locked `Database` helpers (`get_url_id`,
   `get_url_source`, `latest_page_id`, `get_url_by_tg_channel_id`).
+- Tracked Telegram channel lists share one limit, `TG_CHANNEL_LIST_LIMIT`
+  (1000) in `darkwatch/web.py`. "Search all channels", smart discovery and
+  the deep search used 500 and the live listener 1000, and channels past
+  the limit were left out without a word. Each of these now logs a warning
+  naming how many tracked channels it skipped (the least recently
+  scanned); the Telegram tab lists up to the same 1000 channels (it listed
+  500).
 
 ### Internal
+- New `darkwatch/tests/test_tor_control.py` tests the ControlPort client
+  against a fake ControlPort: NEWNYM success, a wrong password (`515`), a
+  refused signal, a ControlPort that never answers, quotes and backslashes
+  in the password escaped, a password with a line break never sent, the
+  control host resolved before connecting, and bad control settings
+  skipping rotation without failing the scan. The fake ControlPort moved
+  to `darkwatch/tests/conftest.py`; the image smoke test also imports
+  `dw_tor`.
 - `tests/images/smoke.sh` also checks that the tor image runs as
   `debian-tor`, owns its `/var/lib/tor` (a fresh `tor-data` volume copies
   that owner), has an executable `healthcheck.sh` (and the bash, timeout
@@ -391,8 +416,8 @@
   lock), and `tests/lock-deps/check.sh` tests the script with uv stubbed.
   The locks are resolved for x86_64 Linux; they carry the hashes of every
   file of each version, but building the images on arm64 is untested.
-  stem and pyaes ship only source archives: those archives are
-  hash-checked, the setuptools pip fetches to build them is not. Dependabot
+  pyaes ships only a source archive: that archive is hash-checked, the
+  setuptools pip fetches to build it is not. Dependabot
   updates `requirements.in` only; run `./ops/lock-deps.sh` on its PR branch
   (RUNBOOK, "Update Python dependencies").
 - New weekly workflow `Dependency audit` runs pip-audit 2.10.1 separately on

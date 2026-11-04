@@ -35,8 +35,8 @@ run() {
 
 # A module missing from the image (the Dockerfile COPY line) or an import
 # that blocks on the network fails here.
-run "darkwatch: import darkwatch, dw_db, dw_telegram, threat_intel, web" \
-    "$DARKWATCH_IMAGE" python -c 'import darkwatch, dw_db, dw_telegram, threat_intel, web'
+run "darkwatch: import darkwatch, dw_db, dw_telegram, dw_tor, threat_intel, web" \
+    "$DARKWATCH_IMAGE" python -c 'import darkwatch, dw_db, dw_telegram, dw_tor, threat_intel, web'
 
 # Importing web starts no background thread (darkwatch/tests/
 # test_web_startup.py); `python web.py`, the image's CMD, must start the

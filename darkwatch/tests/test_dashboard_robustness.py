@@ -5,7 +5,6 @@ check's Tunnel 1 probe (Tor's ControlPort, with a SOCKS fallback)."""
 import collections
 import json
 import socket
-import threading
 
 import pytest
 
@@ -268,51 +267,6 @@ def test_quick_health_reuses_the_controlport_answer(web, monkeypatch):
     assert len(queries) == 4 and "Tor circuits not checked" in r["vpn"]["detail"]
 
 
-class _FakeControlPort:
-    """A one-connection-at-a-time Tor ControlPort on 127.0.0.1."""
-
-    def __init__(self, reply):
-        self.reply = reply            # callable(request bytes) -> bytes | None
-        self.requests = []
-        self.sock = socket.socket()
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(4)
-        self.port = self.sock.getsockname()[1]
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-        self.thread.start()
-
-    def _serve(self):
-        self.sock.settimeout(0.2)
-        while not self.stop.is_set():
-            try:
-                conn, _ = self.sock.accept()
-            except OSError:
-                continue
-            with conn:
-                conn.settimeout(2)
-                data = b""
-                try:
-                    while b"QUIT\r\n" not in data:
-                        chunk = conn.recv(4096)
-                        if not chunk:
-                            break
-                        data += chunk
-                except OSError:
-                    pass
-                self.requests.append(data)
-                out = self.reply(data)
-                if out is None:           # never answer
-                    self.stop.wait(3)
-                    continue
-                conn.sendall(out)
-
-    def close(self):
-        self.stop.set()
-        self.thread.join(5)
-        self.sock.close()
-
-
 def _answer(value):
     return lambda req: (b"250 OK\r\n"
                         b"250-status/circuit-established=" + value + b"\r\n"
@@ -320,19 +274,14 @@ def _answer(value):
 
 
 @pytest.fixture
-def controlport(web, monkeypatch):
-    servers = []
-
+def controlport(web, monkeypatch, fake_controlport):
     def start(reply, password="pw"):
-        srv = _FakeControlPort(reply)
-        servers.append(srv)
+        srv = fake_controlport(reply)
         monkeypatch.setattr(web._crawler, "tor_control_host", "127.0.0.1")
         monkeypatch.setattr(web._crawler, "tor_control_port", srv.port)
         monkeypatch.setattr(web._crawler, "tor_control_password", password)
         return srv
-    yield start
-    for srv in servers:
-        srv.close()
+    return start
 
 
 def test_controlport_query_parses_tor_answers(web, controlport):
@@ -373,3 +322,56 @@ def test_check_vpn_end_to_end_falls_back_when_controlport_is_closed(
     monkeypatch.setattr(web, "_check_tor_alive", _socks(True))
     r = web._check_vpn()
     assert r["ok"] is True and "Tor circuits not checked" in r["detail"]
+
+
+# ─── Tracked Telegram channel list limit ─────────────────────────────────────
+
+@pytest.fixture
+def tg_channels_db(web, monkeypatch, tmp_path):
+    """A fresh database for web._crawler and a channel list limit of 2."""
+    from darkwatch import Database
+    db = Database(str(tmp_path / "dw.db"))
+    monkeypatch.setattr(web._crawler, "db", db)
+    monkeypatch.setattr(web, "TG_CHANNEL_LIST_LIMIT", 2)
+
+    def add(n):
+        for i in range(n):
+            db.add_url(f"tg://chan{i}", source="telegram")
+        db.add_url("http://example.onion", source="manual")
+    return add
+
+
+def test_tracked_tg_channels_warns_when_the_limit_skips_channels(
+        web, tg_channels_db, caplog):
+    tg_channels_db(3)
+    with caplog.at_level("WARNING", logger="darkwatch.web"):
+        rows = web._tracked_tg_channels("search all channels")
+    assert len(rows) == 2
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(msgs) == 1
+    assert "search all channels: using 2 of 3 tracked Telegram channels" in msgs[0]
+    assert "1 least recently scanned are skipped" in msgs[0]
+
+
+def test_tracked_tg_channels_is_quiet_at_the_limit(web, tg_channels_db, caplog):
+    tg_channels_db(2)
+    with caplog.at_level("WARNING"):
+        rows = web._tracked_tg_channels("live listener")
+    assert len(rows) == 2
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_live_listener_channel_list_uses_the_shared_limit(web, tg_channels_db,
+                                                          monkeypatch, caplog):
+    tg_channels_db(3)
+    with web._crawler.db.lock:
+        web._crawler.db.conn.execute(
+            "UPDATE urls SET tg_channel_id = id WHERE source = 'telegram'")
+        web._crawler.db.conn.commit()
+    seen = []
+    monkeypatch.setattr(web, "_tg_live",
+                        type("L", (), {"set_channels": lambda self, ids: seen.append(ids)})())
+    with caplog.at_level("WARNING"):
+        web._refresh_tg_live_channels()
+    assert len(seen[0]) == 2
+    assert "live listener: using 2 of 3" in caplog.text

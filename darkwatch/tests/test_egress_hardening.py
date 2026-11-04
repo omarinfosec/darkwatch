@@ -11,6 +11,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import darkwatch as dw  # noqa: E402
+import dw_tor  # noqa: E402
 
 CFG = {
     "proxy": {"type": "socks5h", "host": "tunnel1", "port": 9050},
@@ -151,31 +152,20 @@ def test_browser_without_tor_proxy_uses_dead_proxy(fake_pw, tmp_path, mode, prox
 
 
 def test_newnym_connects_to_the_resolved_control_ip(monkeypatch):
-    """stem's from_port() only takes an IP literal: the sidecar name must be
-    resolved first and the IP (not the name) passed on."""
+    """The sidecar name is resolved first and the IP (not the name) dialled,
+    as with stem, whose from_port() only took an IP literal."""
     seen = {}
 
-    class FakeController:
-        @classmethod
-        def from_port(cls, address, port):
-            seen["from_port"] = (address, port)
-            return cls()
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def authenticate(self, password=None): seen["password"] = password
-        def signal(self, sig): seen["signal"] = sig
-
-    monkeypatch.setattr(dw, "STEM_AVAILABLE", True)
-    monkeypatch.setattr(dw, "Controller", FakeController, raising=False)
-    monkeypatch.setattr(dw, "Signal", type("Sig", (), {"NEWNYM": "NEWNYM"}),
-                        raising=False)
-    monkeypatch.setattr(dw.socket, "gethostbyname",
+    def connect(addr, timeout=None):
+        seen["connect"] = addr
+        raise ConnectionRefusedError("refused")
+    monkeypatch.setattr(dw_tor.socket, "gethostbyname",
                         lambda name: seen.setdefault("resolved", name) and "172.31.250.2")
+    monkeypatch.setattr(dw_tor.socket, "create_connection", connect)
     c = dw.DarkWebCrawler.__new__(dw.DarkWebCrawler)
     c.newnym_between_sites = True
     c.tor_control_host = "tunnel1"
     c.tor_control_port = "9051"
     c.tor_control_password = "ctl-pw"
-    assert c.rotate_tor_circuit() is True
-    assert seen == {"resolved": "tunnel1", "from_port": ("172.31.250.2", 9051),
-                    "password": "ctl-pw", "signal": "NEWNYM"}
+    assert c.rotate_tor_circuit() is False
+    assert seen == {"resolved": "tunnel1", "connect": ("172.31.250.2", 9051)}
