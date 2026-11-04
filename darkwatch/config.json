@@ -6,7 +6,6 @@
     },
     "crawler": {
         "max_depth": 2,
-        "max_threads": 5,
         "timeout": 60,
         "retries": 3,
         "retry_delay": 10,
@@ -78,7 +77,6 @@
         "proxy_password": "${TG_SOCKS_PASSWORD}",
         "use_tor": false,
         "scrape_limit_per_tick": 100,
-        "scrape_delay_s": 3,
         "rate_per_s": 0.33,
         "burst": 1,
         "jitter": 0.5,
@@ -89,8 +87,7 @@
         "thorough_jitter": 0.35,
         "thorough_max_deep_budget": 40,
         "pressure_skip_threshold": 30,
-        "live_enabled": false,
-        "persistent_client": false
+        "live_enabled": false
     },
     "output": {
         "loot_dir": "/loot",

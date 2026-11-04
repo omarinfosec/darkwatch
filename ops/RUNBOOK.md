@@ -78,7 +78,7 @@ sudo docker compose restart darkwatch
 Don't edit `darkwatch/config.json` on the VM: it is tracked, so `deploy.sh` refuses the dirty checkout. Put the settings you change in `/var/lib/darkwebapp/config.d/config.local.json` instead. darkwatch merges it over `config.json` at start (mounted read-only at `/app/config.local.d`), key by key: a nested key the file doesn't name keeps its `config.json` value, and a list replaces the whole list. Like `config.json`, a value that is exactly `"${VAR}"` is read from `/var/lib/darkwebapp/env`, so secrets can stay in the env file.
 ```bash
 sudoedit /var/lib/darkwebapp/config.d/config.local.json
-#   {"crawler": {"max_threads": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
+#   {"crawler": {"max_depth": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
 sudo chown root:999 /var/lib/darkwebapp/config.d/config.local.json
 sudo chmod 0640 /var/lib/darkwebapp/config.d/config.local.json
 sudo docker compose restart darkwatch

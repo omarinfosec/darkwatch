@@ -38,11 +38,10 @@ def web(tmp_path_factory):
         # Login off, as by default; test_dashboard_auth turns it on.
         mp.delenv("DARKWATCH_AUTH_TOKEN", raising=False)
         import web as web_mod
-    # The import starts the monitor schedulers. Stop them: tests swap
-    # web._crawler and web._tg for fakes, and a background tick would use
-    # those fakes at the same time as the test does.
+    # The import starts no monitor scheduler (test_web_startup checks
+    # that), so no background tick uses the fakes tests swap in for
+    # web._crawler and web._tg. Keep the schedulers' stop flag set so a
+    # tick a test runs by hand stops at once unless the test gives it a
+    # fresh Event.
     web_mod._monitor_stop.set()
-    for t in (web_mod._monitor_thread, web_mod._tg_monitor_thread):
-        if t is not None:
-            t.join(timeout=10)
     yield web_mod

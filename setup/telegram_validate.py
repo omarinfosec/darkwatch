@@ -83,18 +83,17 @@ def validate_telegram_credentials(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        try:
-            return asyncio.run(
-                validate_telegram_credentials_async(
-                    api_id, api_hash, proxy=proxy, timeout_s=timeout_s
-                )
-            )
-        except asyncio.TimeoutError:
-            return False, f"Telegram credential check timed out after {timeout_s:.0f}s"
-        raise
-    raise RuntimeError(
-        "validate_telegram_credentials() cannot run inside an event loop; "
-        "use validate_telegram_credentials_async()"
+        pass  # no running loop: asyncio.run below may start one
+    else:
+        raise RuntimeError(
+            "validate_telegram_credentials() cannot run inside an event loop; "
+            "use validate_telegram_credentials_async()"
+        )
+    # The async version turns a timeout into (False, "... timed out ...").
+    return asyncio.run(
+        validate_telegram_credentials_async(
+            api_id, api_hash, proxy=proxy, timeout_s=timeout_s
+        )
     )
 
 

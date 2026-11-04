@@ -61,14 +61,29 @@ def test_load_config_passes_through_non_placeholders():
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False
     ) as fp:
-        json.dump({"crawler": {"max_threads": 5}}, fp)
+        json.dump({"crawler": {"retries": 5}}, fp)
         path = fp.name
 
     try:
         cfg = load_config(path)
-        assert cfg["crawler"]["max_threads"] == 5
+        assert cfg["crawler"]["retries"] == 5
     finally:
         os.unlink(path)
+
+
+def test_unused_settings_are_not_offered():
+    """crawler.max_threads, telegram.scrape_delay_s and
+    telegram.persistent_client were never read; neither the defaults nor
+    the shipped config.json list them."""
+    from darkwatch import DEFAULT_CONFIG
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "config.json")) as fp:
+        shipped = json.load(fp)
+    for cfg in (DEFAULT_CONFIG, shipped):
+        assert "max_threads" not in cfg["crawler"]
+        assert "scrape_delay_s" not in cfg["telegram"]
+        assert "persistent_client" not in cfg["telegram"]
 
 
 def _write_json(path, data):
@@ -84,18 +99,18 @@ def test_load_config_local_override_wins_and_keeps_other_keys(tmp_path, monkeypa
 
     monkeypatch.setenv("LOCAL_WEBHOOK", "https://hooks.example/abc")
     base = _write_json(tmp_path / "config.json", {
-        "crawler": {"max_threads": 5, "timeout": 30},
+        "crawler": {"retries": 5, "timeout": 30},
         "alerts": {"min_alert_score": 80, "allow_direct": False},
     })
     local = _write_json(tmp_path / "config.local.json", {
-        "crawler": {"max_threads": 2},
+        "crawler": {"retries": 2},
         "alerts": {"allow_direct": True, "slack_webhook_url": "${LOCAL_WEBHOOK}"},
         "extra": {"k": [1, 2]},
     })
     monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", local)
 
     cfg = load_config(base)
-    assert cfg["crawler"]["max_threads"] == 2         # override wins
+    assert cfg["crawler"]["retries"] == 2         # override wins
     assert cfg["crawler"]["timeout"] == 30            # config.json kept
     assert cfg["crawler"]["max_depth"] == 2           # default kept
     assert cfg["alerts"]["allow_direct"] is True
@@ -103,27 +118,27 @@ def test_load_config_local_override_wins_and_keeps_other_keys(tmp_path, monkeypa
     assert cfg["alerts"]["slack_webhook_url"] == "https://hooks.example/abc"
     assert cfg["extra"] == {"k": [1, 2]}
     # An explicit path takes precedence over the environment.
-    assert load_config(base, local_path="")["crawler"]["max_threads"] == 5
+    assert load_config(base, local_path="")["crawler"]["retries"] == 5
 
 
 def test_load_config_local_override_is_optional(tmp_path, monkeypatch):
     from darkwatch import load_config
 
-    base = _write_json(tmp_path / "config.json", {"crawler": {"max_threads": 5}})
+    base = _write_json(tmp_path / "config.json", {"crawler": {"retries": 5}})
     monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", str(tmp_path / "missing.json"))
-    assert load_config(base)["crawler"]["max_threads"] == 5
+    assert load_config(base)["crawler"]["retries"] == 5
     monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", "")
-    assert load_config(base)["crawler"]["max_threads"] == 5
+    assert load_config(base)["crawler"]["retries"] == 5
 
 
-@pytest.mark.parametrize("body", ['{"crawler": {"max_threads": 2}', "[1, 2]", "",
+@pytest.mark.parametrize("body", ['{"crawler": {"retries": 2}', "[1, 2]", "",
                                   b'{"a": "\xff"}'])
 def test_load_config_invalid_local_override_is_an_error(tmp_path, monkeypatch, body):
     """A broken override must stop startup, not silently run on the
     tracked config.json settings."""
     from darkwatch import load_config
 
-    base = _write_json(tmp_path / "config.json", {"crawler": {"max_threads": 5}})
+    base = _write_json(tmp_path / "config.json", {"crawler": {"retries": 5}})
     local = tmp_path / "config.local.json"
     if isinstance(body, bytes):
         local.write_bytes(body)  # not valid UTF-8
@@ -185,11 +200,11 @@ def test_load_config_does_not_mutate_defaults_or_share_state(tmp_path, monkeypat
 
     monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", "")
     before = copy.deepcopy(DEFAULT_CONFIG)
-    c1 = load_config(_write_json(tmp_path / "a.json", {"crawler": {"max_threads": 9}}))
+    c1 = load_config(_write_json(tmp_path / "a.json", {"crawler": {"retries": 9}}))
     c2 = load_config(_write_json(tmp_path / "b.json", {"proxy": {"port": 1}}))
     assert DEFAULT_CONFIG == before
-    assert c1["crawler"]["max_threads"] == 9
-    assert c2["crawler"]["max_threads"] == before["crawler"]["max_threads"]
+    assert c1["crawler"]["retries"] == 9
+    assert c2["crawler"]["retries"] == before["crawler"]["retries"]
     assert c1["proxy"]["port"] == before["proxy"]["port"]
     assert c2["proxy"]["port"] == 1
 

@@ -25,7 +25,7 @@ import random
 from queue import Queue
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from bs4 import BeautifulSoup, Doctype
@@ -59,7 +59,6 @@ DEFAULT_CONFIG = {
     },
     "crawler": {
         "max_depth": 2,
-        "max_threads": 5,
         "timeout": 60,
         "retries": 3,
         "retry_delay": 10,
@@ -145,7 +144,6 @@ DEFAULT_CONFIG = {
         "proxy_type": "socks5",
         "use_tor": False,
         "scrape_limit_per_tick": 100,
-        "scrape_delay_s": 3,
         # Rate-limit knobs (Safe mode defaults). Thorough-mode overrides
         # live alongside and are picked up when route_tg_search_deep is
         # called with ?mode=thorough.
@@ -1322,6 +1320,40 @@ class Database:
                 "SELECT 1 FROM urls WHERE id = ?", (url_id,))
             return cur.fetchone() is not None
 
+    # Small lookups for callers outside this class (web.py, crawl_url), so
+    # none of them reads self.conn without the lock.
+    def get_url_id(self, url):
+        """id of the urls row for `url`, or None."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM urls WHERE url = ?", (url,)).fetchone()
+            return row[0] if row else None
+
+    def get_url_source(self, url_id):
+        """source of a urls row ('telegram', 'manual', ...), or None if
+        there is no such row."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT source FROM urls WHERE id = ?", (url_id,)).fetchone()
+            return row[0] if row else None
+
+    def latest_page_id(self, url_id):
+        """id of the most recently scanned page of a url, or None."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM pages WHERE url_id = ? "
+                "ORDER BY scanned_at DESC LIMIT 1", (url_id,)).fetchone()
+            return row[0] if row else None
+
+    def get_url_by_tg_channel_id(self, channel_id):
+        """(url_id, tg_username) of the row tracking a Telegram channel id,
+        or None."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id, tg_username FROM urls "
+                "WHERE tg_channel_id = ? LIMIT 1", (channel_id,)).fetchone()
+            return (row[0], row[1]) if row else None
+
     def add_monitor_event(self, url_id, status, pages, findings,
                            page_id=None, note=None):
         with self.lock:
@@ -2454,30 +2486,26 @@ class DataExtractor:
 # ─── Screenshot Engine ───────────────────────────────────────────────────────
 
 class ScreenshotEngine:
-    """Captures page screenshots by rendering fetched HTML offline.
+    """Captures a screenshot and thumbnail of a crawled page.
 
-    Safety:
-    - JavaScript execution DISABLED
-    - ALL network requests BLOCKED (route → abort)
-    - Renders already-fetched HTML via set_content (no navigation)
-    - Graceful fallback if Playwright is not installed
+    Two modes (config.crawler.screenshot_mode; any other value means
+    "tor_render"):
+    - "tor_render" (the default): the browser loads the page itself through
+      the Tor SOCKS proxy (proxy_url), so CSS and same-origin images show.
+      Only same-origin requests go out; scripts, websockets, media and every
+      cross-origin request are aborted. A page that fails to load (most
+      often a redirect, which FIREFOX_PREFS disables) falls back to
+      offline rendering. Without a proxy_url it renders offline.
+    - "offline": renders the HTML the crawler already fetched via
+      set_content, with every network request aborted, so the site is not
+      hit a second time. The browser's proxy is DEAD_PROXY, so anything
+      that slips past the route handler fails instead of going out.
 
-    Async migration note (Phase 5b of the roadmap):
-    This class uses playwright.sync_api. sync_api is thread-bound — the
-    browser + context + page must all be used from the thread that
-    created them. That's why _crawl_lock serializes scans; it's why we
-    can't parallelize screenshotting within a scan. To lift that, the
-    migration path is:
+    In both modes JavaScript is disabled, each capture gets a fresh browser
+    context, and a missing Playwright makes capture() return (None, None).
 
-      1. Replace sync_playwright with playwright.async_api.
-      2. Run the browser on a dedicated asyncio loop (see
-         PersistentTelethonLoop for the pattern).
-      3. Submit page.goto / page.screenshot coroutines from worker
-         threads via run_coroutine_threadsafe, unlocking parallelism.
-
-    Not done here — current serialized path is correct and fast enough
-    for single-operator scans. Enable via config.crawler.async_playwright
-    = true once implemented.
+    sync_playwright is thread-bound: one ScreenshotWorker thread owns the
+    engine and runs every capture.
     """
 
     # Stealth launch args — reduce the headless-browser fingerprint footprint.
@@ -2655,8 +2683,9 @@ class ScreenshotEngine:
                 except Exception: pass
 
     def capture(self, html_content, url, timestamp=None):
-        """Render HTML offline, screenshot + thumbnail. Returns
-        (screenshot_path, thumbnail_path) or (None, None).
+        """Render the page (see the class docstring for the modes),
+        screenshot + thumbnail. Returns (screenshot_path, thumbnail_path)
+        or (None, None).
         Hard-capped at 30s total to prevent crawl-wide Playwright hangs.
         """
         if not self._ensure_browser():
@@ -2896,8 +2925,7 @@ class ResponseValidator:
 try:
     from telethon import TelegramClient
     from telethon.errors import (
-        SessionPasswordNeededError, PhoneCodeInvalidError,
-        FloodWaitError, AuthKeyUnregisteredError,
+        SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError,
     )
     from telethon.tl.types import Channel, Chat
     from telethon.utils import resolve_id as tg_resolve_id
@@ -3054,12 +3082,6 @@ class ClientProfile:
             cls._chosen = random.choice(cls.PROFILES)
         return cls._chosen
 
-    @classmethod
-    def reset(cls):
-        """Force a re-selection on next `current()`. Useful for tests;
-        production flow should let it persist for the container's life."""
-        cls._chosen = None
-
 
 class DarkMTProto:
     """The DarkMTProto engine — DarkWatch's customized, CTI-aware wrapper
@@ -3102,7 +3124,6 @@ class DarkMTProto:
         self.proxy_user = tg.get("proxy_user") or ""
         self.proxy_password = tg.get("proxy_password") or ""
         self.use_tor = bool(tg.get("use_tor"))
-        self.scrape_delay_s = int(tg.get("scrape_delay_s") or 3)
         self.scrape_limit = int(tg.get("scrape_limit_per_tick") or 100)
         # Auth round-trip state: phone_code_hash from auth_send_code has
         # to echo back in auth_confirm.
@@ -3158,26 +3179,6 @@ class DarkMTProto:
         of 'scraper returns 0 messages' reports. Lives in one place so
         every call site gets the same rule."""
         return f"@{username}" if username else channel_id
-
-    async def _with_client(self, fn, *, require_auth=True, on_auth_fail=None):
-        """Run `fn(client)` with a connected, authenticated client and
-        guaranteed disconnect. Centralizes the connect / auth-check /
-        try/finally boilerplate that's in ~15 methods. `on_auth_fail`
-        is the value returned when auth is required but missing.
-
-        Coroutines that want a different shape can still call
-        _build_client() directly — this helper is opt-in."""
-        c = self._build_client()
-        await c.connect()
-        try:
-            if require_auth and not await c.is_user_authorized():
-                log.warning("[darkmtproto] not authenticated — "
-                            "session expired or never completed")
-                return on_auth_fail
-            return await fn(c)
-        finally:
-            try: await c.disconnect()
-            except Exception: pass
 
     def set_mode(self, mode="safe"):
         """Swap rate-limiter + budget for a single operation (e.g. one
@@ -3671,8 +3672,7 @@ class DarkMTProto:
             from telethon.tl.functions.channels import (
                 GetFullChannelRequest, GetParticipantsRequest)
             from telethon.tl.types import (
-                ChannelParticipantsAdmins, ChannelParticipantCreator,
-                ChatAdminRights)
+                ChannelParticipantsAdmins, ChannelParticipantCreator)
             c = self._build_client()
             await c.connect()
             try:
@@ -4272,7 +4272,7 @@ class DarkMTProto:
         self._record_call(channel_id)
         entity = self._entity_ref(channel_id, username)
         async def _go():
-            from telethon.tl.types import Channel, Chat
+            from telethon.tl.types import Channel
             c = self._build_client()
             await c.connect()
             try:
@@ -4995,64 +4995,6 @@ class DarkMTProto:
 TelegramScraper = DarkMTProto
 
 
-# ─── Persistent Telethon loop (infra for future migration) ───────────────────
-
-class PersistentTelethonLoop:
-    """A dedicated thread owning one asyncio event loop. Callers submit
-    coroutines via submit(); the loop runs them and the calling thread
-    blocks on the returned Future.
-
-    Benefits over per-call asyncio.run(): no connect/disconnect churn (a
-    persistent client lives on this loop), better fingerprint (normal
-    clients stay connected), unlocks QR login + live events on the same
-    client. Currently UNUSED in the hot path — each scraper method still
-    runs its own asyncio.run — this class is infrastructure for a future
-    migration. Enabled via config.telegram.persistent_client=true, then
-    consumers should route through run_on_persistent() instead of
-    _run_coro.
-
-    Not yet enabled because the migration touches every scraper method
-    and requires careful thread-safety review (shared client state +
-    re-entrancy). Ship as opt-in once the migration is complete."""
-
-    def __init__(self):
-        self._loop = None
-        self._thread = None
-        self._ready = threading.Event()
-
-    def start(self):
-        if self._thread and self._thread.is_alive(): return
-        self._thread = threading.Thread(
-            target=self._run, name="TelethonPersistent", daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=5)
-
-    def _run(self):
-        import asyncio
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._ready.set()
-        try: self._loop.run_forever()
-        finally:
-            try: self._loop.close()
-            except Exception: pass
-            self._loop = None
-
-    def stop(self, timeout=5):
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=timeout)
-
-    def submit(self, coro):
-        """Run `coro` on the persistent loop, block until it returns."""
-        import asyncio
-        if not self._loop or not self._loop.is_running():
-            raise RuntimeError("persistent loop not running — call start()")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
-
-
 # ─── Real-time live listener ─────────────────────────────────────────────────
 
 class TelegramLiveListener:
@@ -5569,7 +5511,7 @@ class DarkWebCrawler:
                             "download exceeded total time limit")
                     total += len(chunk)
                     if total > max_size:
-                        log.warning(f"  Response exceeded size limit, aborting")
+                        log.warning("  Response exceeded size limit, aborting")
                         resp.close()
                         return None, "size"
                     chunks.append(chunk)
@@ -5593,7 +5535,7 @@ class DarkWebCrawler:
                 if last_category == "http_4xx":
                     return None, last_category
 
-            except requests.exceptions.ReadTimeout as e:
+            except requests.exceptions.ReadTimeout:
                 last_category = "timeout"
                 log.warning(f"  Timeout attempt {attempt}/{self.retries}: {url}")
             except requests.exceptions.ConnectionError as e:
@@ -6267,13 +6209,12 @@ class DarkWebCrawler:
         if not url.startswith("http"):
             url = f"http://{url}"
         self.db.add_url(url, source="manual")
-        rows = self.db.conn.execute("SELECT id, url FROM urls WHERE url = ?", (url,)).fetchall()
-        if not rows:
+        url_id = self.db.get_url_id(url)
+        if url_id is None:
             log.error("Failed to add URL to database")
             return
-        url_id, db_url = rows[0]
-        log.info(f"Crawling: {db_url}")
-        pages, findings = self.crawl_site(url_id, db_url, stop_event=stop_event, max_depth=max_depth)
+        log.info(f"Crawling: {url}")
+        pages, findings = self.crawl_site(url_id, url, stop_event=stop_event, max_depth=max_depth)
         self.db.update_scan(url_id, 200 if pages > 0 else 404)
         log.info(f"Done: {pages} pages scanned, {findings} findings")
         return pages, findings
@@ -6330,7 +6271,7 @@ class DarkWebCrawler:
         self.db.log_scan(started, finished, len(urls), total_pages, total_findings, total_errors)
 
         log.info(f"\n{'='*60}")
-        log.info(f"Scan complete")
+        log.info("Scan complete")
         log.info(f"URLs: {len(urls)} | Pages: {total_pages} | Findings: {total_findings} | Errors: {total_errors}")
         log.info(f"{'='*60}")
 

@@ -306,3 +306,93 @@ def test_scan_tg_message_links_the_inserted_page(tmp_path):
     assert db.conn.execute(
         "SELECT page_url FROM pages WHERE id = ?",
         (page_id,)).fetchone()[0] == "https://t.me/leaks/7"
+
+
+# ── Lookups go through Database, under its lock ─────────────────────────────
+
+def _unlocked_statements(db, call):
+    """Run `call()` and return every SQL statement it sent while db.lock
+    was free. The tests are single-threaded, so a held lock is the
+    caller's own."""
+    bad = []
+    db.conn.set_trace_callback(
+        lambda sql: None if db.lock.locked() else bad.append(sql))
+    try:
+        call()
+    finally:
+        db.conn.set_trace_callback(None)
+    return bad
+
+
+def test_url_lookup_helpers(tmp_path):
+    from darkwatch import Database
+
+    db = Database(str(tmp_path / "dw.db"))
+    db.add_url("http://a.onion")
+    url_id = db.get_url_id("http://a.onion")
+    assert url_id is not None and db.get_url_id("http://b.onion") is None
+    assert db.get_url_source(url_id) == "manual"
+    assert db.get_url_source(url_id + 99) is None
+    assert db.latest_page_id(url_id) is None
+    db.conn.execute(
+        "INSERT INTO pages (url_id, page_url, scanned_at) VALUES "
+        "(?, 'http://a.onion/old', '2026-01-01'), "
+        "(?, 'http://a.onion/new', '2026-02-01')", (url_id, url_id))
+    newest = db.conn.execute(
+        "SELECT id FROM pages WHERE page_url = 'http://a.onion/new'").fetchone()[0]
+    assert db.latest_page_id(url_id) == newest
+    tg_id = db.upsert_tg_channel("chan", 4242, title="chan")
+    assert db.get_url_by_tg_channel_id(4242) == (tg_id, "chan")
+    assert db.get_url_by_tg_channel_id(4243) is None
+    # add_url still returns nothing (INSERT OR IGNORE has no reliable id).
+    assert db.add_url("http://a.onion") is None
+
+    assert _unlocked_statements(db, lambda: (
+        db.get_url_id("http://a.onion"), db.get_url_source(url_id),
+        db.latest_page_id(url_id), db.get_url_by_tg_channel_id(4242))) == []
+
+
+def test_web_and_crawl_url_lookups_hold_the_db_lock(web, tmp_path, monkeypatch):
+    """The scan thread, the monitor and the live consumer share one
+    sqlite connection with every other thread, so they must not query it
+    without the lock."""
+    import queue
+    import threading
+
+    from darkwatch import Database, DarkWebCrawler
+
+    db = Database(str(tmp_path / "dw.db"))
+    crawler = DarkWebCrawler.__new__(DarkWebCrawler)
+    crawler.db = db
+
+    def crawl_site(url_id, url, **kw):
+        db.add_page(url_id, url + "/p", "t", "h-" + url)
+        return 1, 0
+    crawler.crawl_site = crawl_site
+    monkeypatch.setattr(web, "_crawler", crawler)
+    monkeypatch.setattr(web, "_stop_event", threading.Event())
+
+    assert _unlocked_statements(db, lambda: web._run_scan(["http://scan.onion"], 0)) == []
+    assert _unlocked_statements(db, lambda: crawler.crawl_url("http://cli.onion")) == []
+    url_id = db.get_url_id("http://scan.onion")
+    assert url_id is not None
+    assert _unlocked_statements(db, lambda: web._monitor_one(url_id, "http://scan.onion")) == []
+    assert db.conn.execute(
+        "SELECT page_id FROM monitor_events WHERE url_id = ?", (url_id,)
+    ).fetchone()[0] == db.latest_page_id(url_id)
+
+    tg_id = db.upsert_tg_channel("live", 777, title="live")
+    monkeypatch.setattr(web, "_monitor_tg_channel", lambda _id: (0, 0, None))
+    assert _unlocked_statements(db, lambda: web._monitor_one(tg_id, "tg://live")) == []
+
+    stop, q, scanned = threading.Event(), queue.Queue(), []
+
+    def scan_tg_message(*a):
+        scanned.append(a[:2])
+        stop.set()
+    crawler.scan_tg_message = scan_tg_message
+    monkeypatch.setattr(web, "_tg_live_stop", stop)
+    monkeypatch.setattr(web, "_tg_live_queue", q)
+    q.put({"channel_id": 777, "username": "live", "msg": {"msg_id": 1}})
+    assert _unlocked_statements(db, web._tg_live_consumer) == []
+    assert scanned == [(tg_id, "live")]

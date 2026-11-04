@@ -71,6 +71,11 @@ jobs:
         run: for f in ops/*.sh ops/lib/*.sh tor/entrypoint.sh darkwatch/scan.sh tests/*/check.sh; do bash -n "$f"; done
       - name: shellcheck (warnings and errors)
         run: shellcheck -S warning ops/*.sh ops/lib/*.sh tor/*.sh tunnels/killswitch/*.sh tests/*/*.sh darkwatch/scan.sh
+      # Unused imports and variables, f-strings without placeholders,
+      # undefined names. */*.py is the application code; the tests are
+      # left out.
+      - name: pyflakes (pinned)
+        run: pip install pyflakes==4.1.0 && python -m pyflakes */*.py
       - name: WireGuard kill switch (network namespace test)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq python3-pyroute2 >/dev/null

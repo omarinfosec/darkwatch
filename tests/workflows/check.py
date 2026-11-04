@@ -2,7 +2,8 @@
 
 Static: release.yml runs ci.yml through workflow_call, skips manual runs
 off main, and gates the release job on it; ci.yml can be called; Dependabot
-and the gitleaks job are configured as documented.
+and the gitleaks job are configured as documented; CI runs a pinned
+pyflakes.
 
 Behaviour: the release job's shell steps run in order, as Actions would
 (bash -eo pipefail, $GITHUB_ENV between steps), against throwaway git
@@ -159,6 +160,12 @@ shell_runs = [s.get("run", "") for s in ci["jobs"]["shell-and-compose"]["steps"]
 "bash ops/lock-deps.sh --check" in shell_runs or die("CI does not check the locks against requirements.in")
 "bash tests/lock-deps/check.sh" in shell_runs or die("CI does not run tests/lock-deps/check.sh")
 ok("CI installs the lock (hash-checked) and the test tools in separate steps and checks lock staleness")
+
+flakes = [r for r in shell_runs if "pyflakes" in r]
+(len(flakes) == 1 and re.search(r"pip install pyflakes==\d+\.\d+\.\d+ ", flakes[0])
+ and flakes[0].rstrip().endswith("python -m pyflakes */*.py")) \
+    or die(f"CI does not run a pinned pyflakes over */*.py: {flakes}")
+ok("CI runs a pinned pyflakes over the application code")
 
 
 # ─── Behaviour: run the release job's steps ─────────────────────────────────

@@ -506,7 +506,7 @@ mkdir -p "$T/repo/darkwatch"
 cp -a "$repo/darkwatch/config.json" "$T/repo/darkwatch/"
 git -C "$T/repo" init -q && git -C "$T/repo" add -A && git -C "$T/repo" commit -qm v1
 seed
-sed -i 's/"max_threads": [0-9]*/"max_threads": 1/' "$T/repo/darkwatch/config.json"
+sed -i 's/"max_depth": [0-9]*/"max_depth": 1/' "$T/repo/darkwatch/config.json"
 git -C "$T/repo" diff --quiet && die "fixture: config.json not modified"
 deploy
 expect_fail "dirty config.json" "darkwatch/config.json has local edits"; no_compose "dirty config.json"

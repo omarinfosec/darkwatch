@@ -20,7 +20,6 @@ import os
 import queue
 import random
 import socket
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -32,7 +31,7 @@ from flask import Flask, abort, jsonify, redirect, request, send_file, Response
 
 from darkwatch import (DarkWebCrawler, TelegramScraper, TelegramLiveListener,
                         load_config, setup_logging, onion_url_error,
-                        utcnow, __version__, PLAYWRIGHT_AVAILABLE, TELETHON_AVAILABLE)
+                        utcnow, __version__, PLAYWRIGHT_AVAILABLE)
 from threat_intel import ThreatIntelFeed
 
 
@@ -872,14 +871,11 @@ def _run_scan(urls, depth):
                 url = f"http://{url}"
             try:
                 _crawler.db.add_url(url, source="web-ui")
-                row = _crawler.db.conn.execute(
-                    "SELECT id FROM urls WHERE url = ?", (url,)
-                ).fetchone()
-                if not row:
+                url_id = _crawler.db.get_url_id(url)
+                if url_id is None:
                     log.error(f"Could not add {url} to DB")
                     total_errors += 1
                     continue
-                url_id = row[0]
                 # NEWNYM between targets (best-effort)
                 if i > 0:
                     _crawler.rotate_tor_circuit()
@@ -1032,10 +1028,7 @@ def _monitor_one(url_id, url):
     crawl for .onion rows, Telegram fetch for tg:// rows."""
     try:
         # Look up the source once so the monitor loop doesn't have to.
-        row = _crawler.db.conn.execute(
-            "SELECT source FROM urls WHERE id = ?", (url_id,)
-        ).fetchone()
-        source = row[0] if row else None
+        source = _crawler.db.get_url_source(url_id)
 
         if source == "telegram":
             # Separate path — scraper uses its own SOCKS tunnel; crawl_site
@@ -1054,11 +1047,7 @@ def _monitor_one(url_id, url):
                 ev_status, note = 200, None
             else:
                 ev_status, note = 204, "no new messages"
-            row = _crawler.db.conn.execute(
-                "SELECT id FROM pages WHERE url_id = ? "
-                "ORDER BY scanned_at DESC LIMIT 1", (url_id,)
-            ).fetchone()
-            page_id = row[0] if row else None
+            page_id = _crawler.db.latest_page_id(url_id)
             _crawler.db.add_monitor_event(
                 url_id, status=ev_status, pages=pages,
                 findings=findings, page_id=page_id, note=note)
@@ -1075,11 +1064,7 @@ def _monitor_one(url_id, url):
         _crawler.db.update_scan(url_id, status)
         # Pick the most recent page row for THIS url_id — that's what the
         # screenshot belongs to.
-        row = _crawler.db.conn.execute(
-            "SELECT id FROM pages WHERE url_id = ? "
-            "ORDER BY scanned_at DESC LIMIT 1", (url_id,)
-        ).fetchone()
-        page_id = row[0] if row else None
+        page_id = _crawler.db.latest_page_id(url_id)
         _crawler.db.add_monitor_event(
             url_id, status=status, pages=pages,
             findings=findings, page_id=page_id)
@@ -1262,13 +1247,10 @@ def _tg_live_consumer():
             continue
         try:
             # Map channel_id → url_id via the DB.
-            row = _crawler.db.conn.execute(
-                "SELECT id, tg_username FROM urls "
-                "WHERE tg_channel_id = ? LIMIT 1",
-                (ev["channel_id"],)).fetchone()
+            row = _crawler.db.get_url_by_tg_channel_id(ev["channel_id"])
             if not row:
                 continue
-            url_id, uname = row[0], row[1]
+            url_id, uname = row
             with _tg_lock:
                 _crawler.scan_tg_message(url_id, uname, ev["msg"])
             log.info(f"[tg-live] scanned @{uname} #{ev['msg']['msg_id']}")
@@ -1324,7 +1306,7 @@ def route_metrics():
     misconfigured scraper sees a helpful body instead of a 500."""
     try:
         from prometheus_client import (
-            Gauge, Counter, CollectorRegistry, generate_latest,
+            Gauge, CollectorRegistry, generate_latest,
             CONTENT_TYPE_LATEST)
     except ImportError:
         return Response("prometheus_client not installed\n",
@@ -3123,18 +3105,27 @@ def route_thumbnail(page_id):
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
-# Stagger already-due monitored URLs on boot so the first scheduler tick
-# doesn't fire N scans back-to-back after a container restart.
-_staggered = _crawler.db.stagger_due_monitors(utcnow())
-if _staggered:
-    log.info(f"Staggering {_staggered} due monitors on boot")
-
-_start_health_refresh_thread()
-_start_monitor_thread()
-_start_tg_live()
+def start_background_services():
+    """Start the health-refresh thread, both monitor schedulers and (when
+    enabled) the live Telegram listener. Importing this module starts
+    none of them, so tests and tools can import it without a scheduler
+    crawling or polling Telegram in the background; `python web.py` (the
+    image's CMD) calls this before serving. A WSGI server that imports
+    `web:app` instead must call web.start_background_services() once, in
+    a single process: every worker that calls it runs its own
+    schedulers."""
+    # Stagger already-due monitored URLs on boot so the first scheduler
+    # tick doesn't fire N scans back-to-back after a container restart.
+    staggered = _crawler.db.stagger_due_monitors(utcnow())
+    if staggered:
+        log.info(f"Staggering {staggered} due monitors on boot")
+    _start_health_refresh_thread()
+    _start_monitor_thread()
+    _start_tg_live()
 
 
 if __name__ == "__main__":
+    start_background_services()
     # Threaded Flask so health checks and status polls don't block each other
     # while a scan thread is running.
     app.run(host="0.0.0.0", port=8080, threaded=True, debug=False)

@@ -38,6 +38,26 @@ run() {
 run "darkwatch: import darkwatch, threat_intel, web" \
     "$DARKWATCH_IMAGE" python -c 'import darkwatch, threat_intel, web'
 
+# Importing web starts no background thread (darkwatch/tests/
+# test_web_startup.py); `python web.py`, the image's CMD, must start the
+# health refresh and both monitor schedulers before it serves. Flask.run is
+# stubbed, so nothing listens; os._exit skips the daemon threads' shutdown.
+run "darkwatch: python web.py starts the background services" \
+    -w /app "$DARKWATCH_IMAGE" python -c '
+import os, runpy, sys, threading, flask
+def check(self, *a, **kw):
+    names = {t.name for t in threading.enumerate()}
+    missing = {"health-refresh", "MonitorScheduler", "TelegramMonitor"} - names
+    print("threads:", ", ".join(sorted(names)), flush=True)
+    if missing:
+        print("missing:", ", ".join(sorted(missing)), file=sys.stderr, flush=True)
+    os._exit(1 if missing else 0)
+flask.Flask.run = check
+sys.argv = ["web.py"]
+runpy.run_path("web.py", run_name="__main__")
+sys.exit("web.py returned without calling app.run()")
+'
+
 # The two wheel-only native packages (Dockerfile --only-binary). Telethon
 # silently falls back to pure-Python AES without cryptg, so check that it
 # picked cryptg up, round-trip one block, and run one YARA match.

@@ -77,6 +77,18 @@
   characters; if you set a shorter one by hand, replace it with
   `openssl rand -hex 32` (no restart needed).
 
+- **Unused settings removed.** `crawler.max_threads`,
+  `telegram.scrape_delay_s` and `telegram.persistent_client` are gone from
+  `config.json` and the built-in defaults. None of them was ever read, so
+  nothing changes; a copy left in `config.local.json` is still ignored and
+  can be deleted.
+- **`import web` no longer starts the monitor schedulers.** The health
+  refresh, both monitor schedulers and the live Telegram listener now start
+  in `web.start_background_services()`, which `python web.py` (the image's
+  command) calls before serving. Nothing changes for the shipped image. If
+  you run the dashboard under a WSGI server that imports `web:app`, call
+  `web.start_background_services()` once, from a single process.
+
 ### Security
 - The Setup UI session cookie no longer contains `SETUP_AUTH_TOKEN`. It
   holds the issue time and an HMAC of it keyed by the token, is valid for
@@ -290,6 +302,11 @@
 - `darkwatch.py --config` now defaults to `$DARKWATCH_CONFIG` (else
   `config.json`), as `web.py` already did, so the CLI and `--retention`
   read the same config as the dashboard.
+- `web.py` (scan thread, monitor, live Telegram consumer) and
+  `darkwatch.py --url` looked up url and page ids on the shared database
+  connection without the database lock, racing the other threads that use
+  it. They now go through locked `Database` helpers (`get_url_id`,
+  `get_url_source`, `latest_page_id`, `get_url_by_tg_channel_id`).
 
 ### Internal
 - New `darkwatch/tests/test_sanitizer.py` covers the saved-page sanitizer,
@@ -390,6 +407,18 @@
   The dashboard test fixture moved to `darkwatch/tests/conftest.py` and is
   session-scoped, so test modules share the one import of `web`; it still
   sets its environment only around that import.
+- Removed dead code: `PersistentTelethonLoop`, `ClientProfile.reset`,
+  `DarkMTProto._with_client`, Setup's unused `_restart_services` (the
+  Setup UI restarts services with `docker compose`), an unreachable `raise`
+  in `telegram_validate.validate_telegram_credentials`, and the unused
+  imports, variables and placeholder-less f-strings pyflakes reported.
+  The `ScreenshotEngine` docstring, which described offline rendering
+  only, now describes the `tor_render` default and the `offline` mode.
+- CI runs a pinned pyflakes (4.1.0) over the application code (`*/*.py`,
+  tests excluded). New `darkwatch/tests/test_web_startup.py` checks that
+  importing `web` starts no background thread and `python web.py` starts
+  them before serving; the image smoke test checks the latter in the built
+  image.
 
 ## v0.3.1 — 2026-11-04
 
