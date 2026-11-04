@@ -8,7 +8,7 @@ The database lives in dw_db.py and the Telegram engine in dw_telegram.py;
 their names are re-exported here (see the imports below).
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 import os
 import sys

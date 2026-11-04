@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-11-04
+
+Feature and hardening release: Telegram ingestion no longer skips or drops
+messages, CI builds and smoke-tests the images, dependencies are hash-locked,
+database retention, optional dashboard login, Python 3.13 / Debian trixie
+images. Read the upgrade notes and take a backup first (RUNBOOK).
 
 ### Upgrade notes
 - Telethon 1.45 upgrades the Telegram login file
