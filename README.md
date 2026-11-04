@@ -54,7 +54,7 @@ Runs via `docker compose` on a single Linux VM. Operator state — credentials, 
 
 - **Not a tool for accessing illegal content.** The crawler exists to detect and triage threats. What you do with what it finds is on you, and your legal posture is your responsibility.
 - **Not a turn-key SaaS.** You bring your own VM, your own VPN, your own YARA rules, and your own legal review.
-- **Not safe to expose to the public internet.** The DarkWatch dashboard (:8080) has no built-in login (it only accepts requests addressed to localhost / `DARKWATCH_BIND_IP`; set `DARKWATCH_ALLOWED_HOSTS` for a reverse proxy), and the Setup UI (:8082) is gated by a bearer token — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
+- **Not safe to expose to the public internet.** The DarkWatch dashboard (:8080) has no built-in login (it only accepts requests addressed to localhost / `DARKWATCH_BIND_IP`, and rejects requests from other sites and framing; set `DARKWATCH_ALLOWED_HOSTS` for a reverse proxy), and the Setup UI (:8082) is gated by a bearer token — reach them via SSH port-forward, your own VPN, or a reverse proxy with auth that *you* configure. The `DARKWATCH_BIND_IP` env var controls the bind interface; it defaults to `127.0.0.1`.
 
 ## Architecture
 

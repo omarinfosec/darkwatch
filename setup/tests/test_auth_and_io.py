@@ -271,3 +271,27 @@ def test_tor_image_name_matches_compose():
         os.path.abspath(__file__)))), "docker-compose.yml")
     with open(compose) as f:
         assert f"image: {main.TOR_IMAGE}\n" in f.read()
+
+
+def _assert_baseline_headers(r):
+    assert r.headers["x-frame-options"] == "DENY"
+    assert r.headers["content-security-policy"] == "frame-ancestors 'none'"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["referrer-policy"] == "same-origin"
+
+
+def test_security_headers_and_no_store(client):
+    # Login page, token redirect and an API error all carry the headers and
+    # must not be cached (the redirect sets the session cookie).
+    for r in (client.get("/"),
+              client.get(f"/?token={TOKEN}", follow_redirects=False),
+              client.get("/api/state")):
+        _assert_baseline_headers(r)
+        assert r.headers["cache-control"] == "no-store"
+
+
+def test_static_files_keep_cacheable_headers(client):
+    r = client.get("/static/style.css")
+    assert r.status_code == 200
+    _assert_baseline_headers(r)
+    assert "no-store" not in r.headers.get("cache-control", "")

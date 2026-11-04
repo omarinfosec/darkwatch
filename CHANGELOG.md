@@ -93,6 +93,22 @@
   old `TG_SOCKS_PASSWORD` or `TOR_CONTROL_PASSWORD`. It now passes only
   `PATH`, `HOME`, locale, `TZ`, `TMPDIR`, `DOCKER_*`, the proxy variables and
   its host paths.
+- The dashboard's request guard also covers GET requests. It checked only
+  writes, so a page the operator visited could trigger a live Telegram user
+  lookup (`<img src=".../api/telegram/user/...?download=1">`) or an export
+  through the operator's browser. Any request with `Sec-Fetch-Site:
+  cross-site` now gets 403, except a top-level navigation to `/` (a link to
+  the dashboard). An `Origin` header on any method must name an allowed host,
+  and `Origin: null` is rejected. Same-origin, same-site and header-less
+  requests (curl, healthchecks, Prometheus) are unaffected. The user lookup's
+  `photo_limit` is clamped to 1-50 and a non-number is a 400, not a 500.
+- The dashboard and the Setup UI send `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'`,
+  `X-Content-Type-Options: nosniff` and `Referrer-Policy: same-origin` on
+  every response, so neither can be framed (clickjacking). Dashboard
+  `/api/*` responses (findings, Telegram data, exports, screenshots) and all
+  Setup UI responses except `/static/` are `Cache-Control: no-store`.
+  Downloaded Telegram media keeps its own sandbox CSP.
 
 ### Fixed
 - `verify-egress.sh` checks that are real:

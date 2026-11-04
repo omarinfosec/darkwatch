@@ -1,6 +1,6 @@
-"""Dashboard request guard (DNS rebinding / cross-site), CSV formula
-escaping, int-param validation, YARA include blocking, and threat-intel
-refresh keeping a failed feed's previous rule."""
+"""Dashboard request guard (DNS rebinding / cross-site), security headers,
+CSV formula escaping, int-param validation, YARA include blocking, and
+threat-intel refresh keeping a failed feed's previous rule."""
 
 import json
 import os
@@ -50,6 +50,133 @@ def test_cross_site_writes_rejected(web):
     r = c.post("/api/stop", base_url=base, headers={"Origin": base,
                                                     "Sec-Fetch-Site": "same-origin"})
     assert r.status_code != 403
+
+
+BASE = "http://127.0.0.1:8080"
+
+
+def _site(site, mode=None, dest=None):
+    h = {"Sec-Fetch-Site": site}
+    if mode:
+        h["Sec-Fetch-Mode"] = mode
+    if dest:
+        h["Sec-Fetch-Dest"] = dest
+    return h
+
+
+def test_cross_site_reads_rejected(web):
+    c = web.app.test_client()
+    # <img src="http://127.0.0.1:8080/api/telegram/user/x"> on another site
+    # would fire a live Telegram lookup.
+    r = c.get("/api/telegram/user/someone?download=1", base_url=BASE,
+              headers=_site("cross-site", "no-cors", "image"))
+    assert r.status_code == 403
+    # A cross-site link straight to an API route or export.
+    r = c.get("/api/findings", base_url=BASE,
+              headers=_site("cross-site", "navigate", "document"))
+    assert r.status_code == 403
+    r = c.get("/api/telegram/channels/1/export.csv", base_url=BASE,
+              headers=_site("cross-site", "navigate", "document"))
+    assert r.status_code == 403
+    # Framing the dashboard from another site.
+    assert c.get("/", base_url=BASE, headers=_site(
+        "cross-site", "navigate", "iframe")).status_code == 403
+    # A fetch()/no-cors subresource load of "/" is not a navigation.
+    assert c.get("/", base_url=BASE, headers=_site(
+        "cross-site", "no-cors", "empty")).status_code == 403
+    # Only GET is let through, not a cross-site form POST to "/".
+    assert c.post("/", base_url=BASE, headers=_site(
+        "cross-site", "navigate", "document")).status_code == 403
+
+
+def test_cross_site_navigation_to_root_allowed(web):
+    c = web.app.test_client()
+    r = c.get("/", base_url=BASE, headers=_site("cross-site", "navigate", "document"))
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize("headers", [
+    {},
+    _site("same-origin", "cors", "empty"),
+    _site("same-site", "no-cors", "image"),
+    _site("none", "navigate", "document"),
+    {"Origin": BASE, "Sec-Fetch-Site": "same-origin"},
+    {"Origin": "http://localhost:8080"},
+])
+def test_same_origin_and_headerless_reads_allowed(web, headers):
+    c = web.app.test_client()
+    assert c.get("/", base_url=BASE, headers=headers).status_code == 200
+    assert c.get("/api/findings", base_url=BASE, headers=headers).status_code == 200
+
+
+def test_bad_origin_rejected_on_reads(web):
+    c = web.app.test_client()
+    assert c.get("/api/findings", base_url=BASE,
+                 headers={"Origin": "null"}).status_code == 403
+    assert c.get("/api/findings", base_url=BASE,
+                 headers={"Origin": "https://evil.example"}).status_code == 403
+
+
+def test_user_lookup_photo_limit_is_capped(web, monkeypatch):
+    seen = []
+    monkeypatch.setattr(web._tg, "configured", lambda: True)
+    monkeypatch.setattr(web._tg, "lookup_user",
+                        lambda handle, **kw: seen.append(kw["photo_history_limit"]) or {})
+    c = web.app.test_client()
+    for q, want in (("", 10), ("&photo_limit=0", 1), ("&photo_limit=-5", 1),
+                    ("&photo_limit=7", 7), ("&photo_limit=100000", 50)):
+        assert c.get(f"/api/telegram/user/someone?photos=1{q}",
+                     base_url=BASE).status_code == 200
+        assert seen.pop() == want
+    assert c.get("/api/telegram/user/someone?photo_limit=x",
+                 base_url=BASE).status_code == 400
+    assert seen == []
+
+
+def _assert_baseline_headers(r, csp="frame-ancestors 'none'"):
+    assert r.headers["X-Frame-Options"] == "DENY"
+    assert r.headers["Content-Security-Policy"] == csp
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["Referrer-Policy"] == "same-origin"
+
+
+def test_security_headers(web, monkeypatch):
+    c = web.app.test_client()
+    r = c.get("/", base_url=BASE)
+    _assert_baseline_headers(r)
+    assert "no-store" not in r.headers.get("Cache-Control", "")
+    for path in ("/api/findings", "/api/telegram/channels/1/export.bogus"):
+        r = c.get(path, base_url=BASE)
+        _assert_baseline_headers(r)
+        assert r.headers["Cache-Control"] == "no-store"
+    # Guard rejections carry them too.
+    r = c.get("/api/findings", base_url=BASE, headers={"Origin": "null"})
+    assert r.status_code == 403
+    _assert_baseline_headers(r)
+    assert r.headers["Cache-Control"] == "no-store"
+    # send_file sets its own Cache-Control ("no-cache"); /api/* still ends
+    # up no-store.
+    thumb = os.path.join(web._crawler.thumbnails_dir, "t.png")
+    os.makedirs(os.path.dirname(thumb), exist_ok=True)
+    with open(thumb, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(web._crawler.db, "get_page_screenshot",
+                        lambda pid: {"thumbnail_path": thumb})
+    r = c.get("/api/thumbnail/1", base_url=BASE)
+    assert r.status_code == 200
+    _assert_baseline_headers(r)
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_tg_media_keeps_sandbox_csp(web):
+    media = os.path.join(web._crawler.loot_dir, "tg-media", "chan", "p.png")
+    os.makedirs(os.path.dirname(media), exist_ok=True)
+    with open(media, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+    c = web.app.test_client()
+    r = c.get("/loot/tg-media/chan/p.png", base_url=BASE)
+    assert r.status_code == 200
+    _assert_baseline_headers(r, csp="sandbox; default-src 'none'")
 
 
 def test_bad_int_params_are_400_not_500(web):

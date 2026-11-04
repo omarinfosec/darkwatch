@@ -63,7 +63,15 @@ app = Flask(__name__,
 # body-less endpoints (/api/stop, /api/rescan, ...). So:
 #   - the Host header must name this dashboard (loopback, DARKWATCH_BIND_IP,
 #     the container name, or DARKWATCH_ALLOWED_HOSTS for a reverse proxy);
-#   - state-changing requests must not come from another origin.
+#   - no request of any method may come from another site
+#     (Sec-Fetch-Site: cross-site). GETs matter too: a cross-site <img> or
+#     link can fire a live Telegram lookup (/api/telegram/user/...) or an
+#     export. The one exception is a top-level navigation to "/" (a link to
+#     the dashboard on another site), which only loads the page shell;
+#   - an Origin header, on any method, must name an allowed host; "null"
+#     (sandboxed iframe, file:// page) never does.
+# Browsers without Sec-Fetch-* and non-browser clients (curl, healthchecks,
+# Prometheus) send neither header and still get through on the Host check.
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "darkwatch"} | {
     h.strip().lower().strip("[]")
     for h in (os.environ.get("DARKWATCH_BIND_IP", ""),
@@ -84,9 +92,10 @@ def _hostname(value):
 def _request_guard():
     if _hostname(request.host) not in _ALLOWED_HOSTS:
         abort(403)
-    if request.method in ("GET", "HEAD", "OPTIONS"):
-        return None
-    if request.headers.get("Sec-Fetch-Site") == "cross-site":
+    if request.headers.get("Sec-Fetch-Site") == "cross-site" and not (
+            request.method == "GET" and request.path == "/"
+            and request.headers.get("Sec-Fetch-Mode") == "navigate"
+            and request.headers.get("Sec-Fetch-Dest") == "document"):
         abort(403)
     origin = request.headers.get("Origin")
     # "null" = sandboxed iframe / file:// page: never the dashboard itself.
@@ -94,6 +103,24 @@ def _request_guard():
                    or _hostname(urlsplit(origin).netloc) not in _ALLOWED_HOSTS):
         abort(403)
     return None
+
+
+@app.after_request
+def _security_headers(resp):
+    """Baseline headers on every response. setdefault so a route's own,
+    stricter value wins (tg-media keeps its sandbox CSP)."""
+    h = resp.headers
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    # Not no-referrer: that turns a form POST's Origin into "null", which the
+    # guard rejects.
+    h.setdefault("Referrer-Policy", "same-origin")
+    # API answers hold findings, Telegram data and exports. Assigned, not
+    # setdefault: send_file already sets "no-cache", which still stores.
+    if request.path.startswith("/api/"):
+        h["Cache-Control"] = "no-store"
+    return resp
 
 
 def _int_param(value, default):
@@ -1871,10 +1898,12 @@ def route_tg_user_lookup(handle):
     photos = (request.args.get("photos") or "1") not in ("0", "false", "no")
     download = (request.args.get("download") or "0") in ("1", "true", "yes")
     dest = os.path.join(_crawler.loot_dir, "tg-media", "users") if download else None
+    # Each photo is a Telegram request (and a download with download=1).
+    photo_limit = min(max(_int_param(request.args.get("photo_limit"), 10), 1), 50)
     with _tg_lock:
         info = _tg.lookup_user(
             handle, photo_history=photos,
-            photo_history_limit=int(request.args.get("photo_limit") or 10),
+            photo_history_limit=photo_limit,
             photo_dest_dir=dest)
     if info.get("error"):
         return jsonify(info), 400

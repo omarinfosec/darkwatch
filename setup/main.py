@@ -173,6 +173,22 @@ app.mount("/static", StaticFiles(directory=_BASE / "static"), name="static")
 templates = Jinja2Templates(directory=_BASE / "templates")
 
 
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Same baseline headers as the dashboard. Pages here show WireGuard
+    keys and Telegram credentials, so nothing but /static/ may be cached."""
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    # Not no-referrer: _same_origin falls back to Referer for older clients.
+    h.setdefault("Referrer-Policy", "same-origin")
+    if not request.url.path.startswith("/static/"):
+        h["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     if not _is_authenticated(request):
