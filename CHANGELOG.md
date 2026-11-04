@@ -113,7 +113,14 @@
   sign-ins are logged with the client IP only. Unset, as by default, nothing
   changes. `ops/deploy.sh` now warns, without failing, when
   `DARKWATCH_BIND_IP` is not a loopback address and no token is set, or when
-  the token is too short (never printing it).
+  the token is too short (never printing it). `ops/install.sh`, when you
+  let it bind the dashboard to the host's private IP, now offers to
+  generate the token into the env file (default yes, also with `--yes`) and
+  warns when you decline.
+  `ops/RUNBOOK.md`, "Roll back a release", now says what rolling back past
+  this release undoes: the older dashboard has no login (set
+  `DARKWATCH_BIND_IP=127.0.0.1` first), the older darkwatch ignores
+  `config.d/config.local.json`, and the retention cron job stays installed.
 
 ### Upgrades
 - Telethon 1.36 → 1.45.0 with python-socks 3.2.1 (both images);

@@ -227,7 +227,9 @@ services:
     # the corresponding feature (Tor crawl or Telegram scrape) is just
     # unavailable, and the dashboard shows it as such.
     healthcheck:
-      # /healthz, not /api/status — the latter drains the dashboard log queue.
+      # /healthz, not /api/status: /healthz is exempt from the optional
+      # dashboard login (DARKWATCH_AUTH_TOKEN), and /api/status queries the
+      # database on every call.
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz > /dev/null || exit 1"]
       interval: 15s
       timeout: 10s

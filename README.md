@@ -33,6 +33,7 @@
 - [Architecture](#architecture)
 - [Quick install](#quick-install)
 - [The Setup UI (configure via browser)](#the-setup-ui-configure-via-browser)
+- [Dashboard login](#dashboard-login)
 - [Day-to-day operations](#day-to-day-operations)
 - [Repository layout](#repository-layout)
 - [What AGPL means for you](#what-agpl-means-for-you)
@@ -213,7 +214,7 @@ Signing in sets an HttpOnly session cookie that lasts 12 hours. It holds a times
 
 ## Dashboard login
 
-The dashboard on port 8080 has no login by default; reach it through an SSH tunnel or your own VPN. If you bind it to anything other than loopback (`DARKWATCH_BIND_IP`), also turn its login on, and `ops/deploy.sh` warns (without failing) until you do:
+The dashboard on port 8080 has no login by default; reach it through an SSH tunnel or your own VPN. If you bind it to anything other than loopback (`DARKWATCH_BIND_IP`), also turn its login on, and `ops/deploy.sh` warns (without failing) until you do. `ops/install.sh` offers to generate the token when you let it bind the dashboard to the host's private IP; otherwise:
 
 ```bash
 echo "DARKWATCH_AUTH_TOKEN=$(openssl rand -hex 32)" | sudo tee -a /var/lib/darkwebapp/env

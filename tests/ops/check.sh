@@ -181,6 +181,40 @@ grep -q "DARKWATCH_AUTH_TOKEN is shorter than 32 characters" "$work/out" || die 
 grep -qF "$short_dash" "$work/out" && die "deploy: printed the dashboard token"
 ok "deploy warns about a dashboard published beyond loopback without DARKWATCH_AUTH_TOKEN, and about a short one"
 
+# install.sh: binding the dashboard to the private IP offers to generate
+# DARKWATCH_AUTH_TOKEN (default yes), warns when declined, and never prints it.
+printf '#!/bin/sh\necho 10.8.0.5 192.0.2.7\n' > "$work/bin/hostname"; chmod 755 "$work/bin/hostname"
+install() {   # $1 = answers on stdin, rest = extra flags; sets rc
+    local answers="$1"; shift
+    set +e
+    printf '%b' "$answers" | DARKWEBAPP_DATA_ROOT="$D" DW_CRON_DIR="$T/cron.d" \
+        "$T/repo/ops/install.sh" --skip-hardening --skip-deploy "$@" > "$work/out" 2>&1
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || die "install.sh exited $rc"
+}
+dash_tok_of() { grep -E '^DARKWATCH_AUTH_TOKEN=' "$D/env" | tail -1 | cut -d= -f2- || true; }
+new_tree; install 'y\ny\n'
+grep -q '^DARKWATCH_BIND_IP=10.8.0.5$' "$D/env" || die "install: bind not set to the private IP"
+tok="$(dash_tok_of)"
+[[ "$tok" =~ ^[0-9a-f]{64}$ ]] || die "install: no 64-hex DARKWATCH_AUTH_TOKEN after answering yes"
+grep -qF "$tok" "$work/out" && die "install: printed the dashboard token"
+grep -q "sign in with DARKWATCH_AUTH_TOKEN" "$work/out" || die "install: no sign-in hint at the end"
+deploy
+grep -q "with no login\|DARKWATCH_AUTH_TOKEN" "$work/out" && die "deploy: warned after install generated a dashboard token"
+new_tree; install 'y\nn\n'
+[[ -z "$(dash_tok_of)" ]] || die "install: set DARKWATCH_AUTH_TOKEN although declined"
+grep -q 'the dashboard has no login' "$work/out" || die "install: no warning when the dashboard token is declined"
+grep -q 'README, "Dashboard login"' "$work/out" || die "install: the warning must point at README \"Dashboard login\""
+new_tree; install '' --yes
+[[ "$(dash_tok_of)" =~ ^[0-9a-f]{64}$ ]] || die "install --yes: no dashboard token with a non-loopback bind"
+new_tree; install 'n\n'
+grep -q '^DARKWATCH_BIND_IP=127.0.0.1$' "$D/env" || die "install: bind changed although declined"
+[[ -z "$(dash_tok_of)" ]] || die "install: set DARKWATCH_AUTH_TOKEN on a loopback bind"
+grep -q "DARKWATCH_AUTH_TOKEN" "$work/out" && die "install: asked about the dashboard token on a loopback bind"
+rm "$work/bin/hostname"
+ok "install.sh offers DARKWATCH_AUTH_TOKEN when it binds the dashboard beyond loopback"
+
 # ─── default env (no DARKNET_SUBNET) reaches the end ────────────────────────
 new_tree; seed
 grep -q '^DARKNET_SUBNET=' "$D/env" && die "fixture: env should not set DARKNET_SUBNET"
