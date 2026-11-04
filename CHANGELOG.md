@@ -212,10 +212,11 @@
   IPv4 lockdown rule. `egress-lockdown.sh` and `--status` warn when the
   network has IPv6 anyway.
 - Saving Tunnel 1 in the Setup UI before the tor image exists returns 409
-  with "the config is saved, run sudo ./ops/deploy.sh" instead of a compose
-  build error. Tunnel saves run `docker compose up --no-build`, since the
-  Setup UI cannot build images. Other image check failures, such as an
-  unreachable Docker daemon, still show the compose error.
+  saying the config was saved and to run `sudo ./ops/deploy.sh` (which builds
+  the image and starts tunnel1 + tor) instead of a compose build error.
+  Tunnel saves run `docker compose up --no-build`, since the Setup UI cannot
+  build images. Other image check failures, such as an unreachable Docker
+  daemon, still show the compose error.
 - A rescan (`/api/rescan`, the auto-rescan) no longer deletes findings. It
   purged every finding on a page URL and re-derived them from each stored
   snapshot's stripped text, so findings from older versions of a page and
