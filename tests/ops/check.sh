@@ -116,9 +116,10 @@ for d in "" /darkwatch /darkwatch/loot /darkwatch/data /darkwatch/investigations
     want="700 999:999"; [[ -z "$d" ]] && want="700 0:0"
     [[ "$(stat -c '%a %u:%g' "$D$d")" == "$want" ]] || die "bootstrap: $D$d is $(stat -c '%a %u:%g' "$D$d"), want $want"
 done
+[[ "$(stat -c '%a %u:%g' "$D/config.d")" == "750 0:999" ]] || die "bootstrap: config.d is $(stat -c '%a %u:%g' "$D/config.d"), want 750 0:999"
 [[ "$(stat -c %a "$D/env")" == 600 ]] || die "bootstrap: env not 0600"
 [[ "$(readlink -f "$T/repo/.env")" == "$(readlink -f "$D/env")" ]] || die "bootstrap: .env link"
-ok "bootstrap creates 0700 dirs (uid 999 for darkwatch/) and links .env"
+ok "bootstrap creates 0700 dirs (uid 999 for darkwatch/), a root-owned config.d and links .env"
 
 rm "$T/repo/.env"; echo x > "$T/repo/.env"
 set +e; DARKWEBAPP_DATA_ROOT="$D" "$T/repo/ops/bootstrap.sh" > "$work/out" 2>&1; rc=$?; set -e
@@ -189,6 +190,13 @@ deploy --skip-build
 expect_ok "--skip-build"
 grep -q '^compose.* build' "$DOCKER_LOG" && die "--skip-build still built"
 ok "--skip-build skips the build"
+
+# An install from before v0.4.0 has no config.d: deploy re-runs bootstrap.
+rmdir "$D/config.d"
+deploy --skip-build
+expect_ok "missing config.d"
+[[ "$(stat -c '%a %u:%g' "$D/config.d")" == "750 0:999" ]] || die "deploy did not recreate config.d"
+ok "deploy creates a missing config.d (via bootstrap)"
 
 # ─── subnet migration and Setup UI refresh ──────────────────────────────────
 STUB_HAVE_SUBNET=172.20.0.0/16 deploy
@@ -400,5 +408,34 @@ expect_ok "self-update without exec bit"
 [[ "$(grep -c 'deploy.sh v3 running (args: --skip-pull --skip-build)' "$work/out")" == 1 ]] \
     || die "self-update without exec bit: v3 must run exactly once"
 ok "the restart does not need deploy.sh's exec bit"
+
+# ─── dirty checkout: local config.json edits ────────────────────────────────
+# Only darkwatch/config.json modified: deploy refuses and points at the
+# override file. Any other dirty file: the plain message, no hint.
+new_tree
+mkdir -p "$T/repo/darkwatch"
+cp -a "$repo/darkwatch/config.json" "$T/repo/darkwatch/"
+git -C "$T/repo" init -q && git -C "$T/repo" add -A && git -C "$T/repo" commit -qm v1
+seed
+sed -i 's/"max_threads": [0-9]*/"max_threads": 1/' "$T/repo/darkwatch/config.json"
+git -C "$T/repo" diff --quiet && die "fixture: config.json not modified"
+deploy
+expect_fail "dirty config.json" "darkwatch/config.json has local edits"; no_compose "dirty config.json"
+grep -qF "$D/config.d/config.local.json" "$work/out" && grep -qF "git checkout darkwatch/config.json" "$work/out" \
+    || die "dirty config.json: the hint must name the override file and the checkout"
+git -C "$T/repo" add darkwatch/config.json
+deploy
+expect_fail "staged config.json" "darkwatch/config.json has local edits"
+echo "# local" >> "$T/repo/.env.example"
+deploy
+expect_fail "dirty config.json and another file" "git working tree has uncommitted changes"; no_compose "two dirty files"
+grep -q "config.local.json" "$work/out" && die "the override hint is only for a dirty config.json alone"
+git -C "$T/repo" checkout -q HEAD -- darkwatch/config.json && git -C "$T/repo" reset -q
+git -C "$T/repo" diff --quiet HEAD -- darkwatch/config.json || die "fixture: config.json not restored"
+git -C "$T/repo" diff --quiet HEAD -- .env.example && die "fixture: .env.example not modified"
+deploy
+expect_fail "other dirty file" "git working tree has uncommitted changes"
+grep -q "config.local.json" "$work/out" && die "the override hint is only for a dirty config.json"
+ok "a checkout dirty only in darkwatch/config.json is refused with a pointer to config.local.json"
 
 echo "ops checks OK ($pass)"

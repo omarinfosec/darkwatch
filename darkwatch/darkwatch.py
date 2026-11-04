@@ -9,6 +9,7 @@ __version__ = "0.3.1"
 
 import os
 import sys
+import copy
 import json
 import html as html_lib
 import socket
@@ -6432,20 +6433,67 @@ def _substitute_env(value):
     return value
 
 
-def load_config(config_path):
-    config = DEFAULT_CONFIG.copy()
+# Operator overrides merged over config.json, so local settings live outside
+# the git checkout (deploy.sh refuses a dirty tree). Compose mounts
+# $DARKWEBAPP_DATA_ROOT/config.d read-only at /app/config.local.d. An empty
+# DARKWATCH_CONFIG_LOCAL turns the override off.
+DEFAULT_CONFIG_LOCAL = "/app/config.local.d/config.local.json"
+
+
+def _deep_merge(base, override):
+    """Merge `override` into `base` in place: nested dicts merge key by
+    key, so keys the override doesn't name keep their value; anything else
+    (lists included) is replaced. Returns `base`."""
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def _read_config_file(path, missing_ok=False):
+    """Parse one config file and resolve its ${VAR} placeholders. A file
+    that exists but can't be read or isn't a JSON object is an error, not
+    something to skip: running on half the operator's settings is worse
+    than not starting. With `missing_ok`, a file that doesn't exist gives
+    None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        if missing_ok:
+            return None
+        raise ValueError(f"cannot read config file {path}: {e}") from e
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ValueError(f"config file {path} is not valid JSON: {e}") from e
+    except OSError as e:
+        raise ValueError(f"cannot read config file {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"config file {path} must hold a JSON object, "
+                         f"not {type(data).__name__}")
+    # Resolve ${VAR} placeholders against the environment BEFORE merging,
+    # so DEFAULT_CONFIG fallbacks aren't shadowed by unsubstituted literal
+    # strings.
+    return _substitute_env(data)
+
+
+def load_config(config_path, local_path=None):
+    """DEFAULT_CONFIG, then `config_path` (config.json), then the local
+    override file (`local_path`, else $DARKWATCH_CONFIG_LOCAL, else
+    DEFAULT_CONFIG_LOCAL), each merged recursively over the one before.
+    Missing files are skipped; invalid ones raise ValueError."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if config_path and os.path.exists(config_path):
-        with open(config_path) as f:
-            user_config = json.load(f)
-        # Resolve ${VAR} placeholders against the environment BEFORE
-        # merging, so DEFAULT_CONFIG fallbacks aren't shadowed by
-        # unsubstituted literal strings.
-        user_config = _substitute_env(user_config)
-        for key in user_config:
-            if isinstance(user_config[key], dict) and key in config:
-                config[key].update(user_config[key])
-            else:
-                config[key] = user_config[key]
+        _deep_merge(config, _read_config_file(config_path))
+    if local_path is None:
+        local_path = os.environ.get("DARKWATCH_CONFIG_LOCAL", DEFAULT_CONFIG_LOCAL)
+    # Opened rather than checked with os.path.exists, which also says False
+    # for a file darkwatch may not look up (EACCES), and that must fail.
+    local = _read_config_file(local_path, missing_ok=True) if local_path else None
+    if local is not None:
+        _deep_merge(config, local)
+        log.info(f"config: applied local overrides from {local_path}")
     return config
 
 
@@ -6546,7 +6594,10 @@ Examples:
                                or args.text_snapshot_days is not None):
         parser.error("--dry-run and the --*-days options need --retention")
     setup_logging(args.debug)
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except ValueError as e:
+        sys.exit(f"darkwatch: {e}")
 
     if args.retention:
         # Database and loot dir only: no crawler, so no screenshot worker,

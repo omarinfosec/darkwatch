@@ -176,9 +176,10 @@ fi
 # Operational data dirs must exist and be writable by the container user
 # (uid 999). Re-running bootstrap is idempotent and gets ownership right —
 # a plain `mkdir -p` here would leave root-owned dirs darkwatch can't write.
-for d in loot data investigations yara-private; do
-    if [[ ! -d "$DATA_ROOT/darkwatch/$d" ]]; then
-        log "  $DATA_ROOT/darkwatch/$d missing — re-running bootstrap"
+# config.d (the local config override) is new in v0.4.0.
+for d in darkwatch/loot darkwatch/data darkwatch/investigations darkwatch/yara-private config.d; do
+    if [[ ! -d "$DATA_ROOT/$d" ]]; then
+        log "  $DATA_ROOT/$d missing — re-running bootstrap"
         "$SCRIPT_DIR/bootstrap.sh"
         break
     fi
@@ -187,8 +188,13 @@ done
 # Working tree must be clean (refuse to deploy uncommitted changes).
 # Untracked files are ignored: bootstrap's .env symlink lives in the repo root.
 if [[ -d .git ]]; then
-    if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    dirty="$(git status --porcelain --untracked-files=no)"
+    if [[ -n "$dirty" ]]; then
         git status --short --untracked-files=no >&2
+        # Local settings belong in the override file, not the tracked config.
+        if [[ "$(cut -c4- <<<"$dirty")" == "darkwatch/config.json" ]]; then
+            fail "darkwatch/config.json has local edits. Move the settings you changed into $DATA_ROOT/config.d/config.local.json (merged over config.json; see ops/RUNBOOK.md, \"Local config overrides\"), then run: sudo git checkout darkwatch/config.json"
+        fi
         fail "git working tree has uncommitted changes. Commit or stash before deploying."
     fi
     log "git: $(git rev-parse --short HEAD) on $(git rev-parse --abbrev-ref HEAD)"

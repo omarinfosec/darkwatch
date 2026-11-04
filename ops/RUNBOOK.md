@@ -30,7 +30,7 @@ sudo grep -c '^TG_SOCKS_PASSWORD=.\+' /var/lib/darkwebapp/env   # 1
 sudo docker image inspect darkwatch-setup:local -f '{{.Created}}' # after you started this upgrade, not the v0.2.0/v0.3.0 install date
 ```
 
-`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes, if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
+`deploy.sh` is idempotent. It refuses to run if tracked files have uncommitted changes (for local edits to `darkwatch/config.json` it points you at the [override file](#local-config-overrides) instead), if required env vars are missing, if the env file isn't 0600, if the repo's `.env` is not a link to `/var/lib/darkwebapp/env` (it creates the link when missing), or if a `wg0.conf` is not full-tunnel (`Table` other than `auto`, any `FwMark`, or no `AllowedIPs` with `0.0.0.0/0`). Missing WG configs don't block it — they just leave the matching `tor` / `tg` profile off. It rebuilds every locally built image (darkwatch, tor, setup) and refreshes the Setup UI if it is running; a stopped Setup UI stays stopped.
 
 The plain `sudo docker compose …` commands below read their settings through that `.env` link.
 
@@ -49,7 +49,7 @@ sudo docker exec tunnel1 iptables -S DW_KS_IN        # inbound drop on wg0
 ```
 `verify-egress.sh` checks all of these. Three layers stop the host's real IP from leaking:
 - **Tunnel kill switch** (`tunnels/killswitch/10-killswitch.sh`): inside tunnel1/tunnel2, nothing may leave except through WireGuard, so if a tunnel drops, Tor and Telegram traffic is rejected instead of exiting via Docker's NAT. The tunnels only report healthy (and tor / tg-socks only start) once it is in place. It also drops new connections arriving through WireGuard, so the VPN side can't reach Tor's SOCKS and control ports. A hostname `Endpoint` is resolved once at tunnel start, before egress closes, and pinned in the container's `/etc/hosts` (`docker logs tunnel1 2>&1 | grep killswitch` shows it); if the VPN changes that address, recreate the tunnel with its sidecar (`sudo docker compose up -d --force-recreate tunnel1 tor`, or `tunnel2 tg-socks`).
-- **Egress lockdown** (`ops/egress-lockdown.sh`): a host firewall rule so the darkwatch container can only talk to the darknet subnet (the proxies). Alerts go out through the Telegram tunnel, falling back to Tor; set `alerts.allow_direct` in `config.json` only if you accept them leaving from the host. Before every scan the dashboard's `ip_leak` check opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` and refuses to start (403, `ip_leak` in the failed list) if either connects or is refused (`ECONNREFUSED`: the lockdown drops, so a refusal means the packet got out); only timeouts, no-route errors and `EPERM` pass. With `DARKWATCH_EGRESS_LOCKDOWN=0` it only compares the Tor exit IP with darkwatch's direct IP, which is a much weaker check.
+- **Egress lockdown** (`ops/egress-lockdown.sh`): a host firewall rule so the darkwatch container can only talk to the darknet subnet (the proxies). Alerts go out through the Telegram tunnel, falling back to Tor; set `alerts.allow_direct` in your [config override](#local-config-overrides) only if you accept them leaving from the host. Before every scan the dashboard's `ip_leak` check opens TCP connections to `1.1.1.1:443` and `9.9.9.9:443` and refuses to start (403, `ip_leak` in the failed list) if either connects or is refused (`ECONNREFUSED`: the lockdown drops, so a refusal means the packet got out); only timeouts, no-route errors and `EPERM` pass. With `DARKWATCH_EGRESS_LOCKDOWN=0` it only compares the Tor exit IP with darkwatch's direct IP, which is a much weaker check.
 - **DNS isolation** (`dns: 127.0.0.1` on darkwatch in `docker-compose.yml`): darkwatch resolves only the service names (`tunnel1`, `tunnel2`); every other lookup goes to 127.0.0.1 inside its own namespace and fails at once. Without it, Docker would send those lookups to the host's resolver, and a loopback one (dnsmasq, unbound, bind) answers them from the host, past the lockdown. Leave `DARKWATCH_DNS` unset; set a real resolver only with `DARKWATCH_EGRESS_LOCKDOWN=0` (which `alerts.allow_direct` also needs to send directly), where darkwatch needs one for direct alerts and the in-app IP-leak check. With the lockdown on, `verify-egress.sh` and `deploy.sh` fail on any other `DARKWATCH_DNS`. On Docker 26 and later, `sudo docker exec darkwatch cat /etc/resolv.conf` contains the line `# ExtServers: [127.0.0.1]` and no `host(`; `host(` there means darkwatch was not recreated with the current compose file (run `sudo ./ops/deploy.sh`). Docker 24/25 write no such line; `verify-egress.sh` then relies on a lookup of `example.com` failing. The tunnels keep the host's DNS (they need it for hostname Endpoints) until WireGuard is up; after that tunnel2 uses the `DNS =` line of its `wg0.conf`, which the Setup UI requires and `verify-egress.sh` warns about when it is missing.
 
 `deploy.sh` applies the lockdown before it starts the containers, and its `darkwatch-egress-lockdown` unit re-applies it at boot before `docker.service` starts them. After each deploy it probes `http://1.1.1.1` from darkwatch (the host is the positive control) and fails if darkwatch connects. After a reboot:
@@ -73,6 +73,21 @@ sudo docker compose logs -f darkwatch  # one service
 ```bash
 sudo docker compose restart darkwatch
 ```
+
+### Local config overrides
+Don't edit `darkwatch/config.json` on the VM: it is tracked, so `deploy.sh` refuses the dirty checkout. Put the settings you change in `/var/lib/darkwebapp/config.d/config.local.json` instead. darkwatch merges it over `config.json` at start (mounted read-only at `/app/config.local.d`), key by key: a nested key the file doesn't name keeps its `config.json` value, and a list replaces the whole list. Like `config.json`, a value that is exactly `"${VAR}"` is read from `/var/lib/darkwebapp/env`, so secrets can stay in the env file.
+```bash
+sudoedit /var/lib/darkwebapp/config.d/config.local.json
+#   {"crawler": {"max_threads": 3}, "alerts": {"telegram_enabled": true, "min_alert_score": 70}}
+sudo chown root:999 /var/lib/darkwebapp/config.d/config.local.json
+sudo chmod 0640 /var/lib/darkwebapp/config.d/config.local.json
+sudo docker compose restart darkwatch
+sudo docker compose logs darkwatch | grep 'local overrides'   # "config: applied local overrides from ..."
+```
+- darkwatch runs as uid/gid 999 and must be able to read the file: keep it `root:999` and `0640` (`bootstrap.sh` creates `config.d` as `root:999`, `0750`).
+- A file that is not valid JSON, not a JSON object or not readable stops darkwatch from starting (`docker compose logs darkwatch` names the file and the error). A missing file is fine.
+- Moving existing edits: put only the keys you changed into `config.local.json`, then `sudo git checkout darkwatch/config.json` and deploy. Copying the whole file also works, but then changes to `config.json` in later releases never reach you.
+- `ops/retention.sh` and other `darkwatch.py` runs inside the container read the same override.
 
 ### Rebuild after changing the Dockerfile
 ```bash
@@ -133,6 +148,7 @@ tar -C /var/lib/darkwebapp -czf /root/dw-$(git describe --tags)-$(date +%F).tgz 
 chmod 600 /root/dw-*.tgz
 docker compose start darkwatch       # start setup too only if you were using it
 ```
+- From v0.4.0, add `config.d` (your [config overrides](#local-config-overrides)) to the `tar` list.
 - Before upgrading to v0.4.0, add `darkwatch/loot` to the `tar` list: that backup is the only way to get back data that v0.4.0's retention removes.
 - `darkwatch/data` holds the database, `telegram.session` (the Telegram login: whoever has it can use the account) and `user.yar` (your keyword rules). `env` and `secrets` hold every password and WireGuard key. Keep the archive root-only and off shared storage.
 - **Never `cp` the live database.** It runs in WAL mode, and a plain copy of the running file can miss every committed row that is still in the `-wal` file.

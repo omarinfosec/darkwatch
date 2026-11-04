@@ -71,6 +71,137 @@ def test_load_config_passes_through_non_placeholders():
         os.unlink(path)
 
 
+def _write_json(path, data):
+    path.write_text(json.dumps(data))
+    return str(path)
+
+
+def test_load_config_local_override_wins_and_keeps_other_keys(tmp_path, monkeypatch):
+    """The local override file is merged last and recursively: the keys it
+    names win, nested keys it doesn't name keep the config.json (or
+    default) value, and its ${VAR} placeholders are substituted."""
+    from darkwatch import load_config
+
+    monkeypatch.setenv("LOCAL_WEBHOOK", "https://hooks.example/abc")
+    base = _write_json(tmp_path / "config.json", {
+        "crawler": {"max_threads": 5, "timeout": 30},
+        "alerts": {"min_alert_score": 80, "allow_direct": False},
+    })
+    local = _write_json(tmp_path / "config.local.json", {
+        "crawler": {"max_threads": 2},
+        "alerts": {"allow_direct": True, "slack_webhook_url": "${LOCAL_WEBHOOK}"},
+        "extra": {"k": [1, 2]},
+    })
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", local)
+
+    cfg = load_config(base)
+    assert cfg["crawler"]["max_threads"] == 2         # override wins
+    assert cfg["crawler"]["timeout"] == 30            # config.json kept
+    assert cfg["crawler"]["max_depth"] == 2           # default kept
+    assert cfg["alerts"]["allow_direct"] is True
+    assert cfg["alerts"]["min_alert_score"] == 80
+    assert cfg["alerts"]["slack_webhook_url"] == "https://hooks.example/abc"
+    assert cfg["extra"] == {"k": [1, 2]}
+    # An explicit path takes precedence over the environment.
+    assert load_config(base, local_path="")["crawler"]["max_threads"] == 5
+
+
+def test_load_config_local_override_is_optional(tmp_path, monkeypatch):
+    from darkwatch import load_config
+
+    base = _write_json(tmp_path / "config.json", {"crawler": {"max_threads": 5}})
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", str(tmp_path / "missing.json"))
+    assert load_config(base)["crawler"]["max_threads"] == 5
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", "")
+    assert load_config(base)["crawler"]["max_threads"] == 5
+
+
+@pytest.mark.parametrize("body", ['{"crawler": {"max_threads": 2}', "[1, 2]", "",
+                                  b'{"a": "\xff"}'])
+def test_load_config_invalid_local_override_is_an_error(tmp_path, monkeypatch, body):
+    """A broken override must stop startup, not silently run on the
+    tracked config.json settings."""
+    from darkwatch import load_config
+
+    base = _write_json(tmp_path / "config.json", {"crawler": {"max_threads": 5}})
+    local = tmp_path / "config.local.json"
+    if isinstance(body, bytes):
+        local.write_bytes(body)  # not valid UTF-8
+    else:
+        local.write_text(body)
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", str(local))
+    with pytest.raises(ValueError, match="config.local.json"):
+        load_config(base)
+
+
+def test_load_config_unreadable_local_override_is_an_error(tmp_path, monkeypatch):
+    from darkwatch import load_config
+
+    # A directory exists but can't be opened as a file (works as root too).
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", str(tmp_path))
+    with pytest.raises(ValueError, match="cannot read config file"):
+        load_config(None)
+
+
+def test_load_config_local_override_without_permission_is_an_error(tmp_path, monkeypatch):
+    """A file darkwatch may not look up (os.path.exists says False on
+    EACCES) must fail like an unreadable one, not count as missing."""
+    import darkwatch
+
+    local = str(tmp_path / "config.d" / "config.local.json")
+    real_open = open
+
+    def fake_open(path, *a, **kw):
+        if path == local:
+            raise PermissionError(13, "Permission denied", path)
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(darkwatch, "open", fake_open, raising=False)
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", local)
+    with pytest.raises(ValueError, match="Permission denied"):
+        darkwatch.load_config(None)
+
+
+def test_cli_reports_an_invalid_config_without_a_traceback(tmp_path, monkeypatch):
+    import darkwatch
+
+    local = tmp_path / "config.local.json"
+    local.write_text("{not json")
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", str(local))
+    monkeypatch.chdir(tmp_path)  # the default database path is relative
+    monkeypatch.setattr(sys, "argv", ["darkwatch.py", "--config",
+                                      str(tmp_path / "none.json"), "--stats"])
+    with pytest.raises(SystemExit) as exc:
+        darkwatch.main()
+    assert "is not valid JSON" in str(exc.value.code)
+
+
+def test_load_config_does_not_mutate_defaults_or_share_state(tmp_path, monkeypatch):
+    """Each load starts from a fresh copy of DEFAULT_CONFIG: loading a file
+    must not write into DEFAULT_CONFIG, and two loaded configs must not
+    share nested dicts or lists."""
+    import copy
+    from darkwatch import DEFAULT_CONFIG, load_config
+
+    monkeypatch.setenv("DARKWATCH_CONFIG_LOCAL", "")
+    before = copy.deepcopy(DEFAULT_CONFIG)
+    c1 = load_config(_write_json(tmp_path / "a.json", {"crawler": {"max_threads": 9}}))
+    c2 = load_config(_write_json(tmp_path / "b.json", {"proxy": {"port": 1}}))
+    assert DEFAULT_CONFIG == before
+    assert c1["crawler"]["max_threads"] == 9
+    assert c2["crawler"]["max_threads"] == before["crawler"]["max_threads"]
+    assert c1["proxy"]["port"] == before["proxy"]["port"]
+    assert c2["proxy"]["port"] == 1
+
+    c1["crawler"]["max_depth"] = 99
+    c1["crawler"]["user_agents"].append("c1-only")
+    c1["security"]["allowed_content_types"].clear()
+    assert c2["crawler"]["max_depth"] == before["crawler"]["max_depth"]
+    assert c2["crawler"]["user_agents"] == before["crawler"]["user_agents"]
+    assert c2["security"] == before["security"]
+    assert DEFAULT_CONFIG == before
+
+
 def test_yara_private_dir_compiles_each_yar_file(tmp_path):
     """Operator-private *.yar files mounted in via /app/yara-private are
     compiled into the scanner and contribute to scan() results."""

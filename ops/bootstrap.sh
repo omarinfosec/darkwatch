@@ -47,6 +47,12 @@ install -d -m 0700 -o "$DARKWATCH_UID" -g "$DARKWATCH_GID" "$DATA_ROOT/darkwatch
 # something to bind.
 install -d -m 0700 -o "$DARKWATCH_UID" -g "$DARKWATCH_GID" "$DATA_ROOT/darkwatch/yara-private"
 
+# config.d/ holds config.local.json, the operator's overrides merged over the
+# tracked darkwatch/config.json (mounted read-only at /app/config.local.d).
+# Root-owned so the container can't change its own settings; group 999 so it
+# can read them. Empty by design: the file is optional.
+install -d -m 0750 -o root -g "$DARKWATCH_GID" "$DATA_ROOT/config.d"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

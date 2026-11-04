@@ -32,6 +32,8 @@ def web(tmp_path_factory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("DARKWATCH_CONFIG", str(d / "config.json"))
         mp.setenv("DARKWATCH_BIND_IP", "10.8.0.5")
+        # No local override file from the machine running the tests.
+        mp.setenv("DARKWATCH_CONFIG_LOCAL", "")
         import web as web_mod
     # The import starts the monitor schedulers. Stop them: tests swap
     # web._crawler and web._tg for fakes, and a background tick would use

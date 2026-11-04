@@ -224,6 +224,8 @@ sudo docker compose restart tunnel1        # restart a specific service
 sudo ./ops/retention.sh                    # enforce retention now (deploy installs the nightly cron job: RUNBOOK → Retention)
 ```
 
+To change darkwatch's settings, don't edit `darkwatch/config.json` on the VM (it is tracked, and `deploy.sh` refuses a dirty checkout). Put only the keys you change in `/var/lib/darkwebapp/config.d/config.local.json` (readable by uid/gid 999, e.g. `root:999` `0640`), which darkwatch merges over `config.json` at start, then `sudo docker compose restart darkwatch`. Details: [RUNBOOK → Local config overrides](ops/RUNBOOK.md#local-config-overrides).
+
 Full operator runbook including incident playbooks, maintenance schedule, and environment cheat sheet: [ops/RUNBOOK.md](ops/RUNBOOK.md).
 
 ## Repository layout

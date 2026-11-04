@@ -5,6 +5,8 @@
 #     it;
 #   - no other service sets `dns:` (the tunnels need the host's DNS to
 #     resolve hostname Endpoints);
+#   - darkwatch mounts $DARKWEBAPP_DATA_ROOT/config.d read-only and points
+#     DARKWATCH_CONFIG_LOCAL into it;
 #   - only setup gets a non-empty SETUP_AUTH_TOKEN, and tor's environment is
 #     exactly TOR_CONTROL_PASSWORD (not the whole env file);
 #   - without TOR_CONTROL_PASSWORD (no .env, no --env-file) `config` fails.
@@ -70,6 +72,23 @@ if [[ "$got" != "$want" ]]; then
     exit 1
 fi
 echo "ok   only setup gets SETUP_AUTH_TOKEN; tor gets only TOR_CONTROL_PASSWORD"
+
+# The local config override: the data root's config.d, read-only, at the
+# path darkwatch is told to read.
+got="$(render | "$PYTHON" -c '
+import json, sys
+dw = json.load(sys.stdin)["services"]["darkwatch"]
+for v in dw["volumes"]:
+    if v["target"] == "/app/config.local.d":
+        print(v["source"], v.get("read_only", False))
+print(dw["environment"].get("DARKWATCH_CONFIG_LOCAL"))')"
+want="$work/config.d True
+/app/config.local.d/config.local.json"
+if [[ "$got" != "$want" ]]; then
+    printf 'FAIL config override mount:\n%s\nwant:\n%s\n' "$got" "$want" >&2
+    exit 1
+fi
+echo "ok   darkwatch mounts DATA_ROOT/config.d read-only for config.local.json"
 
 # Project directory without a .env, no --env-file: a missing or wrong .env
 # link must stop compose, not start tor with an empty control password.

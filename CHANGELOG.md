@@ -44,6 +44,21 @@
   does not shrink by itself; RUNBOOK describes a manual VACUUM with the
   stack stopped.
 
+- **Local settings move to `/var/lib/darkwebapp/config.d/config.local.json`.**
+  darkwatch now merges that file over `darkwatch/config.json` at start
+  (compose mounts `config.d` read-only; `bootstrap.sh`, which `deploy.sh`
+  re-runs when the directory is missing, creates it `root:999` `0750`).
+  Nested keys the file doesn't name keep their `config.json` value, and
+  `"${VAR}"` values are read from the env file as in `config.json`. A file
+  that is not valid JSON, not an object or not readable by uid/gid 999
+  stops darkwatch from starting; a missing file is fine. If you edited
+  `darkwatch/config.json` on the VM, copy the keys you changed into
+  `config.local.json` (`root:999`, `0640`), then `sudo git checkout
+  darkwatch/config.json` and deploy. `deploy.sh` still refuses a dirty
+  checkout, and now names the override file when `config.json` is the only
+  modified file. Add `config.d` to your backups (RUNBOOK, "Local config
+  overrides").
+
 ### Security
 - Saved HTML copies (`loot/pages`) no longer make network requests when
   you open them. The sanitizer now puts a Content-Security-Policy first
@@ -219,6 +234,12 @@
   env file. A file that disappears before it is hashed (a URL deleted in
   the dashboard meanwhile) is logged with `sha256=unknown` instead of
   aborting the run.
+- Loading the config no longer writes into the built-in defaults: it
+  copied them shallowly and then updated the nested sections in place, so a
+  second load (or `run_retention`'s fallback) saw the first file's values,
+  and two loaded configs shared their sections. An invalid `config.json`
+  now ends the CLI with a one-line error naming the file instead of a
+  traceback.
 - `darkwatch.py --config` now defaults to `$DARKWATCH_CONFIG` (else
   `config.json`), as `web.py` already did, so the CLI and `--retention`
   read the same config as the dashboard.
