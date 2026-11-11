@@ -1,5 +1,5 @@
 # ─── Build stage: produce static/ artifacts ───────────────────────────────
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS bundle
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS bundle
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -62,7 +62,7 @@ RUN mkdir -p static && \
 # Debian trixie, like the bundle stage. The pinned Playwright has trixie
 # (debian13, x64 and arm64) in the package lists --with-deps installs from
 # below; a Playwright without them cannot install Firefox's libraries here.
-FROM python:3.13-slim-trixie@sha256:ae14d4ce8771606477a81446e7ef429edd6762305fc50c84507c1041fa8285d1
+FROM python:3.13-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
